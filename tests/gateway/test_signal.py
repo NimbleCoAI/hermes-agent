@@ -2020,3 +2020,23 @@ class TestObserveOnlyReactionSuppression:
         await adapter.on_processing_start(event)
 
         adapter.send_reaction.assert_called_once()
+
+
+class TestRemapPath:
+    """Multi-container path remapping for signal-cli (HERMES_HOST_DATA_DIR)."""
+
+    def test_passthrough_when_host_dir_unset(self, monkeypatch):
+        monkeypatch.delenv("HERMES_HOST_DATA_DIR", raising=False)
+        adapter = _make_signal_adapter(monkeypatch)
+        assert adapter._remap_path("/opt/data/cache/x.jpg") == "/opt/data/cache/x.jpg"
+
+    def test_remaps_container_path_to_host(self, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", "/opt/data")
+        monkeypatch.setenv("HERMES_HOST_DATA_DIR", "/host/hermes-data")
+        adapter = _make_signal_adapter(monkeypatch)
+        assert adapter._remap_path("/opt/data/cache/x.jpg") == "/host/hermes-data/cache/x.jpg"
+
+    def test_unrelated_path_passthrough_with_host_set(self, monkeypatch):
+        monkeypatch.setenv("HERMES_HOST_DATA_DIR", "/host/hermes-data")
+        adapter = _make_signal_adapter(monkeypatch)
+        assert adapter._remap_path("/srv/other.jpg") == "/srv/other.jpg"

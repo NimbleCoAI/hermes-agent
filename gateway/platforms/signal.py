@@ -227,6 +227,14 @@ class SignalAdapter(BasePlatformAdapter):
         dm_allowed_str = os.getenv("SIGNAL_ALLOWED_USERS", "*")
         self.dm_allow_from = set(_parse_comma_list(dm_allowed_str))
 
+        # Path remapping for multi-container setups where signal-cli runs
+        # in a separate container.  HERMES_HOME (default /opt/data) is the
+        # container-internal path, but signal-cli mounts the host data dir
+        # at its real path.  HERMES_HOST_DATA_DIR tells us the host path
+        # so we can translate before passing to signal-cli RPC.
+        self._container_data_dir = os.environ.get("HERMES_HOME", "/opt/data")
+        self._host_data_dir = os.environ.get("HERMES_HOST_DATA_DIR", "")
+
         # HTTP client
         self.client: Optional[httpx.AsyncClient] = None
         # Dedicated client for the long-lived SSE stream — no keepalive pooling,
@@ -1056,6 +1064,36 @@ class SignalAdapter(BasePlatformAdapter):
     # JSON-RPC Communication
     # ------------------------------------------------------------------
 
+    def _remap_path(self, path: str) -> str:
+        """Translate container-internal paths to host paths for signal-cli.
+
+        In multi-container setups signal-cli can't see /opt/data - it mounts
+        the host data dir at its real path.  When HERMES_HOST_DATA_DIR is set,
+        rewrite /opt/data/... -> /host/path/... so signal-cli can read the file.
+
+        Files in /tmp/ are copied to the data dir first since /tmp/ is never
+        shared between containers.
+        """
+        if not self._host_data_dir:
+            return path
+
+        # /tmp/ files: copy to data dir so signal-cli can access them
+        if path.startswith("/tmp/"):
+            import shutil
+            cache_dir = Path(self._container_data_dir) / "cache" / "images"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            dest = cache_dir / Path(path).name
+            try:
+                shutil.copy2(path, dest)
+                path = str(dest)
+            except Exception as e:
+                logger.warning("Signal: failed to copy %s to data dir: %s", path, e)
+                return path
+
+        if path.startswith(self._container_data_dir):
+            return self._host_data_dir + path[len(self._container_data_dir):]
+        return path
+
     async def _rpc(
         self,
         method: str,
@@ -1478,7 +1516,7 @@ class SignalAdapter(BasePlatformAdapter):
                     chat_id, idx + 1, len(att_batches), estimated
                 )
 
-            params = dict(base_params, attachments=att_batch)
+            params = dict(base_params, attachments=[self._remap_path(p) for p in att_batch])
             send_timeout = _signal_send_timeout(n)
 
             for attempt in range(1, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS + 1):
@@ -1586,7 +1624,7 @@ class SignalAdapter(BasePlatformAdapter):
         params: Dict[str, Any] = {
             "account": self.account,
             "message": caption or "",
-            "attachments": [file_path],
+            "attachments": [self._remap_path(file_path)],
         }
 
         if chat_id.startswith("group:"):
@@ -1625,7 +1663,7 @@ class SignalAdapter(BasePlatformAdapter):
         params: Dict[str, Any] = {
             "account": self.account,
             "message": caption or "",
-            "attachments": [file_path],
+            "attachments": [self._remap_path(file_path)],
         }
 
         if chat_id.startswith("group:"):
@@ -1808,6 +1846,14 @@ class SignalAdapter(BasePlatformAdapter):
         if event is not None:
             sender = getattr(getattr(event, "source", None), "user_id", None)
             if sender and "*" not in self.dm_allow_from and sender not in self.dm_allow_from:
+                # Admin check - unified via HSM (approved users = admins)
+                sender_uuid = getattr(getattr(event, "source", None), "user_id_alt", None)
+                try:
+                    from plugins.swarm_map_policy import is_platform_admin
+                    if is_platform_admin(sender, "signal") or (sender_uuid and is_platform_admin(sender_uuid, "signal")):
+                        return True
+                except Exception:
+                    pass
                 return False
         return True
 
