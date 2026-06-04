@@ -791,6 +791,13 @@ class SignalAdapter(BasePlatformAdapter):
                 msg_type = MessageType.VOICE
             elif any(mt.startswith("image/") for mt in media_types):
                 msg_type = MessageType.PHOTO
+            else:
+                # Any other successfully-fetched attachment (PDF, docx, txt, …)
+                # is a document. Without this, run.py's document handler (which
+                # is gated on MessageType.DOCUMENT) never fires, so the file is
+                # downloaded but never surfaced to the agent — the user sends a
+                # PDF and the bot reports "I don't see an attachment".
+                msg_type = MessageType.DOCUMENT
 
         # Parse timestamp from envelope data (milliseconds since epoch)
         ts_ms = envelope_data.get("timestamp", 0)

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageType
 
 
 @pytest.fixture(autouse=True)
@@ -2026,6 +2027,58 @@ class TestObserveOnlyReactionSuppression:
         await adapter.on_processing_start(event)
 
         adapter.send_reaction.assert_called_once()
+
+
+class TestSignalMessageTypeClassification:
+    """Inbound attachments must be classified so run.py surfaces them.
+
+    Regression: a PDF arrived with media_urls populated but message_type=TEXT,
+    so run.py's document handler (gated on MessageType.DOCUMENT) never fired and
+    the bot reported 'I don't see a PDF'."""
+
+    async def _capture(self, monkeypatch, content_type, ext):
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+        adapter.handle_message = fake_handle
+
+        async def fake_fetch(att_id):
+            return (f"/opt/data/cache/documents/file{ext}", ext)
+        adapter._fetch_attachment = fake_fetch
+
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "+15550001111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1000000000,
+                "dataMessage": {
+                    "message": "see attached",
+                    "attachments": [
+                        {"id": "abc", "contentType": content_type, "size": 1000, "filename": f"f{ext}"}
+                    ],
+                },
+            }
+        })
+        return captured["event"]
+
+    @pytest.mark.asyncio
+    async def test_pdf_classified_as_document(self, monkeypatch):
+        event = await self._capture(monkeypatch, "application/pdf", ".pdf")
+        assert event.message_type == MessageType.DOCUMENT
+        assert any(p.endswith(".pdf") for p in event.media_urls)
+
+    @pytest.mark.asyncio
+    async def test_image_still_classified_as_photo(self, monkeypatch):
+        event = await self._capture(monkeypatch, "image/jpeg", ".jpg")
+        assert event.message_type == MessageType.PHOTO
+
+    @pytest.mark.asyncio
+    async def test_audio_still_classified_as_voice(self, monkeypatch):
+        event = await self._capture(monkeypatch, "audio/ogg", ".ogg")
+        assert event.message_type == MessageType.VOICE
 
 
 class TestAttachmentArg:
