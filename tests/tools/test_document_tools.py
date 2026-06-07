@@ -6,8 +6,11 @@ PDFs (and other pymupdf-supported formats) instead of hand-rolling
 2026-06-04-opinionated-hsm-base-package.
 """
 
-import fitz  # PyMuPDF — used here as test infra to build fixture PDFs
 import pytest
+
+# pymupdf is an optional ("documents") extra, not in the lean CI install
+# (`.[all,dev]`). Skip cleanly there; runs in the image where it ships eager.
+fitz = pytest.importorskip("fitz")
 
 from tools.document_tools import (
     READ_DOCUMENT_SCHEMA,
