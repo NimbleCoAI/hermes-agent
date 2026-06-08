@@ -123,7 +123,7 @@ def register(ctx) -> None:
     out_queue: "queue.Queue[str]" = queue.Queue(maxsize=cfg.queue_max)
     handler = HomeLogHandler(RoutePolicy(cfg.loggers, cfg.level), out_queue, guard)
     throttle = Throttle(cfg.rate, cfg.window, cfg.dedup_window, time.monotonic)
-    worker = HomeLogWorker(out_queue, throttle, _make_sender(ctx, cfg.platform), guard)
+    worker = HomeLogWorker(out_queue, throttle, _make_sender(cfg.platform), guard)
 
     logging.getLogger().addHandler(handler)
     worker.start()
@@ -149,10 +149,19 @@ def _teardown() -> None:
         _worker = None
 
 
-def _make_sender(ctx, platform: str):
+def _send_to_home(platform: str, message: str) -> None:
+    # Invoke the send_message tool FUNCTION directly. In the gateway plugin/worker
+    # context the tool is NOT in the dispatchable registry (ctx.dispatch_tool
+    # returns ``{"error": "Unknown tool: send_message"}``), so we call the function.
+    # A bare platform target resolves to get_home_channel(); return value (incl.
+    # "no home" errors) is intentionally ignored — forwarding is best-effort.
+    from tools.send_message_tool import send_message_tool
+
+    send_message_tool({"target": platform, "message": message})
+
+
+def _make_sender(platform: str):
     def sender(message: str) -> None:
-        # Bare platform target -> home channel. Return value (incl. "no home"
-        # errors) is intentionally ignored: forwarding is best-effort.
-        ctx.dispatch_tool("send_message", {"target": platform, "message": message})
+        _send_to_home(platform, message)
 
     return sender
