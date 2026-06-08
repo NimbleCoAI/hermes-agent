@@ -33,3 +33,12 @@ def test_empty_output_is_error_token():
         runner=lambda cmd, **kw: _Proc(""),
     )
     assert token == "ERROR"
+
+
+def test_runner_exception_returns_error():
+    def boom(cmd, **kw): raise OSError("no such file")
+    token, msg = call_gate(
+        gate_path="/x/g.sh", uuid="U", decision_id="D-2026-06-09-01",
+        action="resolve", value="approve", approver="J", runner=boom,
+    )
+    assert token == "ERROR"

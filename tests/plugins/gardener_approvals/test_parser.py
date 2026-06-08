@@ -44,3 +44,23 @@ def test_emoji_thumbsup_approves():
 def test_no_open_decisions_noop():
     r = parse_reply("approve", [])
     assert r.matched is False and r.ask is None
+
+
+def test_disapprove_is_noop():
+    r = parse_reply("I disapprove D-2026-06-09-01", ONE)
+    assert r.matched is False and r.ask is None
+
+
+def test_not_approved_is_noop():
+    r = parse_reply("not approved", ONE)
+    assert r.matched is False and r.ask is None
+
+
+def test_uphold_is_noop():
+    r = parse_reply("uphold the plan", ONE)
+    assert r.matched is False
+
+
+def test_yesterday_is_noop():
+    r = parse_reply("I saw it yesterday", ONE)
+    assert r.matched is False

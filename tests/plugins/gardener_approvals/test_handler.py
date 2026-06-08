@@ -1,3 +1,4 @@
+import pytest
 from plugins.gardener_approvals.handler import on_pre_llm_call
 from plugins.gardener_approvals.config import Config
 
@@ -8,7 +9,7 @@ ONE = ["D-2026-06-09-01"]
 
 def _call(**over):
     kw = dict(platform="signal", user_message="approve",
-              sender_id="+64221977149", sender_id_alt="U-ACI",
+              sender_id="+15550001234", sender_id_alt="U-ACI",
               _config=CFG, _open_reader=lambda p: list(ONE),
               _gate_caller=lambda **k: ("OK", "✓ noted, approved — D-2026-06-09-01 resolved"))
     kw.update(over)
@@ -73,3 +74,17 @@ def test_no_intent_noop():
 def test_hook_never_raises_on_internal_error():
     def boom(p): raise RuntimeError("disk gone")
     assert _call(_open_reader=boom) == ""   # fail-safe -> empty, no exception
+
+
+@pytest.mark.parametrize("token,msg", [
+    ("ALREADY_DONE", "already handled"),
+    ("REFUSED_ALLOWLIST", "do it in Claude Code"),
+    ("AMBIGUOUS", "Which decision?"),
+])
+def test_relay_tokens_produce_relay(token, msg):
+    out = _call(_gate_caller=lambda **k: (token, msg))
+    assert isinstance(out, dict) and msg in out["context"]
+
+
+def test_no_sender_id_noop():
+    assert _call(sender_id="", sender_id_alt="") == ""

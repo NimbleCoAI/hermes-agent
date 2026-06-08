@@ -56,6 +56,7 @@ def on_pre_llm_call(*, platform: str = "", user_message: str = "",
             action=pr.action, value=pr.value, approver=cfg.approver,
             decisions_file=cfg.decisions_file,
         )
+        # msg must be non-empty; empty relay messages are silently dropped (gate protocol)
         if token in _RELAY and msg:
             return _relay(msg)
         if token == "REFUSED_AUTH":

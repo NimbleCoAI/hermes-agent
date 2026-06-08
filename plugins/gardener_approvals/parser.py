@@ -13,13 +13,17 @@ from typing import List, Optional
 
 _DEC_ID_RE = re.compile(r"D-\d{4}-\d{2}-\d{2}-\d+")
 
-# Whole-word / phrase keywords. Short ambiguous words ("go", "ok") are excluded
-# on purpose — a false trigger resolves a decision the user didn't mean.
-_APPROVE = ("approve", "approved", "approves", "yes", "yep", "yeah", "do it",
-            "go ahead", "ship it", "lgtm")
-_APPROVE_EMOJI = ("\U0001F44D", "✅")  # 👍 ✅
-_HOLD = ("hold", "not yet", "wait", "nope", "later")
-_HOLD_WORD = ("no",)  # matched only as a standalone word
+# Single-word keywords — matched by word boundary (token membership).
+# Short ambiguous words ("go", "ok") are excluded on purpose — a false trigger
+# resolves a decision the user didn't mean.
+_APPROVE_WORDS = frozenset(("approve", "approved", "approves", "yes", "yep", "yeah", "lgtm"))
+_APPROVE_PHRASES = ("do it", "go ahead", "ship it")          # substring match (specific enough)
+_APPROVE_EMOJI = ("\U0001F44D", "✅")                         # raw text substring match
+
+# Hold keywords — single-word boundary-matched; "not"/"never"/"dont" also serve
+# as negation so that "not approved" / "I disapprove" → conflict → no-op.
+_HOLD_WORDS = frozenset(("hold", "wait", "nope", "later", "no", "not", "never", "dont"))
+_HOLD_PHRASES = ("not yet", "do not", "don't")               # substring match
 
 
 @dataclass
@@ -36,8 +40,8 @@ def _has_phrase(text: str, phrases) -> bool:
 
 
 def _has_word(text: str, words) -> bool:
-    toks = re.findall(r"[a-z]+", text)
-    return any(w in toks for w in words)
+    toks = set(re.findall(r"[a-z]+", text))
+    return bool(toks & words)
 
 
 def parse_reply(text: str, open_ids: List[str]) -> ParseResult:
@@ -46,8 +50,11 @@ def parse_reply(text: str, open_ids: List[str]) -> ParseResult:
     raw = text or ""
     low = raw.lower()
 
-    approve = _has_phrase(low, _APPROVE) or any(e in raw for e in _APPROVE_EMOJI)
-    hold = _has_phrase(low, _HOLD) or _has_word(low, _HOLD_WORD)
+    approve = (_has_word(low, _APPROVE_WORDS)
+               or _has_phrase(low, _APPROVE_PHRASES)
+               or any(e in raw for e in _APPROVE_EMOJI))
+    hold = (_has_word(low, _HOLD_WORDS)
+            or _has_phrase(low, _HOLD_PHRASES))
     if approve and hold:
         return ParseResult(matched=False)            # conflicting -> no-op
     if not approve and not hold:
