@@ -1,5 +1,13 @@
 name: Upstream Sync
 
+# Weekly sync of this patched fork against NousResearch/hermes-agent.
+#
+# Uses a MERGE (not a rebase). Rebase replays every one of our ~60 fork
+# patches onto a fast-moving upstream and conflicts on the first patch that
+# overlaps upstream's churn — so it failed every week. A merge only conflicts
+# on files BOTH sides actually changed (a far smaller surface), and records
+# our divergence as a single merge commit rather than rewriting it each run.
+
 on:
   schedule:
     - cron: '0 6 * * 1'
@@ -17,6 +25,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |
@@ -28,35 +37,60 @@ jobs:
           git remote add upstream https://github.com/NousResearch/hermes-agent.git || true
           git fetch upstream main
 
-      - name: Attempt rebase
-        id: rebase
+      - name: Attempt merge
+        id: merge
         run: |
-          git checkout -b upstream-sync-$(date +%Y%m%d)
-          if git rebase upstream/main; then
-            echo "status=clean" >> $GITHUB_OUTPUT
-          else
-            git rebase --abort
-            echo "status=conflict" >> $GITHUB_OUTPUT
+          BRANCH="upstream-sync-$(date +%Y%m%d)"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          git checkout -b "$BRANCH"
+
+          # Nothing new upstream → no-op (avoids empty PRs/issues every week).
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "status=noop" >> "$GITHUB_OUTPUT"
+            echo "Already up to date with upstream/main."
+            exit 0
           fi
 
-      - name: Create PR on clean rebase
-        if: steps.rebase.outputs.status == 'clean'
+          if git merge --no-edit upstream/main; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt || true
+            git merge --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create PR on clean merge
+        if: steps.merge.outputs.status == 'clean'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git push origin upstream-sync-$(date +%Y%m%d)
+          BRANCH="${{ steps.merge.outputs.branch }}"
+          git push origin "$BRANCH"
           gh pr create \
             --title "chore: sync with upstream $(date +%Y-%m-%d)" \
-            --body "Automated weekly rebase onto upstream/main. All patches applied cleanly." \
+            --body "Automated weekly merge of \`upstream/main\` (NousResearch/hermes-agent). Merged cleanly — no conflicts. **Review CI before merging**; a clean text merge can still silently drop a fork patch where upstream rewrote the same region, so let the test suite gate it." \
             --base main \
-            --head upstream-sync-$(date +%Y%m%d)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            --head "$BRANCH" \
+          || echo "PR already exists for $BRANCH"
 
       - name: Open issue on conflict
-        if: steps.rebase.outputs.status == 'conflict'
-        run: |
-          gh issue create \
-            --title "Upstream sync conflict $(date +%Y-%m-%d)" \
-            --body "Weekly rebase onto upstream/main had conflicts. Manual resolution needed." \
-            --label "upstream-sync"
+        if: steps.merge.outputs.status == 'conflict'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Ensure the label exists first — a missing label used to fail the
+          # whole job (could not add label: 'upstream-sync' not found), so the
+          # conflict was never reported. --force is create-or-update; the
+          # `|| true` is belt-and-suspenders for a races/permission hiccup.
+          gh label create upstream-sync \
+            --color FBCA04 \
+            --description "Weekly upstream merge needs manual conflict resolution" \
+            --force || true
+
+          CONFLICTS="$(cat /tmp/conflicts.txt 2>/dev/null || echo '(see workflow logs)')"
+          DATE="$(date +%Y%m%d)"
+          gh issue create \
+            --title "Upstream sync conflict $(date +%Y-%m-%d)" \
+            --label upstream-sync \
+            --body "$(printf 'Weekly merge of \x60upstream/main\x60 hit conflicts in:\n\n\x60\x60\x60\n%s\n\x60\x60\x60\n\nResolve locally:\n\n\x60\x60\x60bash\ngit fetch upstream main\ngit checkout -b upstream-sync-%s origin/main\ngit merge upstream/main   # resolve the files above\nuv lock                   # if pyproject changed\n# run the full suite, then open a PR to main\n\x60\x60\x60\n' "$CONFLICTS" "$DATE")" \
+          || echo "Issue may already exist"
