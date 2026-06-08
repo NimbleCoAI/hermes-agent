@@ -80,3 +80,25 @@ def test_stop_is_idempotent_and_joins():
     w.start()
     w.stop()
     w.stop()  # second stop must not raise
+
+
+def test_idle_flush_sends_pending_summary():
+    sent = []
+    w, _, clock, _ = _worker(rate=1, window=10.0, sender=sent.append)
+    w.process("A")          # admitted
+    w.process("B")          # suppressed (rate)
+    sent.clear()
+    w.idle_flush()          # should drain the pending suppression summary
+    assert len(sent) == 1
+    assert "suppress" in sent[0].lower()
+
+
+def test_idle_flush_sends_under_guard():
+    seen = []
+    guard = ReentrancyGuard()
+    w, *_ = _worker(rate=1, window=10.0, sender=lambda m: seen.append(guard.active), guard=guard)
+    w.process("A")
+    w.process("B")  # suppressed
+    seen.clear()
+    w.idle_flush()
+    assert seen == [True]

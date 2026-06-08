@@ -37,7 +37,14 @@ class HomeLogWorker:
 
     def process(self, message: str) -> None:
         """Throttle one message and send what survives. Synchronous, testable."""
-        for out in self.throttle.admit(message):
+        self._send_all(self.throttle.admit(message))
+
+    def idle_flush(self) -> None:
+        """Deliver any pending suppression summary when the queue goes quiet."""
+        self._send_all(self.throttle.flush_summary())
+
+    def _send_all(self, messages) -> None:
+        for out in messages:
             with self.guard:
                 try:
                     self.sender(out)
@@ -64,5 +71,6 @@ class HomeLogWorker:
             try:
                 message = self.out_queue.get(timeout=self.poll_timeout)
             except queue.Empty:
+                self.idle_flush()
                 continue
             self.process(message)

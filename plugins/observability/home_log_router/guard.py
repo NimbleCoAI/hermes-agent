@@ -18,7 +18,11 @@ class ReentrancyGuard:
 
     @property
     def active(self) -> bool:
-        return self._depth > 0
+        # Read under the lock too: the guard's job is cross-thread visibility
+        # (worker thread vs. the adapter's _run_async send thread), which a
+        # lock-free read does not guarantee on free-threaded interpreters.
+        with self._lock:
+            return self._depth > 0
 
     def __enter__(self) -> "ReentrancyGuard":
         with self._lock:

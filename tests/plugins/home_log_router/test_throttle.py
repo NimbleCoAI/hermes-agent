@@ -75,3 +75,21 @@ def test_summary_counter_resets_after_emit():
     t.admit("C")          # emits summary, resets counter
     clock.t = 22.0
     assert t.admit("D") == ["D"]  # no lingering summary
+
+
+def test_flush_summary_returns_pending_and_resets():
+    # A burst that ends with suppression (no following admit) must still be
+    # reportable via flush_summary, not lost.
+    t, _ = _make(rate=1, window=10.0)
+    t.admit("A")
+    t.admit("B")  # suppressed
+    out = t.flush_summary()
+    assert len(out) == 1
+    assert "1" in out[0] and "suppress" in out[0].lower()
+    assert t.flush_summary() == []  # counter cleared
+
+
+def test_flush_summary_empty_when_nothing_suppressed():
+    t, _ = _make()
+    t.admit("A")
+    assert t.flush_summary() == []

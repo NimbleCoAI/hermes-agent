@@ -7,8 +7,8 @@ This plugin installs a ``logging.Handler`` that forwards a curated, throttled
 slice of those records to the home channel via the ``send_message`` tool (a bare
 platform target resolves to home). Zero core emit-site edits.
 
-Opt-in: inert unless ``HERMES_HOME_LOG_ENABLED`` is set. With no home channel
-configured the forward is a silent no-op.
+Enabling the plugin activates it; ``HERMES_HOME_LOG_ENABLED=0`` is a kill switch.
+With no home channel configured the forward is a silent no-op.
 
 Activation is handled by the Hermes plugin system — standalone plugins only load
 when listed in ``plugins.enabled`` (``hermes plugins enable

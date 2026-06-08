@@ -46,7 +46,7 @@ The only setting anyone needs is the enable switch above. Advanced overrides
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `HERMES_HOME_LOG_ENABLED` | (active) | Set to `0` to disable without un-enabling the plugin |
+| `HERMES_HOME_LOG_ENABLED` | (active) | Kill switch — any non-truthy value (`0`/`false`/`off`) disables without un-enabling the plugin. Non-positive numeric knobs below fall back to their defaults. |
 | `HERMES_HOME_LOG_PLATFORM` | `signal` | Platform whose home channel receives forwards |
 | `HERMES_HOME_LOG_LEVEL` | `WARNING` | Minimum level to forward |
 | `HERMES_HOME_LOG_LOGGERS` | (the three above) | Comma-separated logger-name prefixes |
@@ -67,4 +67,15 @@ Five small, independently testable units:
   sending (the platform adapter emits its own logs on another thread that a
   thread-local guard would miss)
 
+The handler and worker are process-lifetime; teardown is bound to `atexit`, not
+`on_session_end` (which fires every conversation turn). Installation is idempotent.
+
 Tests: `tests/plugins/home_log_router/`.
+
+### Known tradeoff
+
+The logger-name allowlist is coupled to internal module names, so an upstream
+rename of those loggers would silently stop forwarding. A deeper fix (a
+structured "operational alert" emit routed through `get_home_channel()`) would be
+rename-proof but requires core changes, which this thin-patch plugin deliberately
+avoids. The allowlist is env-overridable as a mitigation.

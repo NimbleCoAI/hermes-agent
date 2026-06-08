@@ -7,15 +7,22 @@ a ``HomeLogWorker`` that forwards throttled records to the home channel through 
 ``get_home_channel()``; if no home is configured the tool returns an error which
 the worker silently ignores.
 
-``HERMES_HOME_LOG_ENABLED=0`` is an optional kill switch — disable forwarding
-without un-enabling the plugin. Everything else defaults sensibly; no knobs needed.
+The handler and worker are *process-lifetime* resources, so teardown is bound to
+``atexit`` — NOT to ``on_session_end``, which fires at the end of every
+conversation turn and would tear the plugin down after the first message.
+Installation is idempotent so repeated registration never stacks handlers.
+
+``HERMES_HOME_LOG_ENABLED=0`` (or any non-truthy value) is a kill switch.
+Everything else defaults sensibly; no knobs needed.
 """
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import queue
 import time
+from typing import NamedTuple, Tuple
 
 from .guard import ReentrancyGuard
 from .handler import HomeLogHandler
@@ -28,60 +35,118 @@ logger = logging.getLogger(__name__)
 # Loggers whose suppressed records are worth surfacing to home, grounded in the
 # real module logger names: Signal reconnect/health, model cascade fallbacks, and
 # provider errors during model calls. Prefix-matched, so submodules are covered.
-DEFAULT_LOGGERS = (
+DEFAULT_LOGGERS: Tuple[str, ...] = (
     "gateway.platforms.signal",
     "agent.conversation_loop",
     "model_tools",
 )
 
 
-def _truthy(value: str | None) -> bool:
-    return bool(value) and value.strip().lower() not in ("0", "false", "no", "off", "")
+class Config(NamedTuple):
+    enabled: bool
+    platform: str
+    level: int
+    loggers: Tuple[str, ...]
+    rate: int
+    window: int
+    dedup_window: int
+    queue_max: int
 
 
-def _level(name: str) -> int:
-    resolved = logging.getLevelName(name.strip().upper())
-    return resolved if isinstance(resolved, int) else logging.WARNING
+# Matches the project's shared truthy set (utils.TRUTHY_STRINGS). Kept local so
+# this thin-patch plugin stays self-contained and doesn't couple to a core file
+# that churns on upstream rebases (utils.py also uses 3.11-only syntax).
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 def _enabled() -> bool:
-    # Active by default once the plugin is enabled; only an explicit falsey
-    # value disables it (kill switch).
+    # Active by default once the plugin is enabled; any non-truthy value is a
+    # kill switch. Unset (None) stays on; empty/"0"/"false"/"off" turn it off.
     val = os.getenv("HERMES_HOME_LOG_ENABLED")
-    return True if val is None else _truthy(val)
+    if val is None:
+        return True
+    return val.strip().lower() in _TRUTHY
+
+
+def _level(raw: str) -> int:
+    raw = (raw or "").strip()
+    if raw.isdigit():  # numeric levels like "10"/"30" must be honored
+        return int(raw)
+    resolved = logging.getLevelName(raw.upper())
+    return resolved if isinstance(resolved, int) else logging.WARNING
+
+
+def _positive(key: str, default: int) -> int:
+    # A non-positive rate/window/dedup silently breaks throttling (mutes
+    # everything, or disables the rate cap). Fall back to the default instead.
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _read_config() -> Config:
+    raw_loggers = os.getenv("HERMES_HOME_LOG_LOGGERS", "")
+    loggers = tuple(s.strip() for s in raw_loggers.split(",") if s.strip()) or DEFAULT_LOGGERS
+    return Config(
+        enabled=_enabled(),
+        platform=os.getenv("HERMES_HOME_LOG_PLATFORM", "signal").strip() or "signal",
+        level=_level(os.getenv("HERMES_HOME_LOG_LEVEL", "WARNING")),
+        loggers=loggers,
+        rate=_positive("HERMES_HOME_LOG_RATE", 20),
+        window=_positive("HERMES_HOME_LOG_WINDOW", 60),
+        dedup_window=_positive("HERMES_HOME_LOG_DEDUP_WINDOW", 300),
+        queue_max=_positive("HERMES_HOME_LOG_QUEUE", 1000),
+    )
+
+
+# Process-lifetime singletons. register() is idempotent against these.
+_handler: HomeLogHandler | None = None
+_worker: HomeLogWorker | None = None
+_atexit_registered = False
 
 
 def register(ctx) -> None:
-    if not _enabled():
+    global _handler, _worker, _atexit_registered
+    if _handler is not None:
+        return  # already installed — don't stack handlers
+
+    cfg = _read_config()
+    if not cfg.enabled:
         return  # kill switch engaged
 
-    platform = os.getenv("HERMES_HOME_LOG_PLATFORM", "signal").strip() or "signal"
-    level = _level(os.getenv("HERMES_HOME_LOG_LEVEL", "WARNING"))
-    raw_loggers = os.getenv("HERMES_HOME_LOG_LOGGERS", "")
-    loggers = tuple(s.strip() for s in raw_loggers.split(",") if s.strip()) or DEFAULT_LOGGERS
-    rate = _int("HERMES_HOME_LOG_RATE", 20)
-    window = _float("HERMES_HOME_LOG_WINDOW", 60.0)
-    dedup_window = _float("HERMES_HOME_LOG_DEDUP_WINDOW", 300.0)
-    queue_max = _int("HERMES_HOME_LOG_QUEUE", 1000)
-
     guard = ReentrancyGuard()
-    out_queue: "queue.Queue[str]" = queue.Queue(maxsize=queue_max)
-    handler = HomeLogHandler(RoutePolicy(loggers, level), out_queue, guard)
-    throttle = Throttle(rate=rate, window=window, dedup_window=dedup_window, clock=time.monotonic)
-    worker = HomeLogWorker(out_queue, throttle, _make_sender(ctx, platform), guard)
+    out_queue: "queue.Queue[str]" = queue.Queue(maxsize=cfg.queue_max)
+    handler = HomeLogHandler(RoutePolicy(cfg.loggers, cfg.level), out_queue, guard)
+    throttle = Throttle(cfg.rate, cfg.window, cfg.dedup_window, time.monotonic)
+    worker = HomeLogWorker(out_queue, throttle, _make_sender(ctx, cfg.platform), guard)
 
     logging.getLogger().addHandler(handler)
     worker.start()
+    _handler, _worker = handler, worker
+
+    if not _atexit_registered:
+        atexit.register(_teardown)
+        _atexit_registered = True
+
     logger.info(
         "home_log_router active: platform=%s level=%s loggers=%s",
-        platform, logging.getLevelName(level), ",".join(loggers),
+        cfg.platform, logging.getLevelName(cfg.level), ",".join(cfg.loggers),
     )
 
-    def _teardown(**_kwargs):
-        logging.getLogger().removeHandler(handler)
-        worker.stop()
 
-    ctx.register_hook("on_session_end", _teardown)
+def _teardown() -> None:
+    global _handler, _worker
+    if _handler is not None:
+        logging.getLogger().removeHandler(_handler)
+        _handler = None
+    if _worker is not None:
+        _worker.stop()
+        _worker = None
 
 
 def _make_sender(ctx, platform: str):
@@ -91,17 +156,3 @@ def _make_sender(ctx, platform: str):
         ctx.dispatch_tool("send_message", {"target": platform, "message": message})
 
     return sender
-
-
-def _int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, "").strip() or default)
-    except ValueError:
-        return default
-
-
-def _float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, "").strip() or default)
-    except ValueError:
-        return default

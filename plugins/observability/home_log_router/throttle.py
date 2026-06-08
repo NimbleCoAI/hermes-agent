@@ -31,6 +31,7 @@ class Throttle:
         self._window_start = clock()
         self._count = 0  # admits in the current rate window
         self._last_seen: dict[str, float] = {}  # message -> last admit time
+        self._last_prune = self._window_start
         self._suppressed = 0  # suppressions since last summary
 
     def admit(self, message: str) -> List[str]:
@@ -64,12 +65,31 @@ class Throttle:
         out.append(message)
         return out
 
+    def flush_summary(self) -> List[str]:
+        """Emit a pending "N suppressed" summary outside the admit path.
+
+        A burst that ends with suppression (no following admit) would otherwise
+        never report its count. The worker calls this on idle so the tail of a
+        storm is still surfaced.
+        """
+        if self._suppressed <= 0:
+            return []
+        out = [self._summary(self._suppressed)]
+        self._suppressed = 0
+        return out
+
     def _summary(self, n: int) -> str:
         noun = "message" if n == 1 else "messages"
         return f"… {n} more log {noun} suppressed"
 
     def _prune(self, now: float) -> None:
         # Drop dedup entries past their window so the map can't grow unbounded.
+        # Runs at most once per dedup_window, not on every admit: an expired
+        # entry is harmless (admit re-admits it), so eager pruning only wastes
+        # an O(n) scan on the hot path during high-cardinality storms.
+        if now - self._last_prune < self.dedup_window:
+            return
+        self._last_prune = now
         expired = [m for m, ts in self._last_seen.items() if now - ts >= self.dedup_window]
         for m in expired:
             del self._last_seen[m]
