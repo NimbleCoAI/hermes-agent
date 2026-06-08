@@ -547,6 +547,38 @@ class TelegramAdapter(BasePlatformAdapter):
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
 
+    def _is_user_admin(self, user_id: str) -> bool:
+        """Check whether *user_id* is an admin for approval gating.
+
+        Resolution order:
+        1. ``swarm_map_policy.is_platform_admin`` (HSM-backed, if available)
+        2. First entry in ``TELEGRAM_ALLOWED_USERS`` is treated as admin
+        3. Fail-closed: returns False
+        """
+        normalized = str(user_id or "").strip()
+        if not normalized:
+            return False
+
+        # 1. HSM policy (swarm_map_policy plugin)
+        try:
+            from plugins.swarm_map_policy import is_platform_admin
+            if is_platform_admin(normalized, "telegram"):
+                return True
+        except Exception:
+            pass  # plugin not installed or HSM unreachable — fall through
+
+        # 2. First user in TELEGRAM_ALLOWED_USERS is admin
+        allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            first_id = next(
+                (uid.strip() for uid in allowed_csv.split(",") if uid.strip() and uid.strip() != "*"),
+                None,
+            )
+            if first_id and normalized == first_id:
+                return True
+
+        return False
+
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:
@@ -3136,6 +3168,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 ):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
+
+                # Admin-only approval gating — even authorized users may be
+                # blocked from approving if they are not admins.
+                try:
+                    from tools.approval import _get_approval_config
+                    approval_cfg = _get_approval_config()
+                    if approval_cfg.get("admin_only", True) and not self._is_user_admin(caller_id):
+                        await query.answer(text="⛔ Not authorized — only admin users can approve commands.")
+                        return
+                except Exception as _admin_err:
+                    logger.warning("Admin-only approval check failed: %s", _admin_err)
 
                 session_key = self._approval_state.pop(approval_id, None)
                 if not session_key:

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageType
 
 
 @pytest.fixture(autouse=True)
@@ -119,9 +120,12 @@ class TestSignalConnectCleanup:
             result = await adapter.connect()
 
         assert result is False
-        mock_client.aclose.assert_awaited_once()
+        # Both the API client and the dedicated SSE client are created from the
+        # same patched AsyncClient and must both be closed on failed connect.
+        assert mock_client.aclose.await_count == 2
         mock_release.assert_called_once_with("signal-phone", "+15551234567")
         assert adapter.client is None
+        assert adapter.sse_client is None
         assert adapter._platform_lock_identity is None
 
 
@@ -404,7 +408,9 @@ class TestSignalSendImageFile:
         assert captured[0]["method"] == "send"
         assert captured[0]["params"]["account"] == adapter.account
         assert captured[0]["params"]["recipient"] == ["+155****4567"]
-        assert captured[0]["params"]["attachments"] == [str(img_path)]
+        _att = captured[0]["params"]["attachments"]
+        assert len(_att) == 1 and _att[0].startswith("data:") and ";base64," in _att[0]
+        assert f"filename={img_path.name}" in _att[0]
         assert captured[0]["params"]["message"] == ""  # caption=None → ""
         # Typing indicator must be stopped before sending
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
@@ -589,7 +595,9 @@ class TestSignalSendVoice:
 
         assert result.success is True
         assert captured[0]["method"] == "send"
-        assert captured[0]["params"]["attachments"] == [str(audio_path)]
+        _att = captured[0]["params"]["attachments"]
+        assert len(_att) == 1 and _att[0].startswith("data:") and ";base64," in _att[0]
+        assert f"filename={audio_path.name}" in _att[0]
         assert captured[0]["params"]["message"] == ""  # caption=None → ""
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         assert 1234567890 in adapter._recent_sent_timestamps
@@ -678,7 +686,9 @@ class TestSignalSendVideo:
 
         assert result.success is True
         assert captured[0]["method"] == "send"
-        assert captured[0]["params"]["attachments"] == [str(vid_path)]
+        _att = captured[0]["params"]["attachments"]
+        assert len(_att) == 1 and _att[0].startswith("data:") and ";base64," in _att[0]
+        assert f"filename={vid_path.name}" in _att[0]
         assert captured[0]["params"]["message"] == ""  # caption=None → ""
         adapter._stop_typing_indicator.assert_awaited_once_with("+155****4567")
         assert 1234567890 in adapter._recent_sent_timestamps
@@ -1953,3 +1963,160 @@ class TestSignalGroupV2Routing:
 
         assert len(captured) == 1
         assert captured[0].source.chat_type == "dm"
+
+
+# ---------------------------------------------------------------------------
+# Observe-only reaction suppression
+# ---------------------------------------------------------------------------
+
+class TestObserveOnlyReactionSuppression:
+    """Reactions must NOT fire on observe_only events (mention-gating leak)."""
+
+    def _make_event(self, observe_only=True):
+        from gateway.platforms.base import MessageEvent
+        from gateway.session import SessionSource
+        source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="group123",
+            chat_type="group",
+            user_id="+15559999999",
+        )
+        event = MessageEvent(
+            text="hello everyone",
+            source=source,
+            observe_only=observe_only,
+        )
+        # _extract_reaction_target expects sender + timestamp_ms
+        event.raw_message = {
+            "sender": "+15559999999",
+            "timestamp_ms": 1234567890,
+        }
+        return event
+
+    @pytest.mark.asyncio
+    async def test_on_processing_start_skips_observe_only(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.send_reaction = AsyncMock()
+
+        event = self._make_event(observe_only=True)
+        await adapter.on_processing_start(event)
+
+        adapter.send_reaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_on_processing_complete_skips_observe_only(self, monkeypatch):
+        from gateway.platforms.base import ProcessingOutcome
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.send_reaction = AsyncMock()
+        adapter.remove_reaction = AsyncMock()
+
+        event = self._make_event(observe_only=True)
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        adapter.send_reaction.assert_not_called()
+        adapter.remove_reaction.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_normal_event_still_gets_reactions(self, monkeypatch):
+        """Non-observe_only events should still trigger reactions normally."""
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.send_reaction = AsyncMock()
+
+        event = self._make_event(observe_only=False)
+
+        await adapter.on_processing_start(event)
+
+        adapter.send_reaction.assert_called_once()
+
+
+class TestSignalMessageTypeClassification:
+    """Inbound attachments must be classified so run.py surfaces them.
+
+    Regression: a PDF arrived with media_urls populated but message_type=TEXT,
+    so run.py's document handler (gated on MessageType.DOCUMENT) never fired and
+    the bot reported 'I don't see a PDF'."""
+
+    async def _capture(self, monkeypatch, content_type, ext):
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+        adapter.handle_message = fake_handle
+
+        async def fake_fetch(att_id):
+            return (f"/opt/data/cache/documents/file{ext}", ext)
+        adapter._fetch_attachment = fake_fetch
+
+        await adapter._handle_envelope({
+            "envelope": {
+                "sourceNumber": "+15550001111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1000000000,
+                "dataMessage": {
+                    "message": "see attached",
+                    "attachments": [
+                        {"id": "abc", "contentType": content_type, "size": 1000, "filename": f"f{ext}"}
+                    ],
+                },
+            }
+        })
+        return captured["event"]
+
+    @pytest.mark.asyncio
+    async def test_pdf_classified_as_document(self, monkeypatch):
+        event = await self._capture(monkeypatch, "application/pdf", ".pdf")
+        assert event.message_type == MessageType.DOCUMENT
+        assert any(p.endswith(".pdf") for p in event.media_urls)
+
+    @pytest.mark.asyncio
+    async def test_image_still_classified_as_photo(self, monkeypatch):
+        event = await self._capture(monkeypatch, "image/jpeg", ".jpg")
+        assert event.message_type == MessageType.PHOTO
+
+    @pytest.mark.asyncio
+    async def test_audio_still_classified_as_voice(self, monkeypatch):
+        event = await self._capture(monkeypatch, "audio/ogg", ".ogg")
+        assert event.message_type == MessageType.VOICE
+
+
+class TestAttachmentArg:
+    """Outbound attachments are inlined as base64 data: URIs so a
+    separate-container signal-cli can read them without shared mounts."""
+
+    def test_encodes_file_as_data_uri(self, monkeypatch, tmp_path):
+        import base64 as _b64
+        adapter = _make_signal_adapter(monkeypatch)
+        f = tmp_path / "hello.txt"
+        f.write_bytes(b"hello-attachment")
+        arg = adapter._attachment_arg(str(f))
+        assert arg.startswith("data:text/plain;filename=hello.txt;base64,")
+        payload = arg.split("base64,", 1)[1]
+        assert _b64.b64decode(payload) == b"hello-attachment"
+
+    def test_guesses_mime_from_extension(self, monkeypatch, tmp_path):
+        adapter = _make_signal_adapter(monkeypatch)
+        f = tmp_path / "pic.jpg"
+        f.write_bytes(b"\xff\xd8\xff\xe0jpegbytes")
+        arg = adapter._attachment_arg(str(f))
+        assert arg.startswith("data:image/jpeg;filename=pic.jpg;base64,")
+
+    def test_unknown_extension_falls_back_to_octet_stream(self, monkeypatch, tmp_path):
+        adapter = _make_signal_adapter(monkeypatch)
+        f = tmp_path / "blob.weirdext"
+        f.write_bytes(b"\x00\x01\x02")
+        arg = adapter._attachment_arg(str(f))
+        assert arg.startswith("data:application/octet-stream;filename=blob.weirdext;base64,")
+
+    def test_missing_file_falls_back_to_raw_path(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        assert adapter._attachment_arg("/nope/missing.jpg") == "/nope/missing.jpg"
+
+    def test_works_for_tmp_paths(self, monkeypatch, tmp_path):
+        # /tmp is never shared between containers; base64 sidesteps that.
+        adapter = _make_signal_adapter(monkeypatch)
+        f = tmp_path / "voice.m4a"
+        f.write_bytes(b"audio-bytes")
+        arg = adapter._attachment_arg(str(f))
+        assert ";base64," in arg and "filename=voice.m4a" in arg

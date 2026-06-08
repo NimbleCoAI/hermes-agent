@@ -15,6 +15,7 @@ import asyncio
 import base64
 import json
 import logging
+import mimetypes
 import os
 import random
 import time
@@ -63,6 +64,17 @@ SSE_RETRY_DELAY_INITIAL = 2.0
 SSE_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
 HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
+
+
+def _sse_reconnect_log_level(backoff: float) -> int:
+    """Log level for an SSE reconnect, given the current backoff.
+
+    A reconnect while backoff is still at its initial value is the benign,
+    self-healing pooled-socket churn — log it at DEBUG so it doesn't spam
+    WARNINGs. Once the backoff has grown the daemon is persistently
+    unreachable, which is a real problem worth a WARNING.
+    """
+    return logging.DEBUG if backoff <= SSE_RETRY_DELAY_INITIAL else logging.WARNING
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +230,9 @@ class SignalAdapter(BasePlatformAdapter):
 
         # HTTP client
         self.client: Optional[httpx.AsyncClient] = None
+        # Dedicated client for the long-lived SSE stream — no keepalive pooling,
+        # so it never reuses a daemon-closed socket (the reconnect-churn fix).
+        self.sse_client: Optional[httpx.AsyncClient] = None
 
         # Background tasks
         self._sse_task: Optional[asyncio.Task] = None
@@ -280,8 +295,17 @@ class SignalAdapter(BasePlatformAdapter):
             logger.warning("Signal: Could not acquire phone lock (non-fatal): %s", e)
 
         # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
-        from gateway.platforms._http_client_limits import platform_httpx_limits
+        from gateway.platforms._http_client_limits import (
+            platform_httpx_limits,
+            sse_httpx_limits,
+        )
         self.client = httpx.AsyncClient(timeout=30.0, limits=platform_httpx_limits())
+        # Separate client for the SSE stream: no keepalive pool, read timeout
+        # disabled (the stream stays open indefinitely).
+        self.sse_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, read=None),
+            limits=sse_httpx_limits(),
+        )
         try:
             # Health check — verify signal-cli daemon is reachable
             try:
@@ -312,6 +336,9 @@ class SignalAdapter(BasePlatformAdapter):
                 if self.client:
                     await self.client.aclose()
                     self.client = None
+                if self.sse_client:
+                    await self.sse_client.aclose()
+                    self.sse_client = None
                 if lock_acquired:
                     self._release_platform_lock()
 
@@ -342,6 +369,10 @@ class SignalAdapter(BasePlatformAdapter):
             await self.client.aclose()
             self.client = None
 
+        if self.sse_client:
+            await self.sse_client.aclose()
+            self.sse_client = None
+
         self._release_platform_lock()
 
         logger.info("Signal: disconnected")
@@ -358,7 +389,7 @@ class SignalAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 logger.debug("Signal SSE: connecting to %s", url)
-                async with self.client.stream(
+                async with self.sse_client.stream(
                     "GET", url,
                     headers={"Accept": "text/event-stream"},
                     timeout=None,
@@ -402,10 +433,12 @@ class SignalAdapter(BasePlatformAdapter):
                 break
             except httpx.HTTPError as e:
                 if self._running:
-                    logger.warning("Signal SSE: HTTP error: %s (reconnecting in %.0fs)", e, backoff)
+                    logger.log(_sse_reconnect_log_level(backoff),
+                               "Signal SSE: HTTP error: %s (reconnecting in %.0fs)", e, backoff)
             except Exception as e:
                 if self._running:
-                    logger.warning("Signal SSE: error: %s (reconnecting in %.0fs)", e, backoff)
+                    logger.log(_sse_reconnect_log_level(backoff),
+                               "Signal SSE: error: %s (reconnecting in %.0fs)", e, backoff)
 
             if self._running:
                 # Add 20% jitter to prevent thundering herd on reconnection
@@ -758,6 +791,13 @@ class SignalAdapter(BasePlatformAdapter):
                 msg_type = MessageType.VOICE
             elif any(mt.startswith("image/") for mt in media_types):
                 msg_type = MessageType.PHOTO
+            else:
+                # Any other successfully-fetched attachment (PDF, docx, txt, …)
+                # is a document. Without this, run.py's document handler (which
+                # is gated on MessageType.DOCUMENT) never fires, so the file is
+                # downloaded but never surfaced to the agent — the user sends a
+                # PDF and the bot reports "I don't see an attachment".
+                msg_type = MessageType.DOCUMENT
 
         # Parse timestamp from envelope data (milliseconds since epoch)
         ts_ms = envelope_data.get("timestamp", 0)
@@ -1023,6 +1063,34 @@ class SignalAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # JSON-RPC Communication
     # ------------------------------------------------------------------
+
+    def _attachment_arg(self, path: str) -> str:
+        """Build the signal-cli ``send`` attachment argument for a local file.
+
+        In HSM multi-container deployments signal-cli runs in its own
+        container and cannot see the agent's filesystem (``/opt/data``,
+        ``/tmp``), so a bare file path passed to the ``send`` RPC fails with
+        ``AttachmentInvalidException``. Rather than depend on a brittle web
+        of shared host mounts (one per agent, which doesn't scale and the
+        daemon compose never wired up), inline the file as a base64
+        ``data:`` URI — signal-cli 0.14+ accepts
+        ``data:<mime>;filename=<name>;base64,<data>`` for ``--attachment``.
+        This mirrors the inbound path, which already pulls attachments as
+        base64 via ``getAttachment``, and works for any source directory
+        with zero compose changes (single-container setups included).
+
+        Falls back to the raw path if the file can't be read, so a genuinely
+        missing file surfaces signal-cli's own error instead of being masked.
+        """
+        try:
+            data = Path(path).read_bytes()
+        except OSError as e:
+            logger.warning("Signal: could not read attachment %s: %s", path, e)
+            return path
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        name = Path(path).name
+        b64 = base64.b64encode(data).decode("ascii")
+        return f"data:{mime};filename={name};base64,{b64}"
 
     async def _rpc(
         self,
@@ -1446,7 +1514,7 @@ class SignalAdapter(BasePlatformAdapter):
                     chat_id, idx + 1, len(att_batches), estimated
                 )
 
-            params = dict(base_params, attachments=att_batch)
+            params = dict(base_params, attachments=[self._attachment_arg(p) for p in att_batch])
             send_timeout = _signal_send_timeout(n)
 
             for attempt in range(1, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS + 1):
@@ -1554,7 +1622,7 @@ class SignalAdapter(BasePlatformAdapter):
         params: Dict[str, Any] = {
             "account": self.account,
             "message": caption or "",
-            "attachments": [file_path],
+            "attachments": [self._attachment_arg(file_path)],
         }
 
         if chat_id.startswith("group:"):
@@ -1593,7 +1661,7 @@ class SignalAdapter(BasePlatformAdapter):
         params: Dict[str, Any] = {
             "account": self.account,
             "message": caption or "",
-            "attachments": [file_path],
+            "attachments": [self._attachment_arg(file_path)],
         }
 
         if chat_id.startswith("group:"):
@@ -1776,11 +1844,21 @@ class SignalAdapter(BasePlatformAdapter):
         if event is not None:
             sender = getattr(getattr(event, "source", None), "user_id", None)
             if sender and "*" not in self.dm_allow_from and sender not in self.dm_allow_from:
+                # Admin check - unified via HSM (approved users = admins)
+                sender_uuid = getattr(getattr(event, "source", None), "user_id_alt", None)
+                try:
+                    from plugins.swarm_map_policy import is_platform_admin
+                    if is_platform_admin(sender, "signal") or (sender_uuid and is_platform_admin(sender_uuid, "signal")):
+                        return True
+                except Exception:
+                    pass
                 return False
         return True
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """React with 👀 when processing begins."""
+        if getattr(event, 'observe_only', False):
+            return
         if not self._reactions_enabled(event):
             return
         target = self._extract_reaction_target(event)
@@ -1793,6 +1871,8 @@ class SignalAdapter(BasePlatformAdapter):
         On CANCELLED we leave the 👀 in place — no terminal outcome means
         the reaction should keep reflecting "in progress" (matches Telegram).
         """
+        if getattr(event, 'observe_only', False):
+            return
         if not self._reactions_enabled(event):
             return
         if outcome == ProcessingOutcome.CANCELLED:

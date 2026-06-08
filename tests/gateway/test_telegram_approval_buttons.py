@@ -261,8 +261,9 @@ class TestTelegramApprovalCallback:
         query.from_user.id = "12345"
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
-                await adapter._handle_callback_query(update, context)
+            with patch("tools.approval._get_approval_config", return_value={"admin_only": False}):
+                with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+                    await adapter._handle_callback_query(update, context)
 
         mock_resolve.assert_called_once_with("agent:main:telegram:group:12345:99", "once")
         query.answer.assert_called_once()
@@ -299,8 +300,9 @@ class TestTelegramApprovalCallback:
         context = MagicMock()
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            with patch("tools.approval.resolve_gateway_approval", return_value=1):
-                await adapter._handle_callback_query(update, context)
+            with patch("tools.approval._get_approval_config", return_value={"admin_only": False}):
+                with patch("tools.approval.resolve_gateway_approval", return_value=1):
+                    await adapter._handle_callback_query(update, context)
 
         assert "12345" not in adapter._typing_paused
 
@@ -327,8 +329,9 @@ class TestTelegramApprovalCallback:
         context = MagicMock()
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            with patch("tools.approval.resolve_gateway_approval", return_value=0):
-                await adapter._handle_callback_query(update, context)
+            with patch("tools.approval._get_approval_config", return_value={"admin_only": False}):
+                with patch("tools.approval.resolve_gateway_approval", return_value=0):
+                    await adapter._handle_callback_query(update, context)
 
         assert "12345" in adapter._typing_paused
 
@@ -352,8 +355,9 @@ class TestTelegramApprovalCallback:
         query.from_user.id = "12345"
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            with patch("tools.approval.resolve_gateway_approval", return_value=1):
-                await adapter._handle_callback_query(update, context)
+            with patch("tools.approval._get_approval_config", return_value={"admin_only": False}):
+                with patch("tools.approval.resolve_gateway_approval", return_value=1):
+                    await adapter._handle_callback_query(update, context)
 
         edit_kwargs = query.edit_message_text.call_args[1]
         assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
@@ -380,8 +384,9 @@ class TestTelegramApprovalCallback:
         query.from_user.id = "12345"
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
-                await adapter._handle_callback_query(update, context)
+            with patch("tools.approval._get_approval_config", return_value={"admin_only": False}):
+                with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+                    await adapter._handle_callback_query(update, context)
 
         mock_resolve.assert_called_once_with("some-session", "deny")
         edit_kwargs = query.edit_message_text.call_args[1]
@@ -441,8 +446,9 @@ class TestTelegramApprovalCallback:
         query.from_user.id = "12345"
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
-                await adapter._handle_callback_query(update, context)
+            with patch("tools.approval._get_approval_config", return_value={"admin_only": False}):
+                with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+                    await adapter._handle_callback_query(update, context)
 
         # Should NOT resolve — already handled
         mock_resolve.assert_not_called()

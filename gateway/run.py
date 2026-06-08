@@ -67,8 +67,8 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
-_TELEGRAM_NOISY_STATUS_RE = re.compile(
-    r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
+_NOISY_STATUS_RE = re.compile(
+    r"("  # transient/auxiliary status — stays in logs, suppressed from all chat platforms
     r"auxiliary\s+.+\s+failed"
     r"|compression\s+summary\s+failed"
     r"|fallback\s+context\s+marker"
@@ -80,6 +80,9 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|retrying\s+in\s+\d"
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
+    r"|rate\s+limited.*switching\s+to\s+fallback"
+    r"|primary\s+model\s+failed.*switching\s+to\s+fallback"
+    r"|still\s+working.*elapsed.*iteration"
     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
     r")",
     re.IGNORECASE | re.DOTALL,
@@ -293,7 +296,7 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """
     if not text:
         return text
-    if _gateway_platform_value(platform) != "telegram":
+    if _gateway_platform_value(platform) in ("local", "cli"):
         return text
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
@@ -307,11 +310,11 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
+    if _gateway_platform_value(platform) in ("local", "cli"):
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
-    if _TELEGRAM_NOISY_STATUS_RE.search(text):
+    if _NOISY_STATUS_RE.search(text):
         return None
     if _looks_like_gateway_provider_error(text):
         return _gateway_provider_error_reply(text)
@@ -6377,6 +6380,25 @@ class GatewayRunner:
             return YuanbaoAdapter(config)
 
         return None
+    @staticmethod
+    def _chat_id_in_allowlist(source: SessionSource, allowed_group_ids: set) -> bool:
+        """Return True if this group chat is in *allowed_group_ids*.
+
+        Matches the platform chat id and any platform-internal alias. Signal
+        exposes ``chat_id`` as ``group:<id>`` while ``SIGNAL_GROUP_ALLOWED_USERS``
+        lists the bare ``<id>``; ``chat_id_alt`` carries that bare id and the
+        ``group:`` prefix is also stripped so explicit group IDs match either
+        form. (Wildcard ``*`` is handled by the caller.)
+        """
+        candidates = set()
+        if source.chat_id:
+            candidates.add(source.chat_id)
+            if ":" in source.chat_id:
+                candidates.add(source.chat_id.split(":", 1)[1])
+        if getattr(source, "chat_id_alt", None):
+            candidates.add(source.chat_id_alt)
+        return bool(candidates & allowed_group_ids)
+
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
@@ -6412,6 +6434,14 @@ class GatewayRunner:
             chat_allowlist_env = {
                 Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
+                # Signal authorizes by group, not by sender. SIGNAL_GROUP_ALLOWED_USERS
+                # holds the allowed group IDs (or "*" = all groups). The Signal
+                # adapter already drops messages from non-allowlisted groups and
+                # marks unmentioned messages observe_only, so any group message
+                # reaching here is from an allowed group — authorize the sender so
+                # non-admin members get answered when they @mention the bot.
+                # DMs remain gated by SIGNAL_ALLOWED_USERS (handled below).
+                Platform.SIGNAL: "SIGNAL_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
             if chat_allowlist_env:
                 raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
@@ -6421,7 +6451,9 @@ class GatewayRunner:
                         for cid in raw_chat_allowlist.split(",")
                         if cid.strip()
                     }
-                    if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
+                    if "*" in allowed_group_ids or self._chat_id_in_allowlist(
+                        source, allowed_group_ids
+                    ):
                         return True
 
         if not user_id:
@@ -6452,6 +6484,7 @@ class GatewayRunner:
         platform_group_chat_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
+            Platform.SIGNAL: "SIGNAL_GROUP_ALLOWED_USERS",
         }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
@@ -6526,7 +6559,9 @@ class GatewayRunner:
             allowed_group_ids = {
                 chat_id.strip() for chat_id in group_chat_allowlist.split(",") if chat_id.strip()
             }
-            if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
+            if "*" in allowed_group_ids or self._chat_id_in_allowlist(
+                source, allowed_group_ids
+            ):
                 return True
 
         # Backward-compat shim for #15027: prior to PR #17686,
@@ -13801,7 +13836,17 @@ class GatewayRunner:
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
+            _get_approval_config,
         )
+
+        # Admin-only gating: when admin_only is set (default True),
+        # only admin users may approve dangerous commands.
+        approval_cfg = _get_approval_config()
+        if approval_cfg.get("admin_only", True):
+            from gateway.slash_access import policy_for_source as _policy_for_source
+            _policy = _policy_for_source(self.config, source)
+            if _policy.enabled and not _policy.is_admin(source.user_id):
+                return "⛔ Not authorized — only admin users can approve/deny dangerous commands."
 
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:
@@ -13847,7 +13892,17 @@ class GatewayRunner:
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
+            _get_approval_config,
         )
+
+        # Admin-only gating: when admin_only is set (default True),
+        # only admin users may deny dangerous commands.
+        approval_cfg = _get_approval_config()
+        if approval_cfg.get("admin_only", True):
+            from gateway.slash_access import policy_for_source as _policy_for_source
+            _policy = _policy_for_source(self.config, source)
+            if _policy.enabled and not _policy.is_admin(source.user_id):
+                return "⛔ Not authorized — only admin users can approve/deny dangerous commands."
 
         if not has_blocking_approval(session_key):
             if session_key in self._pending_approvals:

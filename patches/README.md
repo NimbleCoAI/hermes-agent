@@ -12,7 +12,7 @@ Adds per-channel/tenant memory isolation. Memory writes are routed to scoped sub
 
 ### Swarm Map Policy Plugin
 
-[Hermes Swarm Map](https://github.com/NimbleCoOrg/hermes-swarm-map) integration plugin for group access control. Uses standard plugin hooks — no core code changes.
+[Hermes Swarm Map](https://github.com/NimbleCoAI/hermes-swarm-map) integration plugin for group access control. Uses standard plugin hooks — no core code changes.
 
 **Files changed:** `plugins/swarm_map_policy/`
 
@@ -42,5 +42,5 @@ git format-patch upstream/main..HEAD -o patches/
 
 ## Related
 
-- [Hermes Swarm Map](https://github.com/NimbleCoOrg/hermes-swarm-map) — Admin GUI for managing Hermes agents
+- [Hermes Swarm Map](https://github.com/NimbleCoAI/hermes-swarm-map) — Admin GUI for managing Hermes agents
 - Upstream Issue: _link pending_

@@ -343,6 +343,43 @@ class TestLoadGatewayConfig:
         # Env value preserved, not clobbered by yaml.
         assert os.environ.get("DISCORD_THREAD_REQUIRE_MENTION") == "true"
 
+    def test_top_level_require_mention_bridges_to_signal(self, tmp_path, monkeypatch):
+        """A top-level `require_mention: true` should gate Signal groups, the same
+        way it already bridges to Telegram (config.py:957). Users write the
+        shorthand alongside `group_sessions_per_user` expecting it to apply to
+        every platform — Signal silently ignored it, so agents kept replying to
+        unmentioned group messages (hermes-personal incident)."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "require_mention: true\n"
+            "signal:\n"
+            "  home_channel: support bus\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("SIGNAL_REQUIRE_MENTION", raising=False)
+
+        load_gateway_config()
+
+        assert os.environ.get("SIGNAL_REQUIRE_MENTION") == "true"
+
+    def test_signal_require_mention_yaml_does_not_overwrite_env(self, tmp_path, monkeypatch):
+        """Explicit SIGNAL_REQUIRE_MENTION env wins over the top-level shorthand."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text("require_mention: true\n", encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("SIGNAL_REQUIRE_MENTION", "false")  # user override
+
+        load_gateway_config()
+
+        assert os.environ.get("SIGNAL_REQUIRE_MENTION") == "false"
+
     def test_bridges_quoted_false_platform_enabled_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

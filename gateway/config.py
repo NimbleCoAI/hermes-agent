@@ -1062,8 +1062,15 @@ def load_gateway_config() -> GatewayConfig:
             # Signal settings → env vars (env vars take precedence)
             signal_cfg = yaml_cfg.get("signal", {})
             if isinstance(signal_cfg, dict):
-                if "require_mention" in signal_cfg and not os.getenv("SIGNAL_REQUIRE_MENTION"):
-                    os.environ["SIGNAL_REQUIRE_MENTION"] = str(signal_cfg["require_mention"]).lower()
+                # Prefer signal.require_mention; fall back to the top-level
+                # shorthand. Users write `require_mention: true` at the top
+                # level (alongside group_sessions_per_user) expecting it to gate
+                # every platform — Telegram already honors this (see above), so
+                # Signal must too, otherwise agents reply to unmentioned group
+                # messages despite the setting.
+                _signal_rm = signal_cfg.get("require_mention", yaml_cfg.get("require_mention"))
+                if _signal_rm is not None and not os.getenv("SIGNAL_REQUIRE_MENTION"):
+                    os.environ["SIGNAL_REQUIRE_MENTION"] = str(_signal_rm).lower()
 
             # DingTalk settings → env vars (env vars take precedence)
             dingtalk_cfg = yaml_cfg.get("dingtalk", {})
