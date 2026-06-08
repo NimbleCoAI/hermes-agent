@@ -5,14 +5,11 @@ Also tests the vision_tools and browser_tool model override env vars.
 """
 
 import asyncio
-import json
 import os
 import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 
-import pytest
-import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
