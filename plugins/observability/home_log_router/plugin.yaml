@@ -1,0 +1,6 @@
+name: home_log_router
+version: "1.0.0"
+description: "Forward selected suppressed logs (cascade fallbacks, provider errors, persistent reconnects) to the agent's home channel via send_message. Opt-in via `hermes plugins enable observability/home_log_router`. Inert when no home channel is set; disable with HERMES_HOME_LOG_ENABLED=0."
+author: NimbleCo
+hooks:
+  - on_session_end
