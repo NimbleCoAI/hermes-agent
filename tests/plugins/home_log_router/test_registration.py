@@ -63,19 +63,35 @@ def test_register_is_idempotent(monkeypatch):
         registration._teardown()
 
 
+def _capture_sends(monkeypatch):
+    """Patch _send_to_home (the real sink) and capture (platform, message) calls.
+
+    The sink calls the send_message tool FUNCTION directly — NOT ctx.dispatch_tool,
+    which returns "Unknown tool: send_message" in the gateway worker context.
+    """
+    sent = []
+    evt = threading.Event()
+
+    def fake(platform, message):
+        sent.append((platform, message))
+        evt.set()
+
+    monkeypatch.setattr(registration, "_send_to_home", fake)
+    return sent, evt
+
+
 def test_forwards_record_to_send_message_home(monkeypatch):
     monkeypatch.delenv("HERMES_HOME_LOG_ENABLED", raising=False)
-    ctx = FakeCtx()
+    sent, evt = _capture_sends(monkeypatch)
     try:
-        registration.register(ctx)
+        registration.register(FakeCtx())
         log = logging.getLogger("gateway.platforms.signal")
         log.setLevel(logging.DEBUG)
         log.warning("disk full on %s", "agent-7")
-        assert ctx.tool_event.wait(timeout=2.0), "send_message was never dispatched"
-        name, args = ctx.dispatched[0]
-        assert name == "send_message"
-        assert args["target"] == "signal"
-        assert "disk full on agent-7" in args["message"]
+        assert evt.wait(timeout=2.0), "log was never forwarded to home"
+        platform, message = sent[0]
+        assert platform == "signal"
+        assert "disk full on agent-7" in message
     finally:
         registration._teardown()
 
@@ -83,14 +99,13 @@ def test_forwards_record_to_send_message_home(monkeypatch):
 def test_respects_platform_env(monkeypatch):
     monkeypatch.delenv("HERMES_HOME_LOG_ENABLED", raising=False)
     monkeypatch.setenv("HERMES_HOME_LOG_PLATFORM", "telegram")
-    ctx = FakeCtx()
+    sent, evt = _capture_sends(monkeypatch)
     try:
-        registration.register(ctx)
+        registration.register(FakeCtx())
         log = logging.getLogger("model_tools")
         log.setLevel(logging.DEBUG)
         log.error("provider down")
-        assert ctx.tool_event.wait(timeout=2.0)
-        _, args = ctx.dispatched[0]
-        assert args["target"] == "telegram"
+        assert evt.wait(timeout=2.0)
+        assert sent[0][0] == "telegram"
     finally:
         registration._teardown()
