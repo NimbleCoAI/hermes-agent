@@ -1483,6 +1483,13 @@ AUTHOR_MAP = {
     "leonard@sellem.me": "leonardsellem",  # PR #37405 (desktop WS origin guard on remote/Tailscale binds)
     "42903577+ohMyJason@users.noreply.github.com": "ohMyJason",  # PR #29810 (discover_models in custom_providers section 4)
     "singhsanidhya741@gmail.com": "sanidhyasin",  # PR #40403 salvage (model.default_headers for custom OpenAI-compatible providers, #40033)
+    # New upstream contributors picked up by the 2026-06-07 sync merge.
+    "enesilhaydin@gmail.com": "enesilhaydin",
+    "ilonagaja509-glitch@users.noreply.github.com": "ilonagaja509-glitch",
+    "info@amikchat.site": "AMIK-coorporations",
+    "naqerl@users.noreply.github.com": "naqerl",
+    "redpiggy-cyber@users.noreply.github.com": "redpiggy-cyber",
+    "vinoth12940@users.noreply.github.com": "vinoth12940",
 }
 
 
