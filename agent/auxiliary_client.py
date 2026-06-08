@@ -5416,7 +5416,7 @@ def call_llm(
                 reason = "rate limit"
             else:
                 reason = "connection error"
-            logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
+            logger.warning("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
             # Fallback order (#26882, #26803):
@@ -5840,7 +5840,7 @@ async def async_call_llm(
                 reason = "rate limit"
             else:
                 reason = "connection error"
-            logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
+            logger.warning("Auxiliary %s (async): %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
             # Fallback order (#26882, #26803):

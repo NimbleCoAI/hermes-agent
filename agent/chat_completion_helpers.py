@@ -1251,7 +1251,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             f"🔄 Primary model failed — switching to fallback: "
             f"{fb_model} via {fb_provider}"
         )
-        logger.info(
+        logger.warning(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
         )

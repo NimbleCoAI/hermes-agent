@@ -23,6 +23,9 @@ def test_defaults(monkeypatch):
     assert c.platform == "signal"
     assert c.level == logging.WARNING
     assert c.loggers == DEFAULT_LOGGERS
+    # cascade + provider fallbacks (incl. auxiliary client) forward by default
+    assert "agent.conversation_loop" in c.loggers
+    assert "agent.auxiliary_client" in c.loggers
     assert c.rate == 20 and c.window == 60 and c.dedup_window == 300
 
 

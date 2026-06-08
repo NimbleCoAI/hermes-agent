@@ -39,6 +39,7 @@ DEFAULT_LOGGERS: Tuple[str, ...] = (
     "gateway.platforms.signal",
     "agent.conversation_loop",
     "model_tools",
+    "agent.auxiliary_client",
 )
 
 
