@@ -38,6 +38,7 @@ import importlib
 import importlib.metadata
 import importlib.util
 import inspect
+import json
 import logging
 import os
 import sys
@@ -265,6 +266,16 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # Declared capabilities — an optional, opt-in allow-list the plugin
+    # publishes for itself in ``plugin.yaml``. When a key is present it is
+    # enforced fail-closed; when absent the plugin is unrestricted (preserving
+    # backward compatibility). Currently honoured:
+    #   ``tools``: list[str] — tool names this plugin may dispatch via
+    #              ``PluginContext.dispatch_tool``. An undeclared tool is
+    #              refused before reaching the registry, closing the
+    #              lateral-movement path for shared/third-party plugins.
+    # (``network``/``fs``/``env`` are reserved for future enforcement points.)
+    declared_capabilities: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -481,6 +492,20 @@ class PluginContext:
         Returns:
             JSON string from the tool handler (same format as model tool calls).
         """
+        # Enforce the plugin's declared tool capabilities (opt-in, fail-closed).
+        # When ``declared_capabilities.tools`` is present, a tool outside the
+        # allow-list is refused *before* the registry is touched — closing the
+        # lateral-movement path where a shared/third-party plugin's own code
+        # dispatches arbitrary tools. Absent declaration => unrestricted.
+        allowed_tools = (self.manifest.declared_capabilities or {}).get("tools")
+        if allowed_tools is not None and tool_name not in allowed_tools:
+            return json.dumps({
+                "error": (
+                    f"Plugin '{self.manifest.name}' is not permitted to dispatch "
+                    f"tool '{tool_name}': not in its declared_capabilities.tools."
+                )
+            })
+
         from tools.registry import registry
 
         # Wire up parent agent context when available (CLI mode).
@@ -1322,6 +1347,7 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                declared_capabilities=data.get("declared_capabilities") or {},
             )
         except Exception as exc:
             logger.warning(
