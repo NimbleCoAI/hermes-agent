@@ -1,0 +1,6 @@
+name: gardener_approvals
+version: "1.0.0"
+description: "Deterministic two-way Signal approvals trigger — routes a gardener decision reply through the decision-approve gate with the verified sender UUID. Enable via `hermes plugins enable gardener_approvals`."
+author: nimbleco gardener
+hooks:
+  - pre_llm_call
