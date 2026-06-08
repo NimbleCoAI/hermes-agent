@@ -633,7 +633,6 @@ class SignalAdapter(BasePlatformAdapter):
         if not data_message:
             return
 
-        # Check for group message.
         # Modern Signal groups surface on dataMessage.groupV2.id; legacy V1
         # groups still arrive under dataMessage.groupInfo.groupId. signal-cli
         # versions differ in which field they expose for V2 groups — some

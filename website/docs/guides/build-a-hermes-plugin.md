@@ -272,13 +272,18 @@ def register(ctx):
 **`dispatch_tool` example — a slash command that runs a tool:**
 
 ```python
-def handle_scan(ctx, argstr):
+def handle_scan(ctx, raw_args: str):
     """Implement /scan by invoking the terminal tool through the registry."""
-    result = ctx.dispatch_tool("terminal", {"command": f"find . -name '{argstr}'"})
+    result = ctx.dispatch_tool("terminal", {"command": f"find . -name '{raw_args}'"})
     return result  # returned to the caller's chat UI
 
 def register(ctx):
-    ctx.register_command("scan", handle_scan, help="Find files matching a glob")
+    # Handlers receive a single raw_args string; close over ctx via a lambda.
+    ctx.register_command(
+        "scan",
+        lambda raw: handle_scan(ctx, raw),
+        description="Find files matching a glob",
+    )
 ```
 
 The dispatched tool goes through the normal approval, redaction, and budget pipelines — it's a real tool invocation, not a shortcut around them.
@@ -706,7 +711,7 @@ def register(ctx):
 
 After registration, users can type `/mystatus` in any session. The command appears in autocomplete, `/help` output, and the Telegram bot menu.
 
-**Signature:** `ctx.register_command(name: str, handler: Callable, description: str = "")`
+**Signature:** `ctx.register_command(name: str, handler: Callable, description: str = "", args_hint: str = "")`
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -770,7 +775,7 @@ def register(ctx):
 **Runtime behavior:**
 
 - **CLI mode:** `parent_agent` is resolved from the active CLI agent so workspace hints, spinner, and model selection inherit as expected.
-- **Gateway mode:** There is no CLI agent, so tools degrade gracefully — workspace is read from `TERMINAL_CWD` and no spinner is shown.
+- **Gateway mode:** There is no CLI agent, so tools degrade gracefully — workspace is read from the configured terminal working directory and no spinner is shown.
 - **Explicit override:** If the caller passes `parent_agent=` explicitly, it is respected and not overwritten.
 
 This is the public, stable interface for tool dispatch from plugin commands. Plugins should not reach into `ctx._cli_ref.agent` or similar private state.
@@ -896,11 +901,15 @@ class MyMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
 
-    def sync_turn(self, user_message, assistant_response, **kwargs) -> None:
+    def sync_turn(self, user_content, assistant_content, *,
+                  session_id="", messages=None) -> None:
         ...
 
-    def prefetch(self, query: str, **kwargs) -> str | None:
+    def prefetch(self, query, *, session_id="") -> str:
         ...
+
+    def get_tool_schemas(self) -> list[dict]:
+        return []   # required @abstractmethod — see full guide
 
 def register(ctx):
     ctx.register_memory_provider(MyMemoryProvider())
@@ -921,8 +930,9 @@ class MyContextEngine(ContextEngine):
     def name(self) -> str:
         return "my-engine"
 
-    def should_compress(self, messages, model) -> bool: ...
-    def compress(self, messages, model) -> list[dict]: ...
+    def update_from_response(self, usage) -> None: ...
+    def should_compress(self, prompt_tokens: int = None) -> bool: ...
+    def compress(self, messages, current_tokens=None, focus_topic=None) -> list: ...
 
 def register(ctx):
     ctx.register_context_engine(MyContextEngine())
@@ -946,7 +956,9 @@ class MyImageGenProvider(ImageGenProvider):
         return "my-imggen"
 
     def is_available(self) -> bool: ...
-    def generate(self, prompt: str, **kwargs) -> str: ...   # returns image path
+    def generate(self, prompt: str, aspect_ratio="landscape", **kwargs) -> dict:
+        # returns success_response(...) / error_response(...)
+        ...
 
 def register(ctx):
     ctx.register_image_gen_provider(MyImageGenProvider())
