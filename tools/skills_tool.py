@@ -790,11 +790,30 @@ def _serve_plugin_skill(
             ensure_ascii=False,
         )
 
-    # Injection scan — log but still serve (matches local-skill behaviour)
-    if any(p in content.lower() for p in _INJECTION_PATTERNS):
+    # Injection scan (inbound security boundary). Plugin-provided skills are
+    # shared/third-party artifacts whose body becomes model-followed
+    # instructions, so we scan with the shared threat-pattern library (the
+    # same one guarding SOUL.md/AGENTS.md) and refuse fail-closed — rather
+    # than the previous weak, log-but-serve behaviour. An injection payload
+    # in a shared skill must never reach the model.
+    from tools.threat_patterns import scan_for_threats
+
+    findings = scan_for_threats(content, scope="context")
+    if findings:
         logger.warning(
-            "Plugin skill '%s:%s' contains patterns that may indicate prompt injection",
-            namespace, bare,
+            "Plugin skill '%s:%s' BLOCKED: potential prompt injection (%s)",
+            namespace, bare, ", ".join(findings),
+        )
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Skill '{namespace}:{bare}' was blocked: its content "
+                    f"contains potential prompt injection ({', '.join(findings)}). "
+                    f"Not loaded."
+                ),
+            },
+            ensure_ascii=False,
         )
 
     description = str(parsed_frontmatter.get("description", ""))
