@@ -133,6 +133,8 @@ _DEFAULT_PAYLOADS = {
         "is_first_turn": True,
         "model": "gpt-4",
         "platform": "cli",
+        "sender_id": "+15550001234",
+        "sender_id_alt": "test-sender-uuid",
     },
     "post_llm_call": {
         "session_id": "test-session",

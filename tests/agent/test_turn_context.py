@@ -185,3 +185,30 @@ def test_no_review_when_memory_disabled():
     agent = _FakeAgent()
     ctx = _build(agent)
     assert ctx.should_review_memory is False
+
+
+def test_pre_llm_call_receives_sender_id_alt(monkeypatch):
+    """build_turn_context must forward agent._user_id_alt to the
+    pre_llm_call hook as sender_id_alt."""
+    captured: list[dict] = []
+
+    def _fake_invoke_hook(event, **kwargs):
+        captured.append({"event": event, "kwargs": kwargs})
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_invoke_hook)
+
+    agent = _FakeAgent()
+    agent._user_id = "+15550001234"
+    agent._user_id_alt = "U-ACI-TEST"
+
+    _build(agent)
+
+    pre_llm_calls = [c for c in captured if c["event"] == "pre_llm_call"]
+    assert pre_llm_calls, "pre_llm_call hook was never invoked"
+    kwargs = pre_llm_calls[0]["kwargs"]
+    assert kwargs.get("sender_id_alt") == "U-ACI-TEST", (
+        f"expected sender_id_alt='U-ACI-TEST', got {kwargs.get('sender_id_alt')!r}"
+    )
+    # Confirm sender_id is also present for completeness.
+    assert kwargs.get("sender_id") == "+15550001234"
