@@ -371,3 +371,7 @@ class TestBroadenedSecretReadDeny:
     def test_env_example_still_allowed(self):
         from agent.file_safety import get_read_block_error
         assert get_read_block_error("/tmp/project/.env.example") is None
+
+    def test_underscore_service_account_denied(self):
+        from agent.file_safety import get_read_block_error
+        assert get_read_block_error("/secrets/foo_service_account.json") is not None

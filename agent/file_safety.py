@@ -168,7 +168,10 @@ _BLOCKED_PROJECT_ENV_BASENAMES: set[str] = {
 # approval, and L3 (secret not in the agent's mount) is the real boundary.
 # See glocal-scoping design, Read-floor section.
 _SECRET_READ_DENY_BASENAMES: frozenset[str] = frozenset({
-    "credentials",        # ~/.aws/credentials and similar cloud-CLI stores
+    # Bare "credentials" is broad (may block non-secret project files) but the
+    # DiD error is recoverable; cloud-CLI stores (~/.aws/credentials, gcloud)
+    # warrant the blanket block.
+    "credentials",
     ".git-credentials",
     ".netrc",
     ".pgpass",
@@ -180,7 +183,10 @@ _SECRET_READ_DENY_BASENAMES: frozenset[str] = frozenset({
     "id_dsa",
 })
 
-# Directory-name segments whose contents are credential stores.
+# Read-side credential dirs. Intentionally narrower than the write denylist
+# (build_write_denied_prefixes) — dirs like ~/.docker, ~/.azure, ~/.config/gh
+# are write-guarded but hold little plaintext-secret material the agent would
+# read, so they are omitted here.
 _SECRET_READ_DENY_DIR_SEGMENTS: tuple[str, ...] = (
     "/.aws/",
     "/.config/gcloud/",
@@ -201,7 +207,11 @@ def _looks_like_secret_read(resolved: Path) -> bool:
         return True
     if name.endswith(".pem"):
         return True
-    if name.endswith(".json") and "service-account" in name:
+    # Both hyphen (Google Cloud Console canonical) and underscore (Terraform,
+    # some SDKs) forms of service-account key filenames.
+    if name.endswith(".json") and (
+        "service-account" in name or "service_account" in name
+    ):
         return True
     full = str(resolved).lower()
     full_padded = full if full.endswith("/") else full + "/"
