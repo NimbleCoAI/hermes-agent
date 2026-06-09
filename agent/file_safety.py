@@ -161,6 +161,62 @@ _BLOCKED_PROJECT_ENV_BASENAMES: set[str] = {
     ".envrc",
 }
 
+# Broadened secret-bearing credential material denied to the read-file tool
+# anywhere on disk: cloud service-account JSON, private keys, and cloud-CLI
+# credential dirs. Defense-in-depth only — the terminal tool can still cat
+# these; L2 (DANGEROUS_PATTERNS in tools/approval.py) routes that through
+# approval, and L3 (secret not in the agent's mount) is the real boundary.
+# See glocal-scoping design, Read-floor section.
+_SECRET_READ_DENY_BASENAMES: frozenset[str] = frozenset({
+    # Bare "credentials" is broad (may block non-secret project files) but the
+    # DiD error is recoverable; cloud-CLI stores (~/.aws/credentials, gcloud)
+    # warrant the blanket block.
+    "credentials",
+    ".git-credentials",
+    ".netrc",
+    ".pgpass",
+    ".npmrc",
+    ".pypirc",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
+})
+
+# Read-side credential dirs. Intentionally narrower than the write denylist
+# (build_write_denied_prefixes) — dirs like ~/.docker, ~/.azure, ~/.config/gh
+# are write-guarded but hold little plaintext-secret material the agent would
+# read, so they are omitted here.
+_SECRET_READ_DENY_DIR_SEGMENTS: tuple[str, ...] = (
+    "/.aws/",
+    "/.config/gcloud/",
+    "/.kube/",
+    "/.gnupg/",
+    "/.ssh/",
+)
+
+
+def _looks_like_secret_read(resolved: Path) -> bool:
+    """True when *resolved* points at credential / key material the agent
+    should never read raw (cloud SA keys, private keys, credential dirs).
+
+    Defense-in-depth heuristic, not a boundary — see module docstring.
+    """
+    name = resolved.name.lower()
+    if name in _SECRET_READ_DENY_BASENAMES:
+        return True
+    if name.endswith(".pem"):
+        return True
+    # Both hyphen (Google Cloud Console canonical) and underscore (Terraform,
+    # some SDKs) forms of service-account key filenames.
+    if name.endswith(".json") and (
+        "service-account" in name or "service_account" in name
+    ):
+        return True
+    full = str(resolved).lower()
+    full_padded = full if full.endswith("/") else full + "/"
+    return any(seg in full_padded for seg in _SECRET_READ_DENY_DIR_SEGMENTS)
+
 
 def get_read_block_error(path: str) -> Optional[str]:
     """Return an error message when a read targets a denied Hermes path.
@@ -303,6 +359,16 @@ def get_read_block_error(path: str) -> Optional[str]:
             "and cannot be read to prevent credential leakage. "
             "If you need to check the file structure, read .env.example instead. "
             "(Defense-in-depth — not a security boundary; the terminal tool can still bypass.)"
+        )
+
+    # Broadened secret-bearing credential material anywhere on disk.
+    if _looks_like_secret_read(resolved):
+        return (
+            f"Access denied: {path} looks like secret-bearing credential "
+            "material and cannot be read directly to prevent credential "
+            "leakage. Provider tools consume credentials through internal "
+            "channels. (Defense-in-depth — not a security boundary; the "
+            "terminal tool can still bypass.)"
         )
 
     return None

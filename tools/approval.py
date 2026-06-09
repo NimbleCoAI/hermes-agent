@@ -485,6 +485,20 @@ DANGEROUS_PATTERNS = [
     # into a single -X token. Catches the same threat class.
     (r'\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b',
      "sudo with combined-flag privilege escalation"),
+    # Reading credential / secret material through the shell. The read-file
+    # tool already denies these (agent/file_safety.get_read_block_error);
+    # this routes the terminal-tool bypass (cat/cp/base64/… of a secret
+    # path) through the approval flow instead of silently succeeding.
+    # Defense-in-depth — a determined model can still obfuscate; L3 (keeping
+    # secrets out of the agent's mount) is the real fix. Patterns run against
+    # the normalized lowercased command. See glocal-scoping design, L2.
+    (r'\b(cat|less|more|head|tail|nl|xxd|od|strings|base64|cp|install)\b'
+     r'[^\n|]*'
+     r'(\.pem\b|\bid_rsa\b|\bid_ed25519\b|\bid_ecdsa\b|\bid_dsa\b|'
+     r'/\.aws/|/\.ssh/|/\.config/gcloud/|/\.gnupg/|/\.kube/|'
+     r'\.git-credentials\b|service-account[^\s]*\.json|'
+     r'service_account[^\s]*\.json)',
+     "read credential/secret file"),
 ]
 
 
