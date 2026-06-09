@@ -328,6 +328,7 @@ def build_turn_context(
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            sender_id_alt=getattr(agent, "_user_id_alt", None) or "",
         )
         _ctx_parts: list[str] = []
         for r in _pre_results:
