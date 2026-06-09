@@ -337,3 +337,37 @@ def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
     root_tok.parent.mkdir(parents=True, exist_ok=True)
     root_tok.write_text("x")
     assert "MCP token" in (get_read_block_error(str(root_tok)) or "")
+
+
+class TestBroadenedSecretReadDeny:
+    """L1 read-floor: credential material beyond .env is denied to read_file."""
+
+    def test_gcloud_service_account_json_denied(self):
+        from agent.file_safety import get_read_block_error
+        err = get_read_block_error("~/.config/gcloud/my-app-service-account.json")
+        assert err is not None
+        assert "secret" in err.lower()
+
+    def test_aws_credentials_denied(self):
+        from agent.file_safety import get_read_block_error
+        assert get_read_block_error("~/.aws/credentials") is not None
+
+    def test_ssh_private_key_denied(self):
+        from agent.file_safety import get_read_block_error
+        assert get_read_block_error("~/.ssh/id_rsa") is not None
+
+    def test_pem_anywhere_denied(self):
+        from agent.file_safety import get_read_block_error
+        assert get_read_block_error("/tmp/some/cert.pem") is not None
+
+    def test_mounted_service_account_denied(self):
+        from agent.file_safety import get_read_block_error
+        assert get_read_block_error("/secrets/prod-service-account.json") is not None
+
+    def test_ordinary_json_allowed(self):
+        from agent.file_safety import get_read_block_error
+        assert get_read_block_error("/tmp/project/data.json") is None
+
+    def test_env_example_still_allowed(self):
+        from agent.file_safety import get_read_block_error
+        assert get_read_block_error("/tmp/project/.env.example") is None
