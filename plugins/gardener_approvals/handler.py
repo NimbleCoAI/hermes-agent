@@ -11,9 +11,9 @@ from __future__ import annotations
 import logging
 
 from .config import load_config
-from .decisions import read_open_decisions
+from .decisions import most_recent_resolved, read_open_decisions
 from .gate import call_gate
-from .parser import parse_reply
+from .parser import has_approval_intent, parse_reply
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ def _relay(msg: str) -> dict:
 def on_pre_llm_call(*, platform: str = "", user_message: str = "",
                     sender_id: str = "", sender_id_alt: str = "",
                     _config=None, _open_reader=None, _gate_caller=None,
+                    _recent_reader=None,
                     **_kwargs):
     try:
         cfg = _config or load_config()
@@ -44,6 +45,18 @@ def on_pre_llm_call(*, platform: str = "", user_message: str = "",
         open_reader = _open_reader or read_open_decisions
         decisions = open_reader(cfg.decisions_file)
         if not decisions:
+            # Nothing pending. If the user is replying with approval/merge intent,
+            # tell them it's already handled — and explicitly forbid the LLM from
+            # improvising an action (e.g. hunting for a branch to merge).
+            if has_approval_intent(user_message or ""):
+                recent = (_recent_reader or most_recent_resolved)(cfg.decisions_file)
+                note = "No gardener decisions are pending right now."
+                if recent:
+                    note += f" The most recently resolved was {recent.id} ({recent.date})."
+                note += (" If the user is replying to an approval or merge, tell them"
+                         " it's already handled and nothing is pending. Do NOT merge,"
+                         " approve, or act on anything else — there is nothing to act on.")
+                return {"context": "[gardener] " + note}
             return ""
         pr = parse_reply(user_message or "", decisions)
         if pr.ask:

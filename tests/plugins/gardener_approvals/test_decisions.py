@@ -101,3 +101,84 @@ def test_only_open_blocks_returned(tmp_path):
     assert "D-2026-06-09-02" not in ids   # resolved
     assert "D-2026-06-09-01" in ids
     assert "D-2026-06-09-03" in ids
+
+
+# --- most_recent_resolved tests ---
+
+from plugins.gardener_approvals.decisions import most_recent_resolved
+
+SAMPLE_RESOLVED_MULTI = """# Decisions
+
+## D-2026-06-07-01 · First — status: resolved
+- **Decision:** a
+- **Resolved:** 2026-06-07 by Juniper
+
+## D-2026-06-09-01 · Latest — status: resolved
+- **Decision:** b
+- **Resolved:** 2026-06-09 by Juniper
+
+## D-2026-06-08-01 · Middle — status: resolved
+- **Decision:** c
+- **Resolved:** 2026-06-08 by Juniper
+"""
+
+SAMPLE_NO_RESOLVED = """# Decisions
+
+## D-2026-06-09-01 · Open one — status: open
+- **Decision:** pending
+"""
+
+SAMPLE_RESOLVED_NO_DATE = """# Decisions
+
+## D-2026-06-09-01 · No date — status: resolved
+- **Decision:** a
+"""
+
+SAMPLE_RESOLVED_TIE = """# Decisions
+
+## D-2026-06-08-01 · First with same date — status: resolved
+- **Decision:** a
+- **Resolved:** 2026-06-08
+
+## D-2026-06-08-02 · Second with same date — status: resolved
+- **Decision:** b
+- **Resolved:** 2026-06-08
+"""
+
+
+def test_most_recent_resolved_returns_latest_by_date(tmp_path):
+    f = tmp_path / "decisions.md"
+    f.write_text(SAMPLE_RESOLVED_MULTI)
+    r = most_recent_resolved(str(f))
+    assert r is not None
+    assert r.id == "D-2026-06-09-01"
+    assert r.date == "2026-06-09"
+
+
+def test_most_recent_resolved_none_when_no_resolved(tmp_path):
+    f = tmp_path / "decisions.md"
+    f.write_text(SAMPLE_NO_RESOLVED)
+    assert most_recent_resolved(str(f)) is None
+
+
+def test_most_recent_resolved_none_when_missing_file(tmp_path):
+    assert most_recent_resolved(str(tmp_path / "nope.md")) is None
+
+
+def test_most_recent_resolved_no_date_still_returned(tmp_path):
+    # Single resolved block with no Resolved: date — still returns it (date="")
+    f = tmp_path / "decisions.md"
+    f.write_text(SAMPLE_RESOLVED_NO_DATE)
+    r = most_recent_resolved(str(f))
+    assert r is not None
+    assert r.id == "D-2026-06-09-01"
+    assert r.date == ""
+
+
+def test_most_recent_resolved_tie_prefers_last_in_file(tmp_path):
+    # Same date: last one in the file wins
+    f = tmp_path / "decisions.md"
+    f.write_text(SAMPLE_RESOLVED_TIE)
+    r = most_recent_resolved(str(f))
+    assert r is not None
+    assert r.id == "D-2026-06-08-02"

@@ -29,8 +29,9 @@ def test_non_signal_platform_noop():
     assert _call(platform="cli") == ""
 
 
-def test_no_open_decisions_noop():
-    assert _call(_open_reader=lambda p: []) == ""
+def test_no_open_decisions_unrelated_message_noop():
+    # Empty board + no approval intent → still silent
+    assert _call(_open_reader=lambda p: [], user_message="what's the weather") == ""
 
 
 def test_prefers_uuid_alt_over_number():
@@ -120,3 +121,56 @@ def test_merge_decision_approve_calls_gate_with_merge_action():
     assert seen["decision_id"] == "D-2026-06-09-01"
     assert isinstance(out, dict)
     assert "merged PR #27" in out["context"]
+
+
+# --- empty-board guard tests ---
+
+from plugins.gardener_approvals.decisions import Decision
+# ResolvedDecision is defined in decisions.py (will exist after implementation)
+from plugins.gardener_approvals.decisions import ResolvedDecision
+
+
+def test_empty_board_merge_intent_injects_guard_with_recent_id():
+    """Empty board + merge/approve intent → guard dict with recent id mentioned."""
+    out = on_pre_llm_call(
+        platform="signal",
+        user_message="merge it",
+        sender_id_alt="U-ACI",
+        _config=CFG,
+        _open_reader=lambda p: [],
+        _recent_reader=lambda p: ResolvedDecision("D-2026-06-09-03", "2026-06-09"),
+    )
+    assert isinstance(out, dict)
+    ctx = out["context"]
+    # Must warn about nothing pending / already handled and forbid freelancing
+    assert any(phrase in ctx.lower() for phrase in ("already handled", "nothing", "do not"))
+    assert "D-2026-06-09-03" in ctx
+
+
+def test_empty_board_unrelated_chatter_still_silent():
+    """Empty board + non-approval chat → still returns '' (no injection)."""
+    out = on_pre_llm_call(
+        platform="signal",
+        user_message="hey what's up",
+        sender_id_alt="U-ACI",
+        _config=CFG,
+        _open_reader=lambda p: [],
+        _recent_reader=lambda p: ResolvedDecision("D-2026-06-09-03", "2026-06-09"),
+    )
+    assert out == ""
+
+
+def test_empty_board_approve_no_recent_still_injects_guard():
+    """Empty board + approve intent + no recent resolved → still injects guard (no id)."""
+    out = on_pre_llm_call(
+        platform="signal",
+        user_message="approve",
+        sender_id_alt="U-ACI",
+        _config=CFG,
+        _open_reader=lambda p: [],
+        _recent_reader=lambda p: None,
+    )
+    assert isinstance(out, dict)
+    ctx = out["context"]
+    # Must forbid freelancing even without a recent id
+    assert "do not" in ctx.lower() or "Do NOT" in ctx
