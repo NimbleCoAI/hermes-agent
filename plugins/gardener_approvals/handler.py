@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 
 from .config import load_config
-from .decisions import read_open_ids
+from .decisions import read_open_decisions
 from .gate import call_gate
 from .parser import parse_reply
 
@@ -41,11 +41,11 @@ def on_pre_llm_call(*, platform: str = "", user_message: str = "",
         uuid = (sender_id_alt or sender_id or "").strip()
         if not uuid:
             return ""
-        open_reader = _open_reader or read_open_ids
-        open_ids = open_reader(cfg.decisions_file)
-        if not open_ids:
+        open_reader = _open_reader or read_open_decisions
+        decisions = open_reader(cfg.decisions_file)
+        if not decisions:
             return ""
-        pr = parse_reply(user_message or "", open_ids)
+        pr = parse_reply(user_message or "", decisions)
         if pr.ask:
             return _relay(pr.ask)
         if not pr.matched:

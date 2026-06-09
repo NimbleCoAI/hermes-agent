@@ -1,10 +1,19 @@
 import pytest
+from plugins.gardener_approvals.decisions import Decision
 from plugins.gardener_approvals.handler import on_pre_llm_call
 from plugins.gardener_approvals.config import Config
 
 CFG = Config(enabled=True, gate_path="/g.sh",
              decisions_file="/d.md", approver="Juniper")
-ONE = ["D-2026-06-09-01"]
+
+# Helpers
+def _plain(id_: str) -> Decision:
+    return Decision(id=id_, pr_number=None)
+
+def _merge(id_: str, pr: int) -> Decision:
+    return Decision(id=id_, pr_number=pr)
+
+ONE = [_plain("D-2026-06-09-01")]
 
 
 def _call(**over):
@@ -61,7 +70,7 @@ def test_ambiguous_two_open_asks_without_calling_gate():
     called = {"n": 0}
     def gate(**k): called["n"] += 1; return ("OK", "x")
     out = _call(user_message="approve",
-                _open_reader=lambda p: ["D-2026-06-09-01", "D-2026-06-09-02"],
+                _open_reader=lambda p: [_plain("D-2026-06-09-01"), _plain("D-2026-06-09-02")],
                 _gate_caller=gate)
     assert isinstance(out, dict) and "D-" in out["context"]
     assert called["n"] == 0
@@ -88,3 +97,26 @@ def test_relay_tokens_produce_relay(token, msg):
 
 def test_no_sender_id_noop():
     assert _call(sender_id="", sender_id_alt="") == ""
+
+
+# --- New test: merge path ---
+
+def test_merge_decision_approve_calls_gate_with_merge_action():
+    """approve on a PR-bearing decision → gate receives action=merge, value=str(pr#)."""
+    seen = {}
+    def gate(**k): seen.update(k); return ("OK", "✓ merged PR #27")
+
+    out = on_pre_llm_call(
+        platform="signal",
+        user_message="approve",
+        sender_id_alt="U-ACI",
+        _config=CFG,
+        _open_reader=lambda p: [_merge("D-2026-06-09-01", 27)],
+        _gate_caller=gate,
+    )
+
+    assert seen["action"] == "merge"
+    assert seen["value"] == "27"
+    assert seen["decision_id"] == "D-2026-06-09-01"
+    assert isinstance(out, dict)
+    assert "merged PR #27" in out["context"]
