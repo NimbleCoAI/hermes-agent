@@ -1568,3 +1568,44 @@ class TestApprovalTimeoutIsNotConsent:
         assert last_post.get("choice") == "timeout", (
             f"hook choice should be 'timeout' on no-response, got {last_post.get('choice')!r}"
         )
+
+
+class TestSecretReadCommandGuard:
+    """L2 read-floor: reading credential material via the shell is flagged
+    dangerous so it routes through the approval flow instead of silently
+    succeeding (the terminal-tool bypass of get_read_block_error)."""
+
+    def test_cat_gcloud_service_account_flagged(self):
+        from tools.approval import detect_dangerous_command
+        is_dangerous, _key, desc = detect_dangerous_command(
+            "cat ~/.config/gcloud/app-service-account.json"
+        )
+        assert is_dangerous is True
+        assert "credential" in desc.lower() or "secret" in desc.lower()
+
+    def test_cat_aws_credentials_flagged(self):
+        from tools.approval import detect_dangerous_command
+        is_dangerous, _key, _desc = detect_dangerous_command("cat ~/.aws/credentials")
+        assert is_dangerous is True
+
+    def test_base64_ssh_key_flagged(self):
+        from tools.approval import detect_dangerous_command
+        is_dangerous, _key, _desc = detect_dangerous_command("base64 ~/.ssh/id_rsa")
+        assert is_dangerous is True
+
+    def test_cp_mounted_service_account_flagged(self):
+        from tools.approval import detect_dangerous_command
+        is_dangerous, _key, _desc = detect_dangerous_command(
+            "cp /secrets/prod-service-account.json /tmp/x"
+        )
+        assert is_dangerous is True
+
+    def test_cat_readme_not_flagged(self):
+        from tools.approval import detect_dangerous_command
+        is_dangerous, _key, _desc = detect_dangerous_command("cat README.md")
+        assert is_dangerous is False
+
+    def test_cat_ordinary_json_not_flagged(self):
+        from tools.approval import detect_dangerous_command
+        is_dangerous, _key, _desc = detect_dangerous_command("cat data.json")
+        assert is_dangerous is False
