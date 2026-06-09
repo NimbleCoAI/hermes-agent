@@ -49,6 +49,24 @@ def _has_word(text: str, words) -> bool:
     return bool(toks & words)
 
 
+def has_approval_intent(text: str) -> bool:
+    """Return True if *text* contains any approve-, hold-, or merge-intent keyword
+    using the same word-boundary / phrase / emoji logic as parse_reply.  Conflicting
+    signals (approve + hold together) are still treated conservatively as False,
+    matching the no-op behaviour of parse_reply.
+    """
+    raw = text or ""
+    low = raw.lower()
+    approve = (_has_word(low, _APPROVE_WORDS)
+               or _has_phrase(low, _APPROVE_PHRASES)
+               or any(e in raw for e in _APPROVE_EMOJI))
+    hold = (_has_word(low, _HOLD_WORDS)
+            or _has_phrase(low, _HOLD_PHRASES))
+    if approve and hold:
+        return False   # conflicting → conservative no-op
+    return approve or hold
+
+
 def parse_reply(text: str, decisions: List[Decision]) -> ParseResult:
     if not decisions:
         return ParseResult(matched=False)

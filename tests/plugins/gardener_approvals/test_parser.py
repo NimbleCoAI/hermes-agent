@@ -144,3 +144,71 @@ def test_explicit_id_picks_plain_decision_among_mixed_two():
     assert r.action == "resolve"
     assert r.value == "approve"
     assert r.decision_id == "D-2026-06-09-02"
+
+
+# --- has_approval_intent tests ---
+
+from plugins.gardener_approvals.parser import has_approval_intent
+
+
+def test_intent_approve():
+    assert has_approval_intent("approve") is True
+
+def test_intent_approved():
+    assert has_approval_intent("Approved!") is True
+
+def test_intent_yes():
+    assert has_approval_intent("yes") is True
+
+def test_intent_lgtm():
+    assert has_approval_intent("lgtm") is True
+
+def test_intent_merge():
+    assert has_approval_intent("merge") is True
+
+def test_intent_merge_it():
+    assert has_approval_intent("merge it") is True
+
+def test_intent_hold():
+    assert has_approval_intent("hold") is True
+
+def test_intent_emoji_thumbsup():
+    assert has_approval_intent("\U0001F44D") is True
+
+def test_intent_emoji_check():
+    assert has_approval_intent("✅") is True
+
+def test_intent_ship_it():
+    assert has_approval_intent("ship it") is True
+
+def test_intent_go_ahead():
+    assert has_approval_intent("go ahead") is True
+
+def test_no_intent_unrelated_chatter():
+    assert has_approval_intent("hey what's up") is False
+
+def test_no_intent_yesterday():
+    assert has_approval_intent("I saw it yesterday") is False
+
+def test_no_intent_disapprove():
+    # "disapprove" contains "approve" as substring but word-boundary check should block it
+    assert has_approval_intent("I disapprove") is False
+
+def test_no_intent_not_approved():
+    # approve + not = conflicting → False per conservative rules
+    # NOTE: has_approval_intent is intentionally True if ANY approve/hold/merge
+    # keyword is present WITHOUT conflict filtering — re-read spec: it should be
+    # conservative: "not approved" → False.
+    # The spec says same word-boundary/phrase logic; "not approved" → hold+approve → conflict → noop
+    # So has_approval_intent("not approved") → False (conflict logic applies).
+    assert has_approval_intent("not approved") is False
+
+def test_no_intent_uphold():
+    assert has_approval_intent("uphold the plan") is False
+
+def test_intent_nope():
+    # "nope" is in _HOLD_WORDS, so it counts as intent
+    assert has_approval_intent("nope") is True
+
+def test_no_intent_empty():
+    assert has_approval_intent("") is False
