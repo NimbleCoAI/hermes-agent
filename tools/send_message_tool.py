@@ -1130,10 +1130,13 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 
     from gateway.platforms.signal_rate_limit import (
         SIGNAL_BATCH_PACING_NOTICE_THRESHOLD,
+        SIGNAL_CONNECT_RETRY_BACKOFF_CAP,
+        SIGNAL_CONNECT_RETRY_WINDOW,
         SIGNAL_MAX_ATTACHMENTS_PER_MSG,
         SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
         _extract_retry_after_seconds,
         _format_wait,
+        _is_connection_error,
         _is_signal_rate_limit_error,
         _signal_send_timeout,
         get_scheduler,
@@ -1224,7 +1227,10 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 
             batch_message = message if idx == 0 else ""
 
-            for attempt in range(1, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS + 1):
+            rl_attempt = 0          # counts against SIGNAL_RATE_LIMIT_MAX_ATTEMPTS
+            conn_retry_count = 0    # connection-error retry counter (unlimited within window)
+            batch_start = time.monotonic()
+            while True:
                 try:
                     await scheduler.acquire(n)
                     _rpc_t0 = time.monotonic()
@@ -1239,10 +1245,11 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                     if not _is_signal_rate_limit_error(err):
                         return _error(f"Signal RPC error on batch {idx + 1}/{len(att_batches)}: {err}")
 
+                    rl_attempt += 1
                     server_retry_after = _extract_retry_after_seconds(err)
                     scheduler.feedback(server_retry_after, n)
 
-                    if attempt >= SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
+                    if rl_attempt >= SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
                         failed_batches.append(idx + 1)
                         logger.error(
                             "Signal: rate-limit retries exhausted on batch %d/%d "
@@ -1256,20 +1263,49 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                         "(attempt %d/%d, server retry_after=%s); "
                         "scheduler will pace the retry",
                         idx + 1, len(att_batches),
-                        attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
+                        rl_attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                         f"{server_retry_after:.0f}s" if server_retry_after else "unknown",
                     )
                 except Exception as e:
-                    if attempt >= SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
+                    elapsed = time.monotonic() - batch_start
+                    if _is_connection_error(e) and elapsed < SIGNAL_CONNECT_RETRY_WINDOW:
+                        backoff = min(
+                            2.0 * (2 ** conn_retry_count),
+                            SIGNAL_CONNECT_RETRY_BACKOFF_CAP,
+                        )
+                        conn_retry_count += 1
+                        logger.warning(
+                            "Signal: connection error on batch %d/%d "
+                            "(conn_retry=%d, backoff=%.1fs, elapsed=%.1f/%.0fs): %s; retrying",
+                            idx + 1, len(att_batches),
+                            conn_retry_count, backoff, elapsed, SIGNAL_CONNECT_RETRY_WINDOW,
+                            str(e),
+                        )
+                        await asyncio.sleep(backoff)
+                        continue
+
+                    if _is_connection_error(e):
+                        failed_batches.append(idx + 1)
+                        logger.error(
+                            "Signal: send error on batch %d/%d after %.0fs of "
+                            "connection retries (%d retries): %s",
+                            idx + 1, len(att_batches),
+                            elapsed, conn_retry_count, str(e),
+                        )
+                        break
+
+                    # Non-connection exception: old behaviour — count against rate-limit budget
+                    rl_attempt += 1
+                    if rl_attempt >= SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
                         failed_batches.append(idx + 1)
                         logger.error(
                             "Signal: send error on batch %d/%d after %d attempts: %s",
-                            idx + 1, len(att_batches), attempt, str(e)
+                            idx + 1, len(att_batches), rl_attempt, str(e)
                         )
                         break
                     logger.warning(
                         "Signal: transient error on batch %d/%d (attempt %d/%d): %s; will retry",
-                        idx + 1, len(att_batches), attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS, str(e)
+                        idx + 1, len(att_batches), rl_attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS, str(e)
                     )
 
         warnings = []

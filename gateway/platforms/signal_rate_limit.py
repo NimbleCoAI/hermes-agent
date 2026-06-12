@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from typing import Any, Optional
@@ -34,6 +35,17 @@ SIGNAL_RATE_LIMIT_DEFAULT_RETRY_AFTER = 4  # fallback token refill interval for 
 SIGNAL_RATE_LIMIT_MAX_ATTEMPTS = 2  # initial attempt + 1 retry
 SIGNAL_BATCH_PACING_NOTICE_THRESHOLD = 10.0  # if estimated waiting time > 10s, notify the user about the delay
 SIGNAL_RPC_ERROR_RATELIMIT = -5  # signal-cli (v0.14.3+) JSON-RPC error code for RateLimitException
+
+# Connection-error retry: total budget and per-attempt backoff cap.
+# When the signal-cli daemon bounces (autoheal/redeploy takes 30-60s) these
+# allow the in-flight send to ride through the restart rather than being
+# permanently dropped after 2 attempts in <1s.
+SIGNAL_CONNECT_RETRY_WINDOW: float = float(
+    os.environ.get("SIGNAL_CONNECT_RETRY_WINDOW", "90.0")
+)
+SIGNAL_CONNECT_RETRY_BACKOFF_CAP: float = float(
+    os.environ.get("SIGNAL_CONNECT_RETRY_BACKOFF_CAP", "15.0")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +142,29 @@ def _is_signal_rate_limit_error(err: Any) -> bool:
         or "retrylaterexception" in msg_lower
         or "retry after" in msg_lower
     )
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    """True when ``exc`` indicates the signal-cli daemon is unreachable.
+
+    Covers httpx transport-layer errors (ConnectError, ConnectTimeout,
+    ReadError, RemoteProtocolError, PoolTimeout) plus stdlib ConnectionError
+    and OSError.  httpx is imported lazily so this module stays importable
+    even without it.
+    """
+    try:
+        import httpx as _httpx
+        _HTTPX_CONN_ERRORS = (
+            _httpx.ConnectError,
+            _httpx.ConnectTimeout,
+            _httpx.ReadError,
+            _httpx.RemoteProtocolError,
+            _httpx.PoolTimeout,
+        )
+    except ImportError:
+        _HTTPX_CONN_ERRORS = ()  # type: ignore[assignment]
+
+    return isinstance(exc, (*_HTTPX_CONN_ERRORS, ConnectionError, OSError))
 
 
 # ---------------------------------------------------------------------------
