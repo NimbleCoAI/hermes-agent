@@ -27,6 +27,12 @@ from urllib.parse import quote, unquote
 
 import httpx
 
+from hermes_constants import get_hermes_home
+try:
+    from utils import atomic_json_write as _atomic_json_write
+except Exception:
+    _atomic_json_write = None  # type: ignore[assignment]
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -58,6 +64,10 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 SIGNAL_MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024  # 100 MB
+
+# Persistence file for runtime-accepted group allowlist (relative to HERMES_HOME).
+# Groups added via invite acceptance are written here so they survive restarts.
+_APPROVED_GROUPS_FILE = "signal_approved_groups.json"
 MAX_MESSAGE_LENGTH = 8000  # Signal message size limit
 TYPING_INTERVAL = 8.0  # seconds between typing indicator refreshes
 SSE_RETRY_DELAY_INITIAL = 2.0
@@ -203,6 +213,27 @@ class SignalAdapter(BasePlatformAdapter):
         # Parse allowlists — group policy is derived from presence of group allowlist
         group_allowed_str = os.getenv("SIGNAL_GROUP_ALLOWED_USERS", "")
         self.group_allow_from = set(_parse_comma_list(group_allowed_str))
+
+        # Load runtime-accepted groups persisted from previous sessions.
+        # Corrupted or missing files are non-fatal — we just log and continue.
+        try:
+            _persisted_path = get_hermes_home() / _APPROVED_GROUPS_FILE
+            if _persisted_path.exists():
+                _persisted_data = json.loads(_persisted_path.read_text())
+                if isinstance(_persisted_data, dict):
+                    _loaded = set(_persisted_data.keys()) - self.group_allow_from
+                    self.group_allow_from.update(_loaded)
+                    if _loaded:
+                        logger.info(
+                            "Signal: loaded %d persisted approved group(s) from %s",
+                            len(_loaded), _APPROVED_GROUPS_FILE,
+                        )
+        except Exception:
+            logger.warning(
+                "Signal: failed to load persisted group allowlist from %s — continuing with env-var groups only",
+                _APPROVED_GROUPS_FILE,
+                exc_info=True,
+            )
 
         # Group invite policy — who can add the bot to new groups.
         # "approved-only" (default): only users in dm_allow_from can invite
@@ -492,6 +523,67 @@ class SignalAdapter(BasePlatformAdapter):
             self._sse_response = None
 
     # ------------------------------------------------------------------
+    # Group allowlist persistence
+    # ------------------------------------------------------------------
+
+    def _persist_approved_group(
+        self,
+        group_id: str,
+        sender: str,
+        sender_uuid: str,
+        sender_name: str,
+    ) -> None:
+        """Write a newly-approved group to the persistent JSON allowlist.
+
+        Read-modify-write so multiple groups accumulate correctly.
+        Uses atomic_json_write if available, otherwise tmp-file + os.replace.
+        Failures are logged as warnings and never propagated.
+        """
+        try:
+            path = get_hermes_home() / _APPROVED_GROUPS_FILE
+            existing: dict = {}
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text())
+                    if not isinstance(existing, dict):
+                        existing = {}
+                except Exception:
+                    existing = {}
+            existing[group_id] = {
+                "added_by": sender or "",
+                "added_by_uuid": sender_uuid or "",
+                "added_by_name": sender_name or "",
+                "approved_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if _atomic_json_write is not None:
+                _atomic_json_write(path, existing)
+            else:
+                import tempfile
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(
+                    dir=str(path.parent),
+                    prefix=f".{path.stem}_",
+                    suffix=".tmp",
+                )
+                try:
+                    with os.fdopen(fd, "w") as fh:
+                        json.dump(existing, fh, indent=2)
+                    os.replace(tmp, str(path))
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+        except Exception:
+            logger.warning(
+                "Signal: failed to persist approved group %s to %s (non-fatal)",
+                group_id[:12] if group_id else "?",
+                _APPROVED_GROUPS_FILE,
+                exc_info=True,
+            )
+
+    # ------------------------------------------------------------------
     # Message Handling
     # ------------------------------------------------------------------
 
@@ -622,6 +714,17 @@ class SignalAdapter(BasePlatformAdapter):
                     "Signal: group %s added to runtime allowlist after invite acceptance",
                     group_v2_invite_id[:12] if group_v2_invite_id else "?",
                 )
+                # Persist so the group survives container restarts.
+                try:
+                    self._persist_approved_group(
+                        group_v2_invite_id, sender, sender_uuid, sender_name,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Signal: could not persist approved group %s (non-fatal)",
+                        group_v2_invite_id[:12] if group_v2_invite_id else "?",
+                        exc_info=True,
+                    )
                 return  # nothing else to process — no dataMessage
 
         # Get data message — also check editMessage (edited messages contain
