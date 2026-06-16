@@ -1140,6 +1140,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         _is_signal_rate_limit_error,
         _signal_send_timeout,
         get_scheduler,
+        signal_attachment_arg,
     )
 
     try:
@@ -1152,7 +1153,11 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         attachment_paths = []
         for media_path, _is_voice in valid_media:
             if os.path.exists(media_path):
-                attachment_paths.append(media_path)
+                # signal-cli runs in its own container and cannot see the
+                # agent's filesystem (/opt/data, /tmp). Inline the file as a
+                # base64 data: URI so the daemon never has to resolve the
+                # agent-side path — same helper the gateway adapter uses.
+                attachment_paths.append(signal_attachment_arg(media_path))
             else:
                 logger.warning("Signal media file not found, skipping: %s", media_path)
 

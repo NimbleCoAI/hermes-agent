@@ -16,13 +16,51 @@ daemon.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import mimetypes
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def signal_attachment_arg(path: str) -> str:
+    """Build the signal-cli ``send`` attachment argument for a local file.
+
+    In HSM multi-container deployments signal-cli runs in its own container
+    and cannot see the agent's filesystem (``/opt/data``, ``/tmp``) — each
+    agent's data dir is bind-mounted only into its own container, not the
+    shared signal-cli daemon. A bare file path passed to the ``send`` RPC
+    therefore fails with ``AttachmentInvalidException`` / ``No such file``.
+
+    Rather than depend on a brittle web of shared host mounts (one per agent,
+    which doesn't scale and the daemon compose never wired up), inline the file
+    as a base64 ``data:`` URI — signal-cli 0.14+ accepts
+    ``data:<mime>;filename=<name>;base64,<data>`` for ``--attachment``. This
+    mirrors the inbound path (which pulls attachments as base64 via
+    ``getAttachment``) and works for any source directory with zero compose
+    changes, single-container setups included.
+
+    Falls back to the raw path if the file can't be read, so a genuinely
+    missing file surfaces signal-cli's own error instead of being masked.
+
+    Shared by the gateway adapter (``SignalAdapter._attachment_arg``) and the
+    ``send_message`` tool's Signal path so attachments inline identically for
+    every agent in the fleet.
+    """
+    try:
+        data = Path(path).read_bytes()
+    except OSError as e:
+        logger.warning("Signal: could not read attachment %s: %s", path, e)
+        return path
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    name = Path(path).name
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};filename={name};base64,{b64}"
 
 
 # ---------------------------------------------------------------------------

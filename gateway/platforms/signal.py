@@ -15,7 +15,6 @@ import asyncio
 import base64
 import json
 import logging
-import mimetypes
 import os
 import random
 import time
@@ -56,6 +55,7 @@ from gateway.platforms.signal_rate_limit import (
     _is_signal_rate_limit_error,
     _signal_send_timeout,
     get_scheduler,
+    signal_attachment_arg,
 )
 
 logger = logging.getLogger(__name__)
@@ -1169,30 +1169,11 @@ class SignalAdapter(BasePlatformAdapter):
     def _attachment_arg(self, path: str) -> str:
         """Build the signal-cli ``send`` attachment argument for a local file.
 
-        In HSM multi-container deployments signal-cli runs in its own
-        container and cannot see the agent's filesystem (``/opt/data``,
-        ``/tmp``), so a bare file path passed to the ``send`` RPC fails with
-        ``AttachmentInvalidException``. Rather than depend on a brittle web
-        of shared host mounts (one per agent, which doesn't scale and the
-        daemon compose never wired up), inline the file as a base64
-        ``data:`` URI — signal-cli 0.14+ accepts
-        ``data:<mime>;filename=<name>;base64,<data>`` for ``--attachment``.
-        This mirrors the inbound path, which already pulls attachments as
-        base64 via ``getAttachment``, and works for any source directory
-        with zero compose changes (single-container setups included).
-
-        Falls back to the raw path if the file can't be read, so a genuinely
-        missing file surfaces signal-cli's own error instead of being masked.
+        Thin wrapper over :func:`signal_attachment_arg` (shared with the
+        ``send_message`` tool) — see that function for the full rationale on
+        inlining files as base64 ``data:`` URIs in multi-container deployments.
         """
-        try:
-            data = Path(path).read_bytes()
-        except OSError as e:
-            logger.warning("Signal: could not read attachment %s: %s", path, e)
-            return path
-        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        name = Path(path).name
-        b64 = base64.b64encode(data).decode("ascii")
-        return f"data:{mime};filename={name};base64,{b64}"
+        return signal_attachment_arg(path)
 
     async def _rpc(
         self,
