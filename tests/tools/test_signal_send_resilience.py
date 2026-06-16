@@ -403,3 +403,68 @@ class TestSignalConnectionRetry:
 def _send_signal_fn():
     from tools.send_message_tool import _send_signal
     return _send_signal
+
+
+# ---------------------------------------------------------------------------
+# Attachment inlining: the send_message tool must pass attachments to the
+# signal-cli daemon as base64 data: URIs, never as agent-container file paths.
+#
+# Regression: a video rendered at /opt/data/... failed with AttachmentInvalid
+# because the signal-cli daemon runs in a separate container that cannot see
+# the agent's filesystem. The gateway adapter already inlined as base64
+# (PR #18) but this tool path passed the raw path through.
+# ---------------------------------------------------------------------------
+
+class TestSignalAttachmentInlining:
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _extra(self):
+        return {"http_url": "http://localhost:8080", "account": "+15551234567"}
+
+    def test_attachment_inlined_as_data_uri(self, monkeypatch, tmp_path):
+        """A local media file is inlined as data:<mime>;base64, not a raw path."""
+        _patch_conn_constants(monkeypatch)
+        _patch_tool_clock(monkeypatch)
+
+        # Simulate an agent-container path the daemon cannot resolve.
+        video = tmp_path / "render.mp4"
+        video.write_bytes(b"\x00\x01FAKEMP4DATA")
+
+        fake = _FakeSignalHttp([{"result": {"timestamp": 1}}])
+        _install_signal_http(monkeypatch, fake)
+
+        result = self._run(
+            _send_signal_fn()(
+                self._extra(), "group:abc", "here is the video",
+                media_files=[(str(video), False)],
+            )
+        )
+
+        assert result.get("success") is True
+        assert len(fake.calls) == 1
+        atts = fake.calls[0]["payload"]["params"]["attachments"]
+        assert len(atts) == 1
+        # The daemon must receive a self-contained data: URI, NOT the path.
+        assert atts[0].startswith("data:video/mp4;filename=render.mp4;base64,")
+        assert str(video) not in atts[0]
+
+    def test_missing_attachment_is_skipped(self, monkeypatch):
+        """A non-existent media path is skipped, not inlined."""
+        _patch_conn_constants(monkeypatch)
+        _patch_tool_clock(monkeypatch)
+
+        fake = _FakeSignalHttp([{"result": {"timestamp": 1}}])
+        _install_signal_http(monkeypatch, fake)
+
+        result = self._run(
+            _send_signal_fn()(
+                self._extra(), "group:abc", "text only",
+                media_files=[("/nope/missing.mp4", False)],
+            )
+        )
+
+        assert result.get("success") is True
+        # No attachments param when nothing was inlined.
+        params = fake.calls[0]["payload"]["params"]
+        assert "attachments" not in params or params["attachments"] == []
