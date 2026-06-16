@@ -66,6 +66,26 @@ def build_git_config_content(*, name: str, email: str) -> str:
     )
 
 
+def build_gh_hosts_content(token: str) -> str:
+    """The ``~/.config/gh/hosts.yml`` the GitHub CLI reads for HTTPS auth.
+
+    Same rationale as the git credential file: ``gh`` runs in the tool
+    subprocess where ``GITHUB_TOKEN`` is blocklisted, so a config file is the
+    only way ``gh`` can authenticate. Without this, ``git`` worked from agent
+    tools but ``gh`` reported "not logged in" — leaving half the GitHub surface
+    unusable to the agent.
+    """
+    return "\n".join(
+        [
+            f"{GIT_HOST}:",
+            f"    oauth_token: {token}",
+            "    git_protocol: https",
+            "    user: x-access-token",
+            "",
+        ]
+    )
+
+
 # ---------------------------------------------------------------------------
 # .env token extraction
 # ---------------------------------------------------------------------------
@@ -127,26 +147,38 @@ def provision_git_credentials(
     subprocess_home = home_dir / "home"
     cred_path = subprocess_home / ".git-credentials"
     cfg_path = subprocess_home / ".gitconfig"
-
-    if not force and (cred_path.exists() or cfg_path.exists()):
-        return ProvisionResult(
-            home_dir,
-            False,
-            reason="git config already present (pass force to overwrite)",
-            source=source,
-        )
+    gh_hosts_path = subprocess_home / ".config" / "gh" / "hosts.yml"
 
     resolved_name = name or home_dir.name
     resolved_email = email or f"{resolved_name}@users.noreply.github.com"
 
-    subprocess_home.mkdir(parents=True, exist_ok=True)
-    _write_file(cred_path, build_git_credentials_content(token), mode=0o600)
-    _write_file(
-        cfg_path,
-        build_git_config_content(name=resolved_name, email=resolved_email),
-        mode=0o644,
-    )
-    return ProvisionResult(home_dir, True, source=source)
+    # git and gh are provisioned INDEPENDENTLY (apply-if-absent each). An agent
+    # provisioned by an older build has git set up but no gh hosts.yml — gating
+    # both on "git present" left gh permanently unconfigured. Writing them
+    # separately heals that on the next boot without clobbering a user's setup.
+    wrote: list[str] = []
+    if force or not (cred_path.exists() or cfg_path.exists()):
+        subprocess_home.mkdir(parents=True, exist_ok=True)
+        _write_file(cred_path, build_git_credentials_content(token), mode=0o600)
+        _write_file(
+            cfg_path,
+            build_git_config_content(name=resolved_name, email=resolved_email),
+            mode=0o644,
+        )
+        wrote.append("git")
+    if force or not gh_hosts_path.exists():
+        gh_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_file(gh_hosts_path, build_gh_hosts_content(token), mode=0o600)
+        wrote.append("gh")
+
+    if not wrote:
+        return ProvisionResult(
+            home_dir,
+            False,
+            reason="git+gh already present (pass force to overwrite)",
+            source=source,
+        )
+    return ProvisionResult(home_dir, True, reason="wrote " + "+".join(wrote), source=source)
 
 
 def _write_file(path: Path, content: str, *, mode: int) -> None:
