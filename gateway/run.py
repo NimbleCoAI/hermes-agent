@@ -2441,6 +2441,22 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
+    def _chat_scope_session_key(self, source: SessionSource) -> str:
+        """The per-chat session key with NO per-user suffix.
+
+        Used to find sibling per-user sessions in the same group/chat: every
+        ``group_sessions_per_user`` key for this chat is either equal to this
+        scope or nested under ``scope + ':'``.  Returns "" if it can't be built.
+        """
+        try:
+            return build_session_key(
+                source,
+                group_sessions_per_user=False,
+                thread_sessions_per_user=False,
+            )
+        except Exception:
+            return ""
+
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
@@ -15110,24 +15126,20 @@ class GatewayRunner:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
-            _get_approval_config,
+            resolve_gateway_approval, resolve_gateway_approval_in_scope,
+            has_blocking_approval, _get_approval_config,
         )
 
         # Admin-only gating: when admin_only is set (default True),
         # only admin users may approve dangerous commands.
         approval_cfg = _get_approval_config()
+        is_admin_approver = True
         if approval_cfg.get("admin_only", True):
             from gateway.slash_access import policy_for_source as _policy_for_source
             _policy = _policy_for_source(self.config, source)
             if _policy.enabled and not _policy.is_admin(source.user_id):
                 return "⛔ Not authorized — only admin users can approve/deny dangerous commands."
-
-        if not has_blocking_approval(session_key):
-            if session_key in self._pending_approvals:
-                self._pending_approvals.pop(session_key)
-                return t("gateway.approval_expired")
-            return t("gateway.approve.no_pending")
+            is_admin_approver = (not _policy.enabled) or _policy.is_admin(source.user_id)
 
         # Parse args: support "all", "all session", "all always", "session", "always"
         args = event.get_command_args().strip().lower().split()
@@ -15141,8 +15153,25 @@ class GatewayRunner:
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        if has_blocking_approval(session_key):
+            count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        else:
+            # group_sessions_per_user keys the pending approval to the
+            # *triggering* participant's session, not the approver's. Let an
+            # admin clear a sibling per-user session's approval in the same chat
+            # — otherwise a non-admin can trigger a command nobody can approve.
+            count = 0
+            if is_admin_approver:
+                scope = self._chat_scope_session_key(source)
+                if scope:
+                    count = resolve_gateway_approval_in_scope(
+                        scope, choice, resolve_all=resolve_all, exclude=session_key,
+                    )
+
         if not count:
+            if session_key in self._pending_approvals:
+                self._pending_approvals.pop(session_key)
+                return t("gateway.approval_expired")
             return t("gateway.approve.no_pending")
 
         # Resume typing indicator — agent is about to continue processing.
@@ -15166,30 +15195,43 @@ class GatewayRunner:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
-            _get_approval_config,
+            resolve_gateway_approval, resolve_gateway_approval_in_scope,
+            has_blocking_approval, _get_approval_config,
         )
 
         # Admin-only gating: when admin_only is set (default True),
         # only admin users may deny dangerous commands.
         approval_cfg = _get_approval_config()
+        is_admin_approver = True
         if approval_cfg.get("admin_only", True):
             from gateway.slash_access import policy_for_source as _policy_for_source
             _policy = _policy_for_source(self.config, source)
             if _policy.enabled and not _policy.is_admin(source.user_id):
                 return "⛔ Not authorized — only admin users can approve/deny dangerous commands."
-
-        if not has_blocking_approval(session_key):
-            if session_key in self._pending_approvals:
-                self._pending_approvals.pop(session_key)
-                return t("gateway.deny.stale")
-            return t("gateway.deny.no_pending")
+            is_admin_approver = (not _policy.enabled) or _policy.is_admin(source.user_id)
 
         args = event.get_command_args().strip().lower()
         resolve_all = "all" in args
 
-        count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
+        if has_blocking_approval(session_key):
+            count = resolve_gateway_approval(session_key, "deny", resolve_all=resolve_all)
+        else:
+            # Mirror _handle_approve_command: an admin must be able to deny a
+            # pending approval bound to another participant's per-user session
+            # in the same chat (group_sessions_per_user), else a non-admin's
+            # command can only time out.
+            count = 0
+            if is_admin_approver:
+                scope = self._chat_scope_session_key(source)
+                if scope:
+                    count = resolve_gateway_approval_in_scope(
+                        scope, "deny", resolve_all=resolve_all, exclude=session_key,
+                    )
+
         if not count:
+            if session_key in self._pending_approvals:
+                self._pending_approvals.pop(session_key)
+                return t("gateway.deny.stale")
             return t("gateway.deny.no_pending")
 
         # Resume typing indicator — agent continues (with BLOCKED result).
