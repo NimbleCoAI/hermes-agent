@@ -665,6 +665,50 @@ def has_blocking_approval(session_key: str) -> bool:
         return bool(_gateway_queues.get(session_key))
 
 
+def list_blocking_session_keys(scope_prefix: str = "", exclude: str = "") -> list:
+    """Session keys that currently have >=1 blocking gateway approval.
+
+    When *scope_prefix* is given, restrict to keys equal to it or nested under
+    it (``scope_prefix + ':'``) — i.e. sibling per-user sessions that share one
+    group/chat.  Insertion order is preserved (earliest-registered first).
+    """
+    with _lock:
+        keys = [k for k, q in _gateway_queues.items() if q]
+    if exclude:
+        keys = [k for k in keys if k != exclude]
+    if scope_prefix:
+        sep = scope_prefix + ":"
+        keys = [k for k in keys if k == scope_prefix or k.startswith(sep)]
+    return keys
+
+
+def resolve_gateway_approval_in_scope(scope_prefix: str, choice: str,
+                                      resolve_all: bool = False,
+                                      exclude: str = "") -> int:
+    """Resolve blocking approvals across sibling sessions sharing a chat scope.
+
+    ``group_sessions_per_user`` keys a dangerous-command approval to the
+    *triggering* participant's session, not the approver's.  This lets an
+    admin's /approve (or /deny) clear a pending approval owned by another
+    participant's per-user session in the same group — without it, a non-admin
+    can trigger a command that nobody is able to approve or deny, and it just
+    times out.
+
+    With *resolve_all* False, the single oldest approval from the
+    earliest-registered sibling session is resolved; True resolves every
+    pending approval in scope.  Returns the number resolved.
+    """
+    keys = list_blocking_session_keys(scope_prefix=scope_prefix, exclude=exclude)
+    if not keys:
+        return 0
+    if resolve_all:
+        total = 0
+        for k in keys:
+            total += resolve_gateway_approval(k, choice, resolve_all=True)
+        return total
+    return resolve_gateway_approval(keys[0], choice, resolve_all=False)
+
+
 def submit_pending(session_key: str, approval: dict):
     """Store a pending approval request for a session."""
     with _lock:

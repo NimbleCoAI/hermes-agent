@@ -647,3 +647,117 @@ class TestFallbackNoCallback:
         assert result["approved"] is False
         assert result.get("status") == "pending_approval"
         assert result.get("approval_pending") is True
+
+
+# ------------------------------------------------------------------
+# Cross-session admin approval (group_sessions_per_user)
+# ------------------------------------------------------------------
+
+
+class TestCrossSessionAdminApproval:
+    """In groups with per-user sessions, a dangerous command is keyed to the
+    *triggering* participant's session — not the approver's. An admin's
+    /approve must still clear that sibling session's pending approval, or a
+    non-admin can trigger a command nobody can ever approve."""
+
+    def setup_method(self):
+        _clear_approval_state()
+
+    @staticmethod
+    def _group_source(user_id: str) -> SessionSource:
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id=user_id,
+            chat_id="g1",
+            user_name=user_id,
+            chat_type="group",
+        )
+
+    @staticmethod
+    def _runner_with_admin(admin_id: str):
+        runner = _make_runner()
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.TELEGRAM: PlatformConfig(
+                    enabled=True,
+                    token="***",
+                    extra={"group_allow_admin_from": [admin_id]},
+                )
+            }
+        )
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_admin_approve_clears_other_participants_pending(self):
+        """Admin /approve resolves a pending approval bound to another user's
+        per-user session in the same group."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = self._runner_with_admin("u_admin")
+
+        triggerer = self._group_source("u_cam")  # non-admin who hit the command
+        trig_key = runner._session_key_for_source(triggerer)
+        entry = _ApprovalEntry({"command": "ffprobe x | python3", "description": "scan"})
+        _gateway_queues[trig_key] = [entry]
+
+        admin_event = MessageEvent(
+            text="/approve session",
+            source=self._group_source("u_admin"),
+            message_id="m1",
+        )
+        result = await runner._handle_approve_command(admin_event)
+
+        assert entry.event.is_set()
+        assert entry.result == "session"
+        assert trig_key not in _gateway_queues
+        assert "no pending" not in result.lower()
+        assert "not authorized" not in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_nonadmin_cannot_cross_approve(self):
+        """A non-admin must NOT be able to clear another participant's pending
+        approval — admin-only gating still applies to cross-session resolves."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = self._runner_with_admin("u_admin")
+
+        triggerer = self._group_source("u_other")
+        trig_key = runner._session_key_for_source(triggerer)
+        entry = _ApprovalEntry({"command": "rm -rf /", "description": "scan"})
+        _gateway_queues[trig_key] = [entry]
+
+        nonadmin_event = MessageEvent(
+            text="/approve",
+            source=self._group_source("u_cam"),  # not in group_allow_admin_from
+            message_id="m2",
+        )
+        result = await runner._handle_approve_command(nonadmin_event)
+
+        assert not entry.event.is_set()
+        assert trig_key in _gateway_queues
+        assert "not authorized" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_admin_deny_clears_other_participants_pending(self):
+        """Admin /deny must also resolve another participant's stuck pending
+        approval — otherwise a non-admin-triggered command can only time out."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = self._runner_with_admin("u_admin")
+
+        triggerer = self._group_source("u_cam")
+        trig_key = runner._session_key_for_source(triggerer)
+        entry = _ApprovalEntry({"command": "rm -rf /", "description": "scan"})
+        _gateway_queues[trig_key] = [entry]
+
+        admin_event = MessageEvent(
+            text="/deny",
+            source=self._group_source("u_admin"),
+            message_id="m3",
+        )
+        result = await runner._handle_deny_command(admin_event)
+
+        assert entry.event.is_set()
+        assert entry.result == "deny"
+        assert trig_key not in _gateway_queues
+        assert "no pending" not in result.lower()
