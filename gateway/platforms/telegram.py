@@ -560,37 +560,69 @@ class TelegramAdapter(BasePlatformAdapter):
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
 
-    def _is_user_admin(self, user_id: str) -> bool:
-        """Check whether *user_id* is an admin for approval gating.
+    def _is_user_admin(
+        self,
+        user_id: str,
+        *,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        user_name: Optional[str] = None,
+    ) -> bool:
+        """Whether *user_id* may approve/deny dangerous commands via inline buttons.
 
-        Resolution order:
-        1. ``swarm_map_policy.is_platform_admin`` (HSM-backed, if available)
-        2. First entry in ``TELEGRAM_ALLOWED_USERS`` is treated as admin
-        3. Fail-closed: returns False
+        Routes through the gateway's unified approval-admin check
+        (``GatewayRunner._is_approval_admin``) so a Telegram user has the SAME
+        approval authority whether they click a button or type ``/approve``:
+        "approved = admin" — membership in the individual allowlist
+        (``TELEGRAM_ALLOWED_USERS``) plus any configured ``allow_admin_from``
+        policy. Falls back to an env-only individual-allowlist check when the
+        runner isn't wired (mirrors ``_is_callback_user_authorized``).
+
+        Replaces the former ``swarm_map_policy.is_platform_admin`` call: that HSM
+        route does not exist, so it 404'd on every click (fail-closed plus a
+        needless ~5s timeout), and its "first allowlisted user only" fallback was
+        inconsistent with the slash ``/approve`` gate.
         """
-        normalized = str(user_id or "").strip()
-        if not normalized:
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
             return False
 
-        # 1. HSM policy (swarm_map_policy plugin)
-        try:
-            from plugins.swarm_map_policy import is_platform_admin
-            if is_platform_admin(normalized, "telegram"):
-                return True
-        except Exception:
-            pass  # plugin not installed or HSM unreachable — fall through
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        admin_fn = getattr(runner, "_is_approval_admin", None)
+        if callable(admin_fn):
+            try:
+                from gateway.session import SessionSource
 
-        # 2. First user in TELEGRAM_ALLOWED_USERS is admin
+                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+                if normalized_chat_type == "private":
+                    normalized_chat_type = "dm"
+                elif normalized_chat_type == "supergroup":
+                    normalized_chat_type = "forum" if thread_id is not None else "group"
+
+                source = SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id=str(chat_id or normalized_user_id),
+                    chat_type=normalized_chat_type,
+                    user_id=normalized_user_id,
+                    user_name=str(user_name).strip() if user_name else None,
+                    thread_id=str(thread_id) if thread_id is not None else None,
+                )
+                return bool(admin_fn(source))
+            except Exception:
+                logger.debug(
+                    "[Telegram] Falling back to env-only admin check for user %s",
+                    normalized_user_id,
+                    exc_info=True,
+                )
+
+        # Env-only fallback (no runner wired): "approved = admin" against the
+        # individual allowlist, consistent with _is_individual_allowlisted.
         allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
-        if allowed_csv:
-            first_id = next(
-                (uid.strip() for uid in allowed_csv.split(",") if uid.strip() and uid.strip() != "*"),
-                None,
-            )
-            if first_id and normalized == first_id:
-                return True
-
-        return False
+        if not allowed_csv:
+            return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+        return "*" in allowed_ids or normalized_user_id in allowed_ids
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -3330,11 +3362,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 try:
                     from tools.approval import _get_approval_config
                     approval_cfg = _get_approval_config()
-                    if approval_cfg.get("admin_only", True) and not self._is_user_admin(caller_id):
+                    if approval_cfg.get("admin_only", True) and not self._is_user_admin(
+                        caller_id,
+                        chat_id=query_chat_id,
+                        chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                        thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                        user_name=query_user_name,
+                    ):
                         await query.answer(text="⛔ Not authorized — only admin users can approve commands.")
                         return
                 except Exception as _admin_err:
+                    # Fail closed: a dangerous-command approval must not slip
+                    # through because the admin check raised.
                     logger.warning("Admin-only approval check failed: %s", _admin_err)
+                    await query.answer(text="⛔ Could not verify approval permissions — denied.")
+                    return
 
                 session_key = self._approval_state.pop(approval_id, None)
                 if not session_key:
