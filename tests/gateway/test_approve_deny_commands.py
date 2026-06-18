@@ -62,6 +62,10 @@ def _make_runner():
     runner._fallback_model = None
     runner._show_reasoning = False
     runner._is_user_authorized = lambda _source: True
+    # Default: the approver is an individual-allowlisted admin. Admin-gating
+    # behavior is covered explicitly in TestApprovalUsesDmAllowlist (handler
+    # wiring) and TestIndividualAllowlist (the real predicate).
+    runner._is_individual_allowlisted = lambda _source: True
     runner._set_session_env = lambda _context: None
     return runner
 
@@ -799,9 +803,10 @@ class TestApprovalUsesDmAllowlist:
         runner.config = GatewayConfig(
             platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
         )
-        # Only u_admin is in the individual (DM) allowlist. The gate evaluates
-        # DM authorization, so this is what decides admin.
-        runner._is_user_authorized = lambda source: source.user_id == "u_admin"
+        # Only u_admin is in the individual (DM) allowlist; that predicate is
+        # what the gate consults. (The real predicate is exercised directly in
+        # TestIndividualAllowlist.)
+        runner._is_individual_allowlisted = lambda source: source.user_id == "u_admin"
         return runner
 
     @pytest.mark.asyncio
@@ -883,3 +888,87 @@ class TestApprovalUsesDmAllowlist:
 
         assert entry.event.is_set()
         assert "not authorized" not in result.lower()
+
+
+# ------------------------------------------------------------------
+# The individual-allowlist predicate the approval gate falls back to.
+# Exercises the REAL _is_individual_allowlisted (not a stub) so the
+# fail-closed + UUID-alt guarantees are actually tested.
+# ------------------------------------------------------------------
+
+# Env keys neutralized in every case so the host environment can't leak in.
+_ISO_ENV_OFF = {
+    "GATEWAY_ALLOWED_USERS": "",
+    "GATEWAY_ALLOW_ALL_USERS": "",
+    "TELEGRAM_ALLOWED_USERS": "",
+    "TELEGRAM_ALLOW_ALL_USERS": "",
+    "SIGNAL_ALLOWED_USERS": "",
+    "SIGNAL_ALLOW_ALL_USERS": "",
+    "WHATSAPP_ALLOWED_USERS": "",
+    "WHATSAPP_ALLOW_ALL_USERS": "",
+}
+
+
+class TestIndividualAllowlist:
+    """Direct tests of _is_individual_allowlisted — the "approved = admin"
+    predicate. Must be fail-closed: only the individual (DM) allowlist, the
+    pairing store, an allow-all flag, or a wildcard grants approval rights;
+    group membership and adapter own-policy trust must NOT."""
+
+    @staticmethod
+    def _runner():
+        # Bare instance so the REAL _is_individual_allowlisted runs (not the
+        # _make_runner stub). The method only needs os.environ and the source.
+        from gateway.run import GatewayRunner
+        return object.__new__(GatewayRunner)
+
+    @staticmethod
+    def _src(platform, user_id, *, user_id_alt=None, chat_type="group"):
+        return SessionSource(
+            platform=platform,
+            user_id=user_id,
+            chat_id="g1",
+            user_name=user_id,
+            chat_type=chat_type,
+            user_id_alt=user_id_alt,
+        )
+
+    def test_dm_allowlisted_user_matches(self):
+        runner = self._runner()
+        env = {**_ISO_ENV_OFF, "TELEGRAM_ALLOWED_USERS": "u_admin"}
+        with patch.dict(os.environ, env, clear=False):
+            assert runner._is_individual_allowlisted(self._src(Platform.TELEGRAM, "u_admin"))
+            assert not runner._is_individual_allowlisted(self._src(Platform.TELEGRAM, "u_cam"))
+
+    def test_group_only_user_fails_closed_with_no_allowlist(self):
+        """MUST-FIX: on an own-policy adapter (WhatsApp) with no individual
+        allowlist, a group-only user is NOT an approval admin. The previous
+        _is_user_authorized reuse fell open here via the adapter-trust shortcut."""
+        runner = self._runner()
+        with patch.dict(os.environ, _ISO_ENV_OFF, clear=False):
+            assert not runner._is_individual_allowlisted(self._src(Platform.WHATSAPP, "u_group"))
+
+    def test_signal_uuid_alt_matches_when_listed_by_uuid(self):
+        """SHOULD-FIX: a user listed by one id form is recognized via user_id_alt
+        — e.g. allowlist holds the UUID, the message carries the phone as user_id
+        and the UUID as user_id_alt."""
+        runner = self._runner()
+        env = {**_ISO_ENV_OFF, "SIGNAL_ALLOWED_USERS": "uuid-abc-123"}
+        with patch.dict(os.environ, env, clear=False):
+            src = self._src(Platform.SIGNAL, "+15550001111", user_id_alt="uuid-abc-123")
+            assert runner._is_individual_allowlisted(src)
+            # A different user (neither id listed) is rejected.
+            other = self._src(Platform.SIGNAL, "+15559998888", user_id_alt="uuid-zzz-999")
+            assert not runner._is_individual_allowlisted(other)
+
+    def test_wildcard_allows_anyone(self):
+        runner = self._runner()
+        env = {**_ISO_ENV_OFF, "TELEGRAM_ALLOWED_USERS": "*"}
+        with patch.dict(os.environ, env, clear=False):
+            assert runner._is_individual_allowlisted(self._src(Platform.TELEGRAM, "anyone"))
+
+    def test_allow_all_flag_allows_anyone(self):
+        runner = self._runner()
+        env = {**_ISO_ENV_OFF, "SIGNAL_ALLOW_ALL_USERS": "true"}
+        with patch.dict(os.environ, env, clear=False):
+            assert runner._is_individual_allowlisted(self._src(Platform.SIGNAL, "anyone"))

@@ -2470,11 +2470,10 @@ class GatewayRunner:
         2. **"approved = admin"** (the default, incl. HSM/Mare): when no
            explicit admin list is set, the de-facto admin set is the
            *individual* (DM) allowlist — ``SIGNAL_ALLOWED_USERS`` and friends,
-           the same identity DM-auth (``_is_user_authorized``) and group-invite
-           approval already use. We evaluate authorization against a **DM-scoped
-           view** of the source so that reaching the bot only through an
-           approved *group* never confers approval rights (a group-only member
-           can chat, but cannot approve dangerous commands).
+           the same identity DM-auth and group-invite approval already use
+           (see ``_is_individual_allowlisted``). Group membership alone never
+           confers approval rights: a group-only member can chat, but cannot
+           approve dangerous commands.
 
         Note: with no explicit admin list, ``SlashAccessPolicy.is_admin`` returns
         ``True`` for everyone (gating disabled) — which is why we must NOT use it
@@ -2484,17 +2483,123 @@ class GatewayRunner:
         policy = policy_for_source(self.config, source)
         if policy.enabled:
             return policy.is_admin(source.user_id)
+        return self._is_individual_allowlisted(source)
 
-        # No explicit admin list → "approved = admin". Evaluate DM authorization
-        # so group membership alone never grants approval rights.
-        dm_source = source
-        if getattr(source, "chat_type", None) != "dm":
+    def _is_individual_allowlisted(self, source: SessionSource) -> bool:
+        """True iff *source* is in the per-platform INDIVIDUAL (DM) allowlist —
+        the "approved = admin" set the approval gate falls back to.
+
+        Deliberately narrower than ``_is_user_authorized`` and **fail-closed**:
+        it never consults the group allowlists, and never honors an adapter's
+        "own access policy" trust shortcut. So reaching the bot only through an
+        approved *group* does NOT qualify a user as an approval admin — only the
+        individual allowlist (``SIGNAL_ALLOWED_USERS`` & friends / the registry's
+        ``allowed_users_env``), the DM pairing store, a per-platform or global
+        allow-all flag, or a ``*`` wildcard does.
+
+        Matches both ``user_id`` and the platform stable alt id (``user_id_alt``
+        — Signal UUID, Feishu union_id), so an approver listed by phone is still
+        recognized when their message carries a UUID, and vice versa. (WhatsApp
+        LID / SimpleX display-name aliasing is intentionally not expanded here;
+        list the canonical id for approval admins on those platforms.)
+        """
+        platform = source.platform
+        user_id = source.user_id
+        user_id_alt = getattr(source, "user_id_alt", None)
+        _truthy = {"true", "1", "yes"}
+
+        # Per-platform / global allow-all → "open mode": everyone is approved.
+        allow_all_env_map = {
+            Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
+            Platform.DISCORD: "DISCORD_ALLOW_ALL_USERS",
+            Platform.WHATSAPP: "WHATSAPP_ALLOW_ALL_USERS",
+            Platform.SLACK: "SLACK_ALLOW_ALL_USERS",
+            Platform.SIGNAL: "SIGNAL_ALLOW_ALL_USERS",
+            Platform.EMAIL: "EMAIL_ALLOW_ALL_USERS",
+            Platform.SMS: "SMS_ALLOW_ALL_USERS",
+            Platform.MATTERMOST: "MATTERMOST_ALLOW_ALL_USERS",
+            Platform.MATRIX: "MATRIX_ALLOW_ALL_USERS",
+            Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
+            Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
+            Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
+            Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOW_ALL_USERS",
+            Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
+            Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
+            Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
+            Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+        }
+        allow_all_env = allow_all_env_map.get(platform, "")
+        if allow_all_env and os.getenv(allow_all_env, "").lower() in _truthy:
+            return True
+        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in _truthy:
+            return True
+
+        # DM pairing store — operator-approved individuals.
+        pairing = getattr(self, "pairing_store", None)
+        platform_name = platform.value if platform else ""
+        if pairing is not None:
             try:
-                import dataclasses
-                dm_source = dataclasses.replace(source, chat_type="dm")
+                if user_id and pairing.is_approved(platform_name, user_id):
+                    return True
+                if user_id_alt and pairing.is_approved(platform_name, user_id_alt):
+                    return True
             except Exception:
-                dm_source = source
-        return self._is_user_authorized(dm_source)
+                pass
+
+        # Individual allowlist env (NOT the group lists).
+        env_map = {
+            Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
+            Platform.DISCORD: "DISCORD_ALLOWED_USERS",
+            Platform.WHATSAPP: "WHATSAPP_ALLOWED_USERS",
+            Platform.SLACK: "SLACK_ALLOWED_USERS",
+            Platform.SIGNAL: "SIGNAL_ALLOWED_USERS",
+            Platform.EMAIL: "EMAIL_ALLOWED_USERS",
+            Platform.SMS: "SMS_ALLOWED_USERS",
+            Platform.MATTERMOST: "MATTERMOST_ALLOWED_USERS",
+            Platform.MATRIX: "MATRIX_ALLOWED_USERS",
+            Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
+            Platform.FEISHU: "FEISHU_ALLOWED_USERS",
+            Platform.WECOM: "WECOM_ALLOWED_USERS",
+            Platform.WECOM_CALLBACK: "WECOM_CALLBACK_ALLOWED_USERS",
+            Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
+            Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
+            Platform.QQBOT: "QQ_ALLOWED_USERS",
+            Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+        }
+        env_name = env_map.get(platform, "")
+        if not env_name and platform is not None:
+            try:
+                from gateway.platform_registry import platform_registry
+                entry = platform_registry.get(platform.value)
+                if entry and getattr(entry, "allowed_users_env", None):
+                    env_name = entry.allowed_users_env
+            except Exception:
+                pass
+
+        allowed = set()
+        if env_name:
+            allowed.update(
+                x.strip() for x in os.getenv(env_name, "").split(",") if x.strip()
+            )
+        allowed.update(
+            x.strip() for x in os.getenv("GATEWAY_ALLOWED_USERS", "").split(",") if x.strip()
+        )
+
+        # No individual allowlist configured → fail closed. (Group-only access
+        # and adapter own-policy trust never grant approval rights.)
+        if not allowed:
+            return False
+        if "*" in allowed:
+            return True
+
+        check_ids = set()
+        if user_id:
+            check_ids.add(user_id)
+            if "@" in user_id:
+                check_ids.add(user_id.split("@")[0])
+        if user_id_alt:
+            check_ids.add(user_id_alt)
+        return bool(check_ids & allowed)
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""

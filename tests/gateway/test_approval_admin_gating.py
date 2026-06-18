@@ -165,25 +165,41 @@ class TestApproveAdminGating:
         assert entry.event.is_set()
 
     @pytest.mark.asyncio
-    async def test_gating_skipped_when_policy_disabled(self):
-        """When slash_access policy is disabled, admin check is skipped."""
+    async def test_policy_disabled_falls_back_to_individual_allowlist(self):
+        """When no explicit slash_access admin list is configured, the gate
+        falls back to "approved = admin": the individual (DM) allowlist decides.
+        A non-allowlisted user is denied — previously this path treated everyone
+        as admin (the bug). An allowlisted user is admitted."""
         from tools.approval import _ApprovalEntry, _gateway_queues
 
         runner = _make_runner()
-        source = _make_source(user_id="anyone")
-        session_key = runner._session_key_for_source(source)
+        runner._is_individual_allowlisted = lambda source: source.user_id == "approved_user"
 
-        entry = _ApprovalEntry({"command": "test"})
-        _gateway_queues[session_key] = [entry]
-
+        # Non-allowlisted user is rejected even though slash policy is disabled.
+        blocked_src = _make_source(user_id="anyone")
+        blocked_key = runner._session_key_for_source(blocked_src)
+        blocked_entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[blocked_key] = [blocked_entry]
         with patch("tools.approval._get_approval_config", return_value={"admin_only": True}):
             with patch("gateway.slash_access.policy_for_source", return_value=_DISABLED_POLICY):
-                result = await runner._handle_approve_command(
+                blocked = await runner._handle_approve_command(
                     _make_event("/approve", user_id="anyone")
                 )
+        assert "Not authorized" in blocked
+        assert not blocked_entry.event.is_set()
 
-        assert "approved" in result.lower() or "resuming" in result.lower()
-        assert entry.event.is_set()
+        # Allowlisted user is admitted.
+        ok_src = _make_source(user_id="approved_user")
+        ok_key = runner._session_key_for_source(ok_src)
+        ok_entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[ok_key] = [ok_entry]
+        with patch("tools.approval._get_approval_config", return_value={"admin_only": True}):
+            with patch("gateway.slash_access.policy_for_source", return_value=_DISABLED_POLICY):
+                ok = await runner._handle_approve_command(
+                    _make_event("/approve", user_id="approved_user")
+                )
+        assert "approved" in ok.lower() or "resuming" in ok.lower()
+        assert ok_entry.event.is_set()
 
 
 # ===========================================================================
