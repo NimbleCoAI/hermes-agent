@@ -761,3 +761,125 @@ class TestCrossSessionAdminApproval:
         assert entry.result == "deny"
         assert trig_key not in _gateway_queues
         assert "no pending" not in result.lower()
+
+
+# ------------------------------------------------------------------
+# Approval gate: "approved = admin" — the individual (DM) allowlist decides
+# who may /approve·/deny, NOT group membership.
+# ------------------------------------------------------------------
+
+
+class TestApprovalUsesDmAllowlist:
+    """When no explicit approval-admin list is configured (the HSM/Mare
+    default), the /approve|/deny admin gate falls back to "approved = admin":
+    a user counts as an admin iff they are in the individual (DM) allowlist —
+    the same identity DM-auth and group-invite approval already use. A user
+    who only reaches the bot through an approved *group* is a normal
+    participant and cannot approve dangerous commands. Otherwise an empty
+    config admin list would treat every group member as an admin (the gap this
+    fixes)."""
+
+    def setup_method(self):
+        _clear_approval_state()
+
+    @staticmethod
+    def _group_source(user_id: str) -> SessionSource:
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id=user_id,
+            chat_id="grp",
+            user_name=user_id,
+            chat_type="group",
+        )
+
+    @staticmethod
+    def _runner():
+        runner = _make_runner()
+        # No config.yaml admin list — "approved = admin" governs.
+        runner.config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        )
+        # Only u_admin is in the individual (DM) allowlist. The gate evaluates
+        # DM authorization, so this is what decides admin.
+        runner._is_user_authorized = lambda source: source.user_id == "u_admin"
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_group_only_user_rejected_even_for_own_session(self):
+        """A group-only user (not in the DM allowlist) cannot /approve — even a
+        command pending in their OWN session. Without the allowlist fallback the
+        empty config list would treat everyone as admin and let this through."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = self._runner()
+        cam = self._group_source("u_cam")
+        key = runner._session_key_for_source(cam)
+        entry = _ApprovalEntry({"command": "rm -rf /", "description": "scan"})
+        _gateway_queues[key] = [entry]
+
+        result = await runner._handle_approve_command(
+            MessageEvent(text="/approve", source=cam, message_id="m1")
+        )
+
+        assert not entry.event.is_set()
+        assert "not authorized" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_dm_allowlisted_user_can_approve(self):
+        """A user in the individual (DM) allowlist can /approve (and clears a
+        sibling per-user session via the cross-session resolver), even when the
+        /approve arrives from a group."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = self._runner()
+        cam = self._group_source("u_cam")
+        key = runner._session_key_for_source(cam)
+        entry = _ApprovalEntry({"command": "ffprobe x", "description": "scan"})
+        _gateway_queues[key] = [entry]
+
+        result = await runner._handle_approve_command(
+            MessageEvent(text="/approve", source=self._group_source("u_admin"), message_id="m2")
+        )
+
+        assert entry.event.is_set()
+        assert "not authorized" not in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_group_only_user_deny_rejected(self):
+        """Same gate applies to /deny."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = self._runner()
+        cam = self._group_source("u_cam")
+        key = runner._session_key_for_source(cam)
+        entry = _ApprovalEntry({"command": "rm -rf /", "description": "scan"})
+        _gateway_queues[key] = [entry]
+
+        result = await runner._handle_deny_command(
+            MessageEvent(text="/deny", source=cam, message_id="m3")
+        )
+
+        assert not entry.event.is_set()
+        assert "not authorized" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_toggle_off_lets_anyone_approve(self):
+        """When the operator turns the "Admins only" toggle off
+        (approvals.admin_only = False), the gate is skipped entirely and any
+        participant may /approve — the HSM setting still governs on/off,
+        independent of the allowlist."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = self._runner()  # u_cam is NOT in the DM allowlist
+        cam = self._group_source("u_cam")
+        key = runner._session_key_for_source(cam)
+        entry = _ApprovalEntry({"command": "ffprobe x", "description": "scan"})
+        _gateway_queues[key] = [entry]
+
+        with patch("tools.approval._get_approval_config", return_value={"admin_only": False}):
+            result = await runner._handle_approve_command(
+                MessageEvent(text="/approve", source=cam, message_id="m4")
+            )
+
+        assert entry.event.is_set()
+        assert "not authorized" not in result.lower()

@@ -2457,6 +2457,45 @@ class GatewayRunner:
         except Exception:
             return ""
 
+    def _is_approval_admin(self, source: SessionSource) -> bool:
+        """Whether *source* may /approve or /deny dangerous commands.
+
+        Two layers, in order:
+
+        1. **config.yaml admin list** (``allow_admin_from`` /
+           ``group_allow_admin_from``): when an operator has configured an
+           explicit approval-admin list for this scope it is authoritative —
+           preserving prior/upstream behavior for deployments that set it.
+
+        2. **"approved = admin"** (the default, incl. HSM/Mare): when no
+           explicit admin list is set, the de-facto admin set is the
+           *individual* (DM) allowlist — ``SIGNAL_ALLOWED_USERS`` and friends,
+           the same identity DM-auth (``_is_user_authorized``) and group-invite
+           approval already use. We evaluate authorization against a **DM-scoped
+           view** of the source so that reaching the bot only through an
+           approved *group* never confers approval rights (a group-only member
+           can chat, but cannot approve dangerous commands).
+
+        Note: with no explicit admin list, ``SlashAccessPolicy.is_admin`` returns
+        ``True`` for everyone (gating disabled) — which is why we must NOT use it
+        as the fallback here, or every group member would be an approval admin.
+        """
+        from gateway.slash_access import policy_for_source
+        policy = policy_for_source(self.config, source)
+        if policy.enabled:
+            return policy.is_admin(source.user_id)
+
+        # No explicit admin list → "approved = admin". Evaluate DM authorization
+        # so group membership alone never grants approval rights.
+        dm_source = source
+        if getattr(source, "chat_type", None) != "dm":
+            try:
+                import dataclasses
+                dm_source = dataclasses.replace(source, chat_type="dm")
+            except Exception:
+                dm_source = source
+        return self._is_user_authorized(dm_source)
+
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
@@ -15135,11 +15174,9 @@ class GatewayRunner:
         approval_cfg = _get_approval_config()
         is_admin_approver = True
         if approval_cfg.get("admin_only", True):
-            from gateway.slash_access import policy_for_source as _policy_for_source
-            _policy = _policy_for_source(self.config, source)
-            if _policy.enabled and not _policy.is_admin(source.user_id):
+            is_admin_approver = self._is_approval_admin(source)
+            if not is_admin_approver:
                 return "⛔ Not authorized — only admin users can approve/deny dangerous commands."
-            is_admin_approver = (not _policy.enabled) or _policy.is_admin(source.user_id)
 
         # Parse args: support "all", "all session", "all always", "session", "always"
         args = event.get_command_args().strip().lower().split()
@@ -15204,11 +15241,9 @@ class GatewayRunner:
         approval_cfg = _get_approval_config()
         is_admin_approver = True
         if approval_cfg.get("admin_only", True):
-            from gateway.slash_access import policy_for_source as _policy_for_source
-            _policy = _policy_for_source(self.config, source)
-            if _policy.enabled and not _policy.is_admin(source.user_id):
+            is_admin_approver = self._is_approval_admin(source)
+            if not is_admin_approver:
                 return "⛔ Not authorized — only admin users can approve/deny dangerous commands."
-            is_admin_approver = (not _policy.enabled) or _policy.is_admin(source.user_id)
 
         args = event.get_command_args().strip().lower()
         resolve_all = "all" in args
