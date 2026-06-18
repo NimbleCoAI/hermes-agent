@@ -1927,14 +1927,18 @@ class SignalAdapter(BasePlatformAdapter):
         if event is not None:
             sender = getattr(getattr(event, "source", None), "user_id", None)
             if sender and "*" not in self.dm_allow_from and sender not in self.dm_allow_from:
-                # Admin check - unified via HSM (approved users = admins)
+                # Sender not matched by user_id. Sealed-sender messages may carry
+                # the UUID as user_id_alt — match it against the allowlist (incl.
+                # resolved UUIDs) before denying. "approved = admin": the
+                # individual DM allowlist is the approved set.
+                #
+                # (Was a swarm_map_policy.is_platform_admin call — that HSM route
+                # does not exist, so it 404'd: it never matched and cost a ~5s
+                # timeout per group message from a non-allowlisted sender.)
                 sender_uuid = getattr(getattr(event, "source", None), "user_id_alt", None)
-                try:
-                    from plugins.swarm_map_policy import is_platform_admin
-                    if is_platform_admin(sender, "signal") or (sender_uuid and is_platform_admin(sender_uuid, "signal")):
-                        return True
-                except Exception:
-                    pass
+                allow_uuids = getattr(self, "dm_allow_from_uuids", set())
+                if sender_uuid and (sender_uuid in self.dm_allow_from or sender_uuid in allow_uuids):
+                    return True
                 return False
         return True
 

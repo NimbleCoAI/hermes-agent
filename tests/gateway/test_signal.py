@@ -2028,6 +2028,47 @@ class TestObserveOnlyReactionSuppression:
         adapter.send_reaction.assert_called_once()
 
 
+class TestReactionAllowlistUuidMatch:
+    """The 👀 reaction gate is "approved = admin": a sender reachable only by
+    UUID (sealed-sender) is matched against the DM allowlist via user_id_alt,
+    and a sender in neither id form is denied — replacing the removed dead
+    swarm_map_policy.is_platform_admin call (HSM 404 + ~5s timeout)."""
+
+    def _event(self, user_id, user_id_alt=None):
+        from gateway.platforms.base import MessageEvent
+        from gateway.session import SessionSource
+        return MessageEvent(
+            text="hi",
+            source=SessionSource(
+                platform=Platform.SIGNAL,
+                chat_id="group123",
+                chat_type="group",
+                user_id=user_id,
+                user_id_alt=user_id_alt,
+            ),
+        )
+
+    def test_uuid_in_allowlist_enables_reaction(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.dm_allow_from = {"uuid-approved"}
+        # phone not in allowlist, but its UUID (user_id_alt) is.
+        ev = self._event("+15550001111", user_id_alt="uuid-approved")
+        assert adapter._reactions_enabled(ev) is True
+
+    def test_resolved_uuid_set_enables_reaction(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.dm_allow_from = {"+15551112222"}
+        adapter.dm_allow_from_uuids = {"uuid-resolved"}
+        ev = self._event("+15550001111", user_id_alt="uuid-resolved")
+        assert adapter._reactions_enabled(ev) is True
+
+    def test_unlisted_sender_denied(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.dm_allow_from = {"+15551112222"}
+        ev = self._event("+15550001111", user_id_alt="uuid-unlisted")
+        assert adapter._reactions_enabled(ev) is False
+
+
 class TestSignalMessageTypeClassification:
     """Inbound attachments must be classified so run.py surfaces them.
 

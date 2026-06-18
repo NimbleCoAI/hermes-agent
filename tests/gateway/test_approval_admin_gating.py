@@ -409,40 +409,121 @@ class TestTelegramCallbackAdminGating:
         # Should have been resolved — no admin block
         assert 12 not in adapter._approval_state
 
+    @pytest.mark.asyncio
+    async def test_admin_check_error_denies(self):
+        """Fail closed: if the admin check raises, the dangerous-command
+        approval must be denied, not allowed through."""
+        adapter = _make_adapter()
+        adapter._approval_state[13] = "agent:main:telegram:group:12345:99"
+
+        query = AsyncMock()
+        query.data = "ea:once:13"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.chat = MagicMock()
+        query.message.chat.type = "private"
+        query.message.message_thread_id = None
+        query.from_user = MagicMock()
+        query.from_user.id = "111"
+        query.from_user.first_name = "Admin"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.approval._get_approval_config", return_value={"admin_only": True}):
+                with patch.object(adapter, "_is_user_admin", side_effect=RuntimeError("boom")):
+                    with patch("tools.approval.resolve_gateway_approval", return_value=1):
+                        await adapter._handle_callback_query(update, context)
+
+        # Denied — state NOT consumed, denial surfaced.
+        assert 13 in adapter._approval_state
+        assert query.answer.called
+        assert "denied" in query.answer.call_args[1]["text"].lower()
+
 
 # ===========================================================================
 # _is_user_admin method
 # ===========================================================================
 
 
+class _FakeAdminRunner:
+    """Stands in for GatewayRunner: exposes _is_approval_admin and a bound
+    method so the adapter can reach it via _message_handler.__self__."""
+
+    def __init__(self, verdict):
+        self._verdict = verdict
+        self.seen = None
+
+    def _is_approval_admin(self, source):
+        self.seen = source
+        return self._verdict
+
+    def _handler(self, *a, **k):  # used purely as a bound method
+        pass
+
+
+# Env baseline so the host environment can't leak into fallback assertions.
+_TG_ENV_OFF = {"TELEGRAM_ALLOWED_USERS": "", "GATEWAY_ALLOW_ALL_USERS": ""}
+
+
 class TestIsUserAdmin:
-    """Test the _is_user_admin method on TelegramAdapter."""
+    """_is_user_admin gates Telegram inline-button approvals. It must mirror the
+    slash /approve gate ("approved = admin"): a user's approval authority can't
+    depend on whether they clicked a button or typed a command."""
 
-    def test_first_allowed_user_is_admin(self):
+    def test_delegates_to_runner_approval_admin(self):
+        """When the gateway runner is wired, _is_user_admin returns the runner's
+        _is_approval_admin verdict — the SAME check the slash gate uses — and
+        builds a Telegram source from the button context."""
         adapter = _make_adapter()
-        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "111,222,333"}, clear=False):
-            with patch("plugins.swarm_map_policy.is_platform_admin", side_effect=Exception("not installed"), create=True):
-                assert adapter._is_user_admin("111") is True
-                assert adapter._is_user_admin("222") is False
+        runner = _FakeAdminRunner(True)
+        adapter._message_handler = runner._handler  # __self__ == runner
 
-    def test_wildcard_not_treated_as_admin(self):
+        assert adapter._is_user_admin(
+            "u1", chat_id="g1", chat_type="supergroup", thread_id="7", user_name="x"
+        ) is True
+        assert runner.seen is not None
+        assert runner.seen.user_id == "u1"
+        assert runner.seen.platform == Platform.TELEGRAM
+        # supergroup + thread → forum scope
+        assert runner.seen.chat_type == "forum"
+
+        # A False verdict from the runner denies.
+        adapter._message_handler = _FakeAdminRunner(False)._handler
+        assert adapter._is_user_admin("u1", chat_id="g1", chat_type="group") is False
+
+    def test_fallback_any_allowlisted_user_is_admin(self):
+        """No runner wired → env-only fallback: ANY user in TELEGRAM_ALLOWED_USERS
+        is admin (not just the first), consistent with _is_individual_allowlisted."""
         adapter = _make_adapter()
-        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*,111"}, clear=False):
-            # "*" is skipped, first real ID is admin
+        env = {**_TG_ENV_OFF, "TELEGRAM_ALLOWED_USERS": "111,222,333"}
+        with patch.dict(os.environ, env, clear=False):
             assert adapter._is_user_admin("111") is True
-            assert adapter._is_user_admin("222") is False
+            assert adapter._is_user_admin("222") is True
+            assert adapter._is_user_admin("444") is False
 
-    def test_empty_allowed_users_returns_false(self):
+    def test_fallback_wildcard_makes_anyone_admin(self):
+        """"*" in the allowlist → open mode → anyone is admin (matches the slash
+        gate / _is_individual_allowlisted)."""
         adapter = _make_adapter()
-        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": ""}, clear=False):
+        env = {**_TG_ENV_OFF, "TELEGRAM_ALLOWED_USERS": "*"}
+        with patch.dict(os.environ, env, clear=False):
+            assert adapter._is_user_admin("anyone") is True
+
+    def test_fallback_gateway_allow_all_makes_admin(self):
+        adapter = _make_adapter()
+        env = {**_TG_ENV_OFF, "GATEWAY_ALLOW_ALL_USERS": "true"}
+        with patch.dict(os.environ, env, clear=False):
+            assert adapter._is_user_admin("anyone") is True
+
+    def test_fallback_empty_allowed_users_returns_false(self):
+        adapter = _make_adapter()
+        with patch.dict(os.environ, _TG_ENV_OFF, clear=False):
             assert adapter._is_user_admin("111") is False
-
-    def test_hsm_policy_checked_first(self):
-        adapter = _make_adapter()
-        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "999"}, clear=False):
-            with patch("plugins.swarm_map_policy.is_platform_admin", return_value=True, create=True):
-                # HSM says admin, even though not first in allowlist
-                assert adapter._is_user_admin("222") is True
 
     def test_empty_user_id_returns_false(self):
         adapter = _make_adapter()
