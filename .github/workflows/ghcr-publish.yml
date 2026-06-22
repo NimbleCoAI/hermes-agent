@@ -31,7 +31,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           # Transitional DUAL-PUBLISH for the hermes-agent → hermes-agent-mt
           # rename. The new path is canonical; the old path is a deprecated
