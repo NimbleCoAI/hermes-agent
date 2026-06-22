@@ -354,6 +354,10 @@ class SignalAdapter(BasePlatformAdapter):
             # Resolve phone-number allowlists to UUIDs now that RPC is live.
             await self._resolve_allowlist_uuids()
 
+            # Auto-approve pre-existing groups the agent was added to without
+            # an invite envelope (e.g. added at group creation). Best-effort.
+            await self._reconcile_groups()
+
             # Set profile name from environment if configured.
             await self._set_profile_name()
 
@@ -581,6 +585,109 @@ class SignalAdapter(BasePlatformAdapter):
                 group_id[:12] if group_id else "?",
                 _APPROVED_GROUPS_FILE,
                 exc_info=True,
+            )
+
+    def _group_approval_reason(self, group: dict):
+        """Decide whether a group the agent already belongs to should be
+        auto-approved, returning the vouching identity or ``None``.
+
+        Mirrors the invite handler's trust model, but keyed on the group's
+        admins instead of an invite envelope's sender (which never arrives for
+        groups the agent was added to at creation time):
+
+        * ``allow-all`` policy  → approve any member group.
+        * open mode / wildcard  → approve (no DM allowlist configured).
+        * ``approved-only``     → approve only when an approved user is an
+                                  *admin* of the group (a trusted operator
+                                  established it).
+
+        Trust note: the invite handler trusts an *action* (an approved user
+        invited the bot); this trusts a *property* (an approved user is a group
+        admin). Those aren't identical — a hostile creator could, in principle,
+        add an approved user to a group and promote them to admin without that
+        user's consent, then add the bot. This is an accepted, bounded trade-off
+        (it still requires an approved operator to be present *as an admin*, and
+        only governs which groups the bot will *respond* in — not DM access or
+        command authority). Reconciliation only runs for groups the bot is
+        already a member of; it never joins new ones.
+
+        Returns ``(number, uuid, name)`` of the vouching admin (empty strings
+        for the policy/open-mode cases), or ``None`` to skip.
+        """
+        if self.group_invite_policy == "allow-all":
+            return ("", "", "allow-all-policy")
+        if not self.dm_allow_from or "*" in self.dm_allow_from:
+            return ("", "", "open-mode")
+        for admin in (group.get("admins") or []):
+            a_uuid = admin.get("uuid")
+            a_num = admin.get("number")
+            if (
+                (a_uuid and (a_uuid in self.dm_allow_from_uuids or a_uuid in self.dm_allow_from))
+                or (a_num and a_num in self.dm_allow_from)
+            ):
+                return (a_num or "", a_uuid or "", "")
+        return None
+
+    async def _reconcile_groups(self) -> None:
+        """Auto-approve groups the agent is already a member of.
+
+        Closes the add-at-creation gap: when an admin creates a group with the
+        agent already in it, no invite envelope is ever delivered, so the
+        invite handler never fires and the group stays unapproved. On connect
+        we list the agent's groups and approve any trusted ones
+        (see :meth:`_group_approval_reason`), reusing the same persistence so
+        they survive restarts. Best-effort — failures never break startup.
+        """
+        try:
+            result = await self._rpc("listGroups", {"account": self.account})
+        except Exception:
+            logger.debug(
+                "Signal: group reconciliation skipped (listGroups failed)",
+                exc_info=True,
+            )
+            return
+
+        # "*" already allows every group at message time — nothing to
+        # reconcile, and per-group persistence would just churn the JSON file
+        # on every connect.
+        if "*" in self.group_allow_from:
+            return
+
+        groups = result if isinstance(result, list) else []
+        approved = 0
+        for group in groups:
+            # Per-group isolation: a malformed entry (non-dict, or admins in an
+            # unexpected shape) must never break the connect path — this is a
+            # best-effort startup step.
+            try:
+                if not isinstance(group, dict):
+                    continue
+                gid = group.get("id")
+                if not gid or gid in self.group_allow_from:
+                    continue
+                if not group.get("isMember", False) or group.get("isBlocked", False):
+                    continue
+                reason = self._group_approval_reason(group)
+                if reason is None:
+                    continue
+                sender, sender_uuid, sender_name = reason
+                self.group_allow_from.add(gid)
+                approved += 1
+                logger.info(
+                    "Signal: reconciliation auto-approving pre-existing group %s (%s)",
+                    gid[:12],
+                    (sender_uuid or sender or sender_name or "?")[:12],
+                )
+                self._persist_approved_group(gid, sender, sender_uuid, sender_name)
+            except Exception:
+                logger.warning(
+                    "Signal: could not reconcile a group (non-fatal)",
+                    exc_info=True,
+                )
+        if approved:
+            logger.info(
+                "Signal: group reconciliation approved %d pre-existing group(s)",
+                approved,
             )
 
     # ------------------------------------------------------------------
