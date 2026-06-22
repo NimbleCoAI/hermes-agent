@@ -19,11 +19,16 @@ from gateway.config import PlatformConfig
 
 
 def _make_signal_adapter(monkeypatch, tmp_path, account="+15551234567", **extra):
-    """Create a SignalAdapter with a tmp HERMES_HOME so tests never touch the real one."""
-    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
-    monkeypatch.setattr(
-        "gateway.platforms.signal.get_hermes_home", lambda: tmp_path, raising=False
-    )
+    """Create a SignalAdapter with a tmp HERMES_HOME so tests never touch the real one.
+
+    Sets HERMES_HOME (read live by ``get_hermes_home``) rather than monkeypatching
+    the function object. Patching ``gateway.platforms.signal.get_hermes_home`` via a
+    dotted string leaks across tests when the module is imported for the first time
+    *during* the patch (monkeypatch records the already-patched lambda as the
+    "original" and never restores the real function). See the matching helper in
+    ``test_signal_group_persistence.py`` for the full root-cause writeup.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", extra.pop("group_allowed", ""))
     if "allowed_users" in extra:

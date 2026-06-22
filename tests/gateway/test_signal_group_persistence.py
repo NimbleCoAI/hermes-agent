@@ -23,13 +23,21 @@ from gateway.config import Platform, PlatformConfig
 # ---------------------------------------------------------------------------
 
 def _make_signal_adapter(monkeypatch, tmp_path, account="+15551234567", **extra):
-    """Create a SignalAdapter with a tmp HERMES_HOME so tests never touch the real one."""
-    # Patch get_hermes_home at the source module AND in signal.py's own namespace
-    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
-    # Also patch via the signal module's import in case it imported directly
-    monkeypatch.setattr(
-        "gateway.platforms.signal.get_hermes_home", lambda: tmp_path, raising=False
-    )
+    """Create a SignalAdapter with a tmp HERMES_HOME so tests never touch the real one.
+
+    We point HERMES_HOME (the env var ``get_hermes_home`` reads) at ``tmp_path``
+    rather than monkeypatching the ``get_hermes_home`` function object. Patching
+    the function via the dotted string ``gateway.platforms.signal.get_hermes_home``
+    is a cross-test-pollution hazard: if the signal module has not been imported
+    yet, the *first* patch of ``hermes_constants.get_hermes_home`` runs before the
+    module is imported, so when the second patch triggers the import, signal.py's
+    ``from hermes_constants import get_hermes_home`` binds the already-patched
+    lambda into the module namespace. monkeypatch then records that lambda as the
+    "original" value and restores it (not the real function) on teardown, leaking
+    the lambda — and its captured tmp_path — into every later test. Setting the
+    env var exercises the real ``get_hermes_home`` code path and tears down cleanly.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", extra.pop("group_allowed", ""))
     if "allowed_users" in extra:
@@ -266,9 +274,7 @@ class TestPersistenceWriteFailure:
         # Make HERMES_HOME a file (not a dir) so writes will fail
         hermes_home_fake = tmp_path / "blocked_home"
         hermes_home_fake.write_text("not a directory")
-        monkeypatch.setattr(
-            "gateway.platforms.signal.get_hermes_home", lambda: hermes_home_fake
-        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home_fake))
 
         await _send_invite_envelope(adapter, "group-unwritable-dir")
 
@@ -318,3 +324,65 @@ class TestReInviteNoduplicates:
         assert persistence_file.exists()
         data = json.loads(persistence_file.read_text())
         assert "env-group-reinvited" in data
+
+
+# ---------------------------------------------------------------------------
+# 7. Test-isolation regression: the helper must NOT leak get_hermes_home
+# ---------------------------------------------------------------------------
+
+class TestHelperDoesNotLeakHermesHome:
+    """Regression for a cross-test pollution bug.
+
+    The old helper monkeypatched ``gateway.platforms.signal.get_hermes_home``
+    via a dotted string. When the signal module was imported for the first
+    time *during* that patch (because ``hermes_constants.get_hermes_home`` was
+    patched first, then the signal-module patch triggered the import),
+    monkeypatch recorded the already-patched lambda as the "original" value and
+    restored that lambda — not the real function — on teardown. The lambda,
+    closing over the test's ``tmp_path``, then leaked into every later test and
+    made unrelated tests load this test's persisted groups.
+
+    These tests assert the helper leaves the signal module's ``get_hermes_home``
+    binding identical to ``hermes_constants.get_hermes_home`` after a test runs,
+    and that an adapter built afterwards reads the *current* HERMES_HOME.
+    """
+
+    def test_helper_leaves_signal_get_hermes_home_unpatched(
+        self, monkeypatch, tmp_path
+    ):
+        import hermes_constants
+        import gateway.platforms.signal as signal_mod
+
+        # Persist a group under this test's home so a leak would be observable.
+        from gateway.platforms.signal import _APPROVED_GROUPS_FILE
+        (tmp_path / _APPROVED_GROUPS_FILE).write_text('{"leaked-group": {}}')
+
+        _make_signal_adapter(monkeypatch, tmp_path, allowed_users="+15559999999")
+
+        # The signal module must still resolve get_hermes_home to the real
+        # function object — not a lambda left behind by the helper.
+        assert signal_mod.get_hermes_home is hermes_constants.get_hermes_home
+
+    def test_fresh_adapter_reads_current_hermes_home(self, monkeypatch, tmp_path):
+        """After the helper runs for one home, a plain adapter built against a
+        different HERMES_HOME must see that new home, proving no stale binding."""
+        from gateway.platforms.signal import SignalAdapter, _APPROVED_GROUPS_FILE
+
+        # First: run the helper pointed at tmp_path with a persisted group.
+        (tmp_path / _APPROVED_GROUPS_FILE).write_text('{"old-home-group": {}}')
+        _make_signal_adapter(monkeypatch, tmp_path, allowed_users="+15559999999")
+
+        # Now point HERMES_HOME somewhere clean and build an adapter directly.
+        clean_home = tmp_path / "clean"
+        clean_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(clean_home))
+        monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "")
+
+        config = PlatformConfig()
+        config.enabled = True
+        config.extra = {"http_url": "http://localhost:8080", "account": "+15551234567"}
+        adapter = SignalAdapter(config)
+
+        # Must NOT have loaded the group from the previous home.
+        assert "old-home-group" not in adapter.group_allow_from
+        assert len(adapter.group_allow_from) == 0
