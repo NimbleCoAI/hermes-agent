@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.git_credentials_boot import (
+    build_gh_hosts_content,
     build_git_config_content,
     build_git_credentials_content,
     provision_all,
@@ -44,6 +45,10 @@ def _cfg_path(home: Path) -> Path:
 
 def _mode(p: Path) -> int:
     return stat.S_IMODE(p.stat().st_mode)
+
+
+def _gh_hosts_path(home: Path) -> Path:
+    return home / "home" / ".config" / "gh" / "hosts.yml"
 
 
 # ---------------------------------------------------------------------------
@@ -150,9 +155,12 @@ def test_apply_if_absent_does_not_clobber_existing_credentials(tmp_path):
 
     result = provision_git_credentials(tmp_path)
 
-    assert result.provisioned is False
-    assert "already present" in (result.reason or "")
-    assert (home / ".git-credentials").read_text() == "PRE-EXISTING\n"
+    # git creds are left intact; gh is provisioned independently (apply-if-absent),
+    # so the call did do work → provisioned=True, but it did NOT clobber git.
+    assert result.provisioned is True
+    assert "gh" in (result.reason or "")
+    assert "git" not in (result.reason or "")
+    assert (home / ".git-credentials").read_text() == "PRE-EXISTING\n"  # untouched
 
 
 def test_apply_if_absent_does_not_clobber_existing_gitconfig(tmp_path):
@@ -163,8 +171,27 @@ def test_apply_if_absent_does_not_clobber_existing_gitconfig(tmp_path):
 
     result = provision_git_credentials(tmp_path)
 
+    # gitconfig left intact; gh provisioned independently → not a no-op, not a clobber.
+    assert result.provisioned is True
+    assert "gh" in (result.reason or "")
+    assert (home / ".gitconfig").read_text() == "[user]\n\tname = human\n"  # untouched
+
+
+def test_no_op_when_git_and_gh_both_present(tmp_path):
+    # the true no-op branch (provisioned=False) now needs BOTH git and gh present —
+    # the only test covering it after the git/gh split. Locks that branch.
+    _write_env(tmp_path, "GITHUB_PAT=ghp_new\n")
+    home = tmp_path / "home"
+    (home / ".config" / "gh").mkdir(parents=True)
+    (home / ".git-credentials").write_text("PRE-EXISTING\n")
+    (home / ".config" / "gh" / "hosts.yml").write_text("PRE-GH\n")
+
+    result = provision_git_credentials(tmp_path)
+
     assert result.provisioned is False
-    assert (home / ".gitconfig").read_text() == "[user]\n\tname = human\n"
+    assert "already present" in (result.reason or "")
+    assert (home / ".git-credentials").read_text() == "PRE-EXISTING\n"
+    assert (home / ".config" / "gh" / "hosts.yml").read_text() == "PRE-GH\n"
 
 
 def test_force_overwrites_existing(tmp_path):
@@ -241,3 +268,43 @@ def test_provision_all_profile_identity_uses_profile_name_not_env(tmp_path, monk
     cfg = _cfg_path(tmp_path / "profiles" / "osint").read_text()
     assert "name = osint" in cfg
     assert "name = rootname" not in cfg
+
+
+# ---------------------------------------------------------------------------
+# gh CLI auth (so `gh` works in the tool subprocess too, not just `git`)
+# ---------------------------------------------------------------------------
+
+
+def test_gh_hosts_content_has_oauth_token_and_https():
+    out = build_gh_hosts_content("ghp_abc")
+    assert "github.com:" in out
+    assert "oauth_token: ghp_abc" in out
+    assert "git_protocol: https" in out
+
+
+def test_writes_gh_hosts_from_env_token(tmp_path):
+    _write_env(tmp_path, "GITHUB_PAT=ghp_secret\n")
+    provision_git_credentials(tmp_path)
+    assert "oauth_token: ghp_secret" in _gh_hosts_path(tmp_path).read_text()
+
+
+def test_gh_hosts_is_chmod_600(tmp_path):
+    _write_env(tmp_path, "GITHUB_PAT=ghp_secret\n")
+    provision_git_credentials(tmp_path)
+    assert _mode(_gh_hosts_path(tmp_path)) == 0o600
+
+
+def test_gh_provisioned_even_when_git_already_present(tmp_path):
+    # The fleet-heal case: an agent provisioned by an older build has git set up
+    # but no gh hosts.yml. gh must still be written (git and gh are independent).
+    _write_env(tmp_path, "GITHUB_PAT=ghp_secret\n")
+    sub = tmp_path / "home"
+    sub.mkdir(parents=True)
+    (sub / ".gitconfig").write_text("# pre-existing git setup\n")
+
+    result = provision_git_credentials(tmp_path)
+
+    assert result.provisioned is True
+    assert "oauth_token: ghp_secret" in _gh_hosts_path(tmp_path).read_text()
+    # git config left untouched (apply-if-absent)
+    assert _cfg_path(tmp_path).read_text() == "# pre-existing git setup\n"
