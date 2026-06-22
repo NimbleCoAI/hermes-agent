@@ -155,9 +155,12 @@ def test_apply_if_absent_does_not_clobber_existing_credentials(tmp_path):
 
     result = provision_git_credentials(tmp_path)
 
-    assert result.provisioned is False
-    assert "already present" in (result.reason or "")
-    assert (home / ".git-credentials").read_text() == "PRE-EXISTING\n"
+    # git creds are left intact; gh is provisioned independently (apply-if-absent),
+    # so the call did do work → provisioned=True, but it did NOT clobber git.
+    assert result.provisioned is True
+    assert "gh" in (result.reason or "")
+    assert "git" not in (result.reason or "")
+    assert (home / ".git-credentials").read_text() == "PRE-EXISTING\n"  # untouched
 
 
 def test_apply_if_absent_does_not_clobber_existing_gitconfig(tmp_path):
@@ -168,8 +171,27 @@ def test_apply_if_absent_does_not_clobber_existing_gitconfig(tmp_path):
 
     result = provision_git_credentials(tmp_path)
 
+    # gitconfig left intact; gh provisioned independently → not a no-op, not a clobber.
+    assert result.provisioned is True
+    assert "gh" in (result.reason or "")
+    assert (home / ".gitconfig").read_text() == "[user]\n\tname = human\n"  # untouched
+
+
+def test_no_op_when_git_and_gh_both_present(tmp_path):
+    # the true no-op branch (provisioned=False) now needs BOTH git and gh present —
+    # the only test covering it after the git/gh split. Locks that branch.
+    _write_env(tmp_path, "GITHUB_PAT=ghp_new\n")
+    home = tmp_path / "home"
+    (home / ".config" / "gh").mkdir(parents=True)
+    (home / ".git-credentials").write_text("PRE-EXISTING\n")
+    (home / ".config" / "gh" / "hosts.yml").write_text("PRE-GH\n")
+
+    result = provision_git_credentials(tmp_path)
+
     assert result.provisioned is False
-    assert (home / ".gitconfig").read_text() == "[user]\n\tname = human\n"
+    assert "already present" in (result.reason or "")
+    assert (home / ".git-credentials").read_text() == "PRE-EXISTING\n"
+    assert (home / ".config" / "gh" / "hosts.yml").read_text() == "PRE-GH\n"
 
 
 def test_force_overwrites_existing(tmp_path):
