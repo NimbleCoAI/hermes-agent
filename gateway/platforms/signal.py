@@ -591,41 +591,32 @@ class SignalAdapter(BasePlatformAdapter):
         """Decide whether a group the agent already belongs to should be
         auto-approved, returning the vouching identity or ``None``.
 
-        Mirrors the invite handler's trust model, but keyed on the group's
-        admins instead of an invite envelope's sender (which never arrives for
-        groups the agent was added to at creation time):
+        Only *policy-level* approvals survive here — never a per-group property:
 
-        * ``allow-all`` policy  → approve any member group.
+        * ``allow-all`` policy  → approve any member group (operator opted in).
         * open mode / wildcard  → approve (no DM allowlist configured).
-        * ``approved-only``     → approve only when an approved user is an
-                                  *admin* of the group (a trusted operator
-                                  established it).
+        * ``approved-only``     → ``None``. Do NOT auto-approve.
 
-        Trust note: the invite handler trusts an *action* (an approved user
-        invited the bot); this trusts a *property* (an approved user is a group
-        admin). Those aren't identical — a hostile creator could, in principle,
-        add an approved user to a group and promote them to admin without that
-        user's consent, then add the bot. This is an accepted, bounded trade-off
-        (it still requires an approved operator to be present *as an admin*, and
-        only governs which groups the bot will *respond* in — not DM access or
-        command authority). Reconciliation only runs for groups the bot is
-        already a member of; it never joins new ones.
+        Issue #56: a previous version approved an ``approved-only`` group when an
+        approved user was merely *present* as an admin. That trusts a *property*,
+        not an *action* — a non-approved actor can stand up a group, drop in (or
+        co-opt) an approved admin, and get the bot responding without that admin
+        ever acting (privilege escalation). The invite handler does this safely
+        because it trusts the *inviter* (envelope ``sourceUuid``). At reconcile
+        time there is no record of who *added* the bot — only the current admin
+        set — so "added by an approved admin" cannot be verified, and we refuse
+        rather than approve on presence. Secure add-at-creation is recovered only
+        if an editor-bearing envelope becomes available (handled by the invite
+        handler); until then such a group stays unapproved until an approved
+        admin invites it, or messages and is approved.
 
-        Returns ``(number, uuid, name)`` of the vouching admin (empty strings
-        for the policy/open-mode cases), or ``None`` to skip.
+        Returns ``("", "", reason)`` for the policy/open-mode cases, or ``None``
+        to skip.
         """
         if self.group_invite_policy == "allow-all":
             return ("", "", "allow-all-policy")
         if not self.dm_allow_from or "*" in self.dm_allow_from:
             return ("", "", "open-mode")
-        for admin in (group.get("admins") or []):
-            a_uuid = admin.get("uuid")
-            a_num = admin.get("number")
-            if (
-                (a_uuid and (a_uuid in self.dm_allow_from_uuids or a_uuid in self.dm_allow_from))
-                or (a_num and a_num in self.dm_allow_from)
-            ):
-                return (a_num or "", a_uuid or "", "")
         return None
 
     async def _reconcile_groups(self) -> None:

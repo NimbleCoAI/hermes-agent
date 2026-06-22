@@ -1,16 +1,26 @@
-"""Tests for Signal adapter group reconciliation (Gap G1: added-at-creation).
+"""Tests for Signal adapter group reconciliation (Gap G1 + issue #56 hardening).
 
-The invite handler only auto-approves a group when an invite *envelope*
-(groupV2 update with no dataMessage) arrives from an approved user. When an
-admin *creates* a group with the agent already in it, no invite envelope is
-ever delivered, so that handler never fires and the group stays unapproved —
-its messages are silently dropped.
+When an admin *creates* a group with the agent already in it, no invite
+envelope carrying the *adder's* identity is delivered — empirically, add-at-
+creation surfaces only at connect-time ``listGroups``, with no record of who
+added the bot. PR #53 closed the "messages silently dropped" gap by auto-
+approving such groups on connect when an approved user was merely *present* as a
+group admin.
 
-`_reconcile_groups()` closes that gap, envelope-agnostically: on connect it
-lists the agent's groups and auto-approves any the agent is already a member
-of when an approved user is a group admin. It mirrors the invite handler's
-trust model (open-mode / wildcard / approved-admin) and reuses the same
-persistence so reconciled groups survive restarts.
+Issue #56: that passive-presence predicate is a privilege-escalation path — a
+non-approved actor can stand up a group, drop in (or co-opt) an approved admin,
+and get the bot responding without that admin ever acting. Because nothing at
+reconcile time records who added the bot, "added *by* an approved admin" cannot
+be verified there. So under ``approved-only`` reconciliation no longer auto-
+approves on admin presence; secure add-at-creation is recovered only when an
+editor-bearing envelope is available (then via the invite handler, which already
+checks the *inviter*).
+
+What reconciliation still does:
+* ``allow-all`` invite policy → approve any member group (operator opted in).
+* open mode / wildcard allowlist → approve (no DM allowlist configured).
+* persisted-reload → previously-approved groups stay approved across restarts.
+* ``approved-only`` → never auto-approve on passive admin presence.
 """
 import json
 import pytest
@@ -89,24 +99,25 @@ def _mock_list_groups(adapter, groups):
 
 
 # ---------------------------------------------------------------------------
-# Approve when an approved user is a group admin (the real use case)
+# Issue #56: approved-only must NOT auto-approve on passive admin presence
 # ---------------------------------------------------------------------------
 
-class TestReconcileApprovesTrustedGroup:
+class TestReconcileDoesNotApproveOnAdminPresence:
 
     @pytest.mark.asyncio
-    async def test_approves_group_with_approved_admin_by_number(self, monkeypatch, tmp_path):
+    async def test_admin_presence_by_number_not_approved(self, monkeypatch, tmp_path):
+        # An approved user is merely *present* as an admin — nobody recorded that
+        # they *added* the bot. Under approved-only this must NOT auto-approve.
         adapter = _make_signal_adapter(monkeypatch, tmp_path, allowed_users="+15559999999")
         _mock_list_groups(adapter, [_group("grp-1", admin_number="+15559999999")])
 
         await adapter._reconcile_groups()
 
-        assert "grp-1" in adapter.group_allow_from
+        assert "grp-1" not in adapter.group_allow_from
 
     @pytest.mark.asyncio
-    async def test_approves_group_with_approved_admin_by_uuid(self, monkeypatch, tmp_path):
+    async def test_admin_presence_by_uuid_not_approved(self, monkeypatch, tmp_path):
         adapter = _make_signal_adapter(monkeypatch, tmp_path, allowed_users="+15559999999")
-        # UUID-only allowlist entry, resolved as DMs are at boot.
         adapter.dm_allow_from_uuids.add("66666666-6666-6666-6666-666666666666")
         _mock_list_groups(
             adapter,
@@ -115,43 +126,50 @@ class TestReconcileApprovesTrustedGroup:
 
         await adapter._reconcile_groups()
 
-        assert "grp-2" in adapter.group_allow_from
+        assert "grp-2" not in adapter.group_allow_from
 
     @pytest.mark.asyncio
-    async def test_persists_reconciled_group(self, monkeypatch, tmp_path):
+    async def test_admin_presence_does_not_persist(self, monkeypatch, tmp_path):
+        # The escalation path must leave no persisted trace either.
         adapter = _make_signal_adapter(monkeypatch, tmp_path, allowed_users="+15559999999")
         _mock_list_groups(adapter, [_group("grp-3", admin_number="+15559999999")])
 
         await adapter._reconcile_groups()
 
         from gateway.platforms.signal import _APPROVED_GROUPS_FILE
-        data = json.loads((tmp_path / _APPROVED_GROUPS_FILE).read_text())
-        assert "grp-3" in data
-        assert data["grp-3"]["added_by_uuid"] or data["grp-3"]["added_by"]
-
-
-# ---------------------------------------------------------------------------
-# Do NOT approve untrusted / ineligible groups
-# ---------------------------------------------------------------------------
-
-class TestReconcileSkipsUntrusted:
+        path = tmp_path / _APPROVED_GROUPS_FILE
+        if path.exists():
+            assert "grp-3" not in json.loads(path.read_text())
 
     @pytest.mark.asyncio
-    async def test_skips_group_without_approved_admin(self, monkeypatch, tmp_path):
-        adapter = _make_signal_adapter(monkeypatch, tmp_path, allowed_users="+15559999999")
-        _mock_list_groups(adapter, [_group("grp-x", admin_number="+15550000000")])
-
-        await adapter._reconcile_groups()
-
-        assert "grp-x" not in adapter.group_allow_from
-
-    @pytest.mark.asyncio
-    async def test_skips_non_member_group(self, monkeypatch, tmp_path):
+    async def test_approved_only_skips_every_member_group(self, monkeypatch, tmp_path):
+        # No approved admin, approved admin present — under approved-only neither
+        # is auto-approved by reconciliation.
         adapter = _make_signal_adapter(monkeypatch, tmp_path, allowed_users="+15559999999")
         _mock_list_groups(
             adapter,
-            [_group("grp-nm", admin_number="+15559999999", is_member=False)],
+            [_group("grp-none", admin_number="+15550000000"),
+             _group("grp-present", admin_number="+15559999999")],
         )
+
+        await adapter._reconcile_groups()
+
+        assert "grp-none" not in adapter.group_allow_from
+        assert "grp-present" not in adapter.group_allow_from
+
+
+# ---------------------------------------------------------------------------
+# Ineligible groups are skipped even under policies that would otherwise approve
+# ---------------------------------------------------------------------------
+
+class TestReconcileSkipsIneligible:
+
+    @pytest.mark.asyncio
+    async def test_skips_non_member_group(self, monkeypatch, tmp_path):
+        # open-mode would approve a member group; the is_member gate must still
+        # skip a non-member one.
+        adapter = _make_signal_adapter(monkeypatch, tmp_path)
+        _mock_list_groups(adapter, [_group("grp-nm", admin_number="+15550000000", is_member=False)])
 
         await adapter._reconcile_groups()
 
@@ -159,11 +177,8 @@ class TestReconcileSkipsUntrusted:
 
     @pytest.mark.asyncio
     async def test_skips_blocked_group(self, monkeypatch, tmp_path):
-        adapter = _make_signal_adapter(monkeypatch, tmp_path, allowed_users="+15559999999")
-        _mock_list_groups(
-            adapter,
-            [_group("grp-bl", admin_number="+15559999999", is_blocked=True)],
-        )
+        adapter = _make_signal_adapter(monkeypatch, tmp_path)
+        _mock_list_groups(adapter, [_group("grp-bl", admin_number="+15550000000", is_blocked=True)])
 
         await adapter._reconcile_groups()
 
@@ -186,7 +201,7 @@ class TestReconcileSkipsUntrusted:
 
 
 # ---------------------------------------------------------------------------
-# Policy parity with the invite handler
+# Policy parity with the invite handler: allow-all / open-mode still approve
 # ---------------------------------------------------------------------------
 
 class TestReconcilePolicyParity:
@@ -214,6 +229,18 @@ class TestReconcilePolicyParity:
 
         assert "grp-open" in adapter.group_allow_from
 
+    @pytest.mark.asyncio
+    async def test_open_mode_persists_reconciled_group(self, monkeypatch, tmp_path):
+        # A policy-level approval is persisted so it survives a restart.
+        adapter = _make_signal_adapter(monkeypatch, tmp_path)
+        _mock_list_groups(adapter, [_group("grp-persist", admin_number="+15550000000")])
+
+        await adapter._reconcile_groups()
+
+        from gateway.platforms.signal import _APPROVED_GROUPS_FILE
+        data = json.loads((tmp_path / _APPROVED_GROUPS_FILE).read_text())
+        assert "grp-persist" in data
+
 
 # ---------------------------------------------------------------------------
 # Robustness: a malformed listGroups payload must never break startup
@@ -222,8 +249,9 @@ class TestReconcilePolicyParity:
 class TestReconcileRobustness:
 
     @pytest.mark.asyncio
-    async def test_malformed_admins_does_not_raise(self, monkeypatch, tmp_path):
-        # admins as a list of strings (unexpected shape) must not crash startup.
+    async def test_malformed_group_does_not_raise(self, monkeypatch, tmp_path):
+        # A group with admins in an unexpected shape must not crash startup, and
+        # must not be approved under approved-only.
         adapter = _make_signal_adapter(monkeypatch, tmp_path, allowed_users="+15559999999")
         bad = {
             "id": "grp-bad",
@@ -232,21 +260,20 @@ class TestReconcileRobustness:
             "admins": ["+15559999999"],  # strings, not dicts
             "members": [],
         }
-        good = _group("grp-good", admin_number="+15559999999")
-        _mock_list_groups(adapter, [bad, good])
+        _mock_list_groups(adapter, [bad])
 
         await adapter._reconcile_groups()  # must not raise
 
-        # The malformed group is skipped; the well-formed one still approved.
         assert "grp-bad" not in adapter.group_allow_from
-        assert "grp-good" in adapter.group_allow_from
 
     @pytest.mark.asyncio
     async def test_non_dict_group_entry_does_not_raise(self, monkeypatch, tmp_path):
-        adapter = _make_signal_adapter(monkeypatch, tmp_path, allowed_users="+15559999999")
+        # open-mode would approve the well-formed group; a non-dict entry must be
+        # skipped without breaking the loop.
+        adapter = _make_signal_adapter(monkeypatch, tmp_path)
         _mock_list_groups(
             adapter,
-            ["i am not a dict", _group("grp-ok", admin_number="+15559999999")],
+            ["i am not a dict", _group("grp-ok", admin_number="+15550000000")],
         )
 
         await adapter._reconcile_groups()  # must not raise
