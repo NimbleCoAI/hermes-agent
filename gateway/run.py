@@ -7355,6 +7355,22 @@ class GatewayRunner:
                     ):
                         return True
 
+            # Signal: also honor groups the adapter approved at runtime — invite
+            # acceptance, startup reconciliation, or the persisted approved-groups
+            # file — which are tracked in the adapter's `group_allow_from` but are
+            # NOT reflected in the SIGNAL_GROUP_ALLOWED_USERS env var. The adapter
+            # already gated this message by that same set at intake; authorizing
+            # the sender here keeps run.py consistent with the adapter's decision
+            # (otherwise auto-approved groups silently reject their members).
+            if source.platform == Platform.SIGNAL:
+                _signal_adapter = (getattr(self, "adapters", None) or {}).get(Platform.SIGNAL)
+                _approved_groups = getattr(_signal_adapter, "group_allow_from", None)
+                if _approved_groups and (
+                    "*" in _approved_groups
+                    or self._chat_id_in_allowlist(source, _approved_groups)
+                ):
+                    return True
+
         if not user_id:
             return False
 

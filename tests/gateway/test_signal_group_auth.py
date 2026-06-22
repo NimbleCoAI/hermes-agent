@@ -111,3 +111,52 @@ def test_group_sender_denied_when_no_group_allowlist(monkeypatch):
     monkeypatch.setenv("SIGNAL_ALLOWED_USERS", ADMIN)
     runner = _make_bare_runner()
     assert runner._is_user_authorized(_group_source(user_id="+15550009999")) is False
+
+
+# ---------------------------------------------------------------------------
+# Adapter runtime-approved groups (invite-accept / reconcile / persisted) must
+# authorize their senders even when the group is NOT in the env var. run.py's
+# group-sender auth previously read only SIGNAL_GROUP_ALLOWED_USERS, so groups
+# the adapter approved at runtime had their senders rejected as "Unauthorized".
+# ---------------------------------------------------------------------------
+
+def test_group_member_authorized_by_adapter_runtime_approval(monkeypatch):
+    """Group present in adapter.group_allow_from but NOT in the env var → the
+    sender is authorized (run.py honors the adapter's own approval decision)."""
+    # A DM allowlist is set, so the "no allowlist → honor adapter" fallback does
+    # NOT apply; and the group is deliberately absent from the env group list.
+    monkeypatch.setenv("SIGNAL_ALLOWED_USERS", ADMIN)
+    monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "someothergroup")
+    runner = _make_bare_runner()
+    runner.adapters = {Platform.SIGNAL: SimpleNamespace(group_allow_from={"runtimegid"})}
+    src = _group_source(user_id="+15550009999", gid="runtimegid")
+    assert runner._is_user_authorized(src) is True
+
+
+def test_group_member_authorized_by_adapter_wildcard(monkeypatch):
+    """Adapter group_allow_from == {'*'} authorizes any group sender."""
+    monkeypatch.setenv("SIGNAL_ALLOWED_USERS", ADMIN)
+    monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "someothergroup")
+    runner = _make_bare_runner()
+    runner.adapters = {Platform.SIGNAL: SimpleNamespace(group_allow_from={"*"})}
+    src = _group_source(user_id="+15550009999", gid="anygid")
+    assert runner._is_user_authorized(src) is True
+
+
+def test_group_member_denied_when_not_in_env_or_adapter(monkeypatch):
+    """A group in neither the env var nor the adapter's approved set still denies."""
+    monkeypatch.setenv("SIGNAL_ALLOWED_USERS", ADMIN)
+    monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "someothergroup")
+    runner = _make_bare_runner()
+    runner.adapters = {Platform.SIGNAL: SimpleNamespace(group_allow_from={"differentgid"})}
+    src = _group_source(user_id="+15550009999", gid="runtimegid")
+    assert runner._is_user_authorized(src) is False
+
+
+def test_adapter_runtime_approval_no_adapters_attr_does_not_crash(monkeypatch):
+    """A bare runner without `.adapters` must not raise (defensive getattr)."""
+    monkeypatch.setenv("SIGNAL_ALLOWED_USERS", ADMIN)
+    monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "someothergroup")
+    runner = _make_bare_runner()  # no .adapters set
+    src = _group_source(user_id="+15550009999", gid="runtimegid")
+    assert runner._is_user_authorized(src) is False
