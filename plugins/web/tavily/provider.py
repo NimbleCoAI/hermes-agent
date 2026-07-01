@@ -154,16 +154,30 @@ class TavilyWebSearchProvider(WebSearchProvider):
             if is_interrupted():
                 return {"success": False, "error": "Interrupted"}
 
-            logger.info("Tavily search: '%s' (limit=%d)", query, limit)
-            raw = _tavily_request(
-                "search",
-                {
-                    "query": query,
-                    "max_results": min(limit, 20),
-                    "include_raw_content": False,
-                    "include_images": False,
-                },
+            # For ``site:<domain>`` scoped queries, Tavily honors the operator
+            # in-query but its default ``basic`` depth frequently returns empty
+            # ``content`` snippets. Bumping to ``advanced`` depth (only when a
+            # site scope is present) restores real snippets without changing
+            # cost/behavior for ordinary queries.
+            from tools.web_tools import parse_site_operator
+
+            domains, _residual = parse_site_operator(query)
+
+            logger.info(
+                "Tavily search: '%s' (limit=%d, site_scope=%s)",
+                query,
+                limit,
+                bool(domains),
             )
+            payload: Dict[str, Any] = {
+                "query": query,
+                "max_results": min(limit, 20),
+                "include_raw_content": False,
+                "include_images": False,
+            }
+            if domains:
+                payload["search_depth"] = "advanced"
+            raw = _tavily_request("search", payload)
             return _normalize_tavily_search_results(raw)
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
