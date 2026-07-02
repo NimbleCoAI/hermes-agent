@@ -4,8 +4,11 @@ Tests for Slack mention gating (require_mention / free_response_channels).
 Follows the same pattern as test_whatsapp_group_gating.py.
 """
 
+import logging
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from gateway.config import Platform, PlatformConfig
 
@@ -252,9 +255,10 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
     is_mentioned = bot_uid and f"<@{bot_uid}>" in text
 
     if not is_dm and bot_uid:
-        # allowed_channels check (whitelist — must pass before other gating)
+        # allowed_channels check (whitelist — must pass before other gating;
+        # "*" is a wildcard meaning no channel restriction)
         allowed = adapter._slack_allowed_channels()
-        if allowed and channel_id not in allowed:
+        if allowed and "*" not in allowed and channel_id not in allowed:
             return False
 
         if channel_id in adapter._slack_free_response_channels():
@@ -639,6 +643,112 @@ def test_allowed_channels_env_var_blocks_channel(monkeypatch):
     adapter = _make_adapter()  # no config value → falls back to env
     assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, text="hello") is False
     assert _would_process(adapter, channel_id=CHANNEL_ID, mentioned=True) is True
+
+
+# ---------------------------------------------------------------------------
+# Tests: "*" wildcard + drop-log visibility (issue #69)
+# ---------------------------------------------------------------------------
+# SLACK_ALLOWED_CHANNELS=* must mean "no channel restriction" (matching the
+# Signal group wildcard and the documented allowlist contract). Previously
+# `{"*"}` was treated as a literal whitelist, so every real channel ID was
+# silently dropped — and the drop only logged at DEBUG, making it invisible
+# at the default INFO level. These tests exercise the REAL handler, not the
+# _would_process mirror above.
+
+_TS_COUNTER = iter(range(1, 10_000))
+
+
+def _make_real_adapter(allowed_channels=None):
+    """Build a full SlackAdapter (real __init__) with I/O mocked out."""
+    extra = {}
+    if allowed_channels is not None:
+        extra["allowed_channels"] = allowed_channels
+    config = PlatformConfig(enabled=True, token="xoxb-fake-token", extra=extra)
+    adapter = SlackAdapter(config)
+    adapter._app = MagicMock()
+    adapter._app.client = AsyncMock()
+    adapter._bot_user_id = BOT_USER_ID
+    adapter._running = True
+    adapter.handle_message = AsyncMock()
+    adapter._resolve_user_name = AsyncMock(return_value="Test User")
+    return adapter
+
+
+def _channel_event(channel_id, *, mentioned=True, text="hello"):
+    if mentioned:
+        text = f"<@{BOT_USER_ID}> {text}"
+    return {
+        "text": text,
+        "user": "U_USER",
+        "channel": channel_id,
+        "channel_type": "channel",
+        "ts": f"1700000000.{next(_TS_COUNTER):06d}",
+    }
+
+
+@pytest.mark.asyncio
+async def test_wildcard_allows_any_channel(monkeypatch):
+    """allowed_channels='*' lets an arbitrary channel through the gate."""
+    monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+    adapter = _make_real_adapter(allowed_channels="*")
+    await adapter._handle_slack_message(_channel_event(OTHER_CHANNEL_ID))
+    adapter.handle_message.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_wildcard_env_var_allows_any_channel(monkeypatch):
+    """SLACK_ALLOWED_CHANNELS=* (env var form) lets any channel through."""
+    monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "*")
+    adapter = _make_real_adapter()
+    await adapter._handle_slack_message(_channel_event(OTHER_CHANNEL_ID))
+    adapter.handle_message.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_wildcard_in_csv_allows_any_channel(monkeypatch):
+    """'*' anywhere in the CSV disables the restriction."""
+    monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+    adapter = _make_real_adapter(allowed_channels=f"{CHANNEL_ID},*")
+    await adapter._handle_slack_message(_channel_event(OTHER_CHANNEL_ID))
+    adapter.handle_message.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_channel_drop_logged_at_info_or_higher(monkeypatch, caplog):
+    """A dropped channel must be visible at the default INFO log level."""
+    monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+    adapter = _make_real_adapter(allowed_channels=[CHANNEL_ID])
+    with caplog.at_level(logging.DEBUG, logger="gateway.platforms.slack"):
+        await adapter._handle_slack_message(_channel_event(OTHER_CHANNEL_ID))
+    adapter.handle_message.assert_not_called()
+    drop_records = [
+        r for r in caplog.records
+        if "non-allowed channel" in r.getMessage() and OTHER_CHANNEL_ID in r.getMessage()
+    ]
+    assert drop_records, "channel drop was not logged at all"
+    assert all(r.levelno >= logging.INFO for r in drop_records), (
+        "channel drop logged below INFO — invisible at default log level"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_allowlist_still_gates(monkeypatch):
+    """No wildcard: listed channel passes, unlisted channel drops."""
+    monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+    adapter = _make_real_adapter(allowed_channels=[CHANNEL_ID])
+    await adapter._handle_slack_message(_channel_event(CHANNEL_ID))
+    adapter.handle_message.assert_called_once()
+
+    adapter.handle_message.reset_mock()
+    await adapter._handle_slack_message(_channel_event(OTHER_CHANNEL_ID))
+    adapter.handle_message.assert_not_called()
+
+
+def test_would_process_wildcard_allows_any_channel(monkeypatch):
+    """Mirror check: '*' disables the restriction in the gating simulation."""
+    monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+    adapter = _make_adapter(allowed_channels="*")
+    assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, mentioned=True) is True
 
 
 # ---------------------------------------------------------------------------

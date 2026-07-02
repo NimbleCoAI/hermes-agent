@@ -2338,11 +2338,21 @@ class SlackAdapter(BasePlatformAdapter):
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
         if not is_dm and bot_uid:
-            # Check allowed channels — if set, only respond in these channels (whitelist)
+            # Check allowed channels — if set, only respond in these channels
+            # (whitelist).  "*" is a wildcard meaning no channel restriction,
+            # matching the Signal group allowlist and the documented contract.
             allowed_channels = self._slack_allowed_channels()
-            if allowed_channels and channel_id not in allowed_channels:
-                logger.debug(
-                    "[Slack] Ignoring message in non-allowed channel: %s", channel_id
+            if (
+                allowed_channels
+                and "*" not in allowed_channels
+                and channel_id not in allowed_channels
+            ):
+                # INFO, not debug: a silent drop here is undiagnosable at the
+                # default log level (issue #69 — cost an hour of live debugging).
+                logger.info(
+                    "[Slack] Ignoring message in non-allowed channel: %s "
+                    "(SLACK_ALLOWED_CHANNELS whitelist active)",
+                    channel_id,
                 )
                 return
 
@@ -3607,9 +3617,11 @@ class SlackAdapter(BasePlatformAdapter):
     def _slack_allowed_channels(self) -> set:
         """Return the whitelist of channel IDs the bot will respond in.
 
-        When non-empty, messages from channels NOT in this set are silently
-        ignored — even if the bot is @mentioned.  DMs are never filtered.
+        When non-empty, messages from channels NOT in this set are ignored —
+        even if the bot is @mentioned.  DMs are never filtered.
         Empty set means no restriction (fully backward compatible).
+        A "*" entry is treated as a wildcard by the caller (no restriction),
+        matching the Signal group allowlist behavior.
         """
         raw = self.config.extra.get("allowed_channels")
         if raw is None:
