@@ -35,9 +35,16 @@ logger = logging.getLogger(__name__)
 # Loggers whose suppressed records are worth surfacing to home, grounded in the
 # real module logger names: Signal reconnect/health, model cascade fallbacks, and
 # provider errors during model calls. Prefix-matched, so submodules are covered.
+#
+# agent.chat_completion_helpers emits the main-cascade "Fallback activated"
+# WARNING (try_activate_fallback), which the conversation_loop fallback path
+# reaches via agent._try_activate_fallback(). Without it, a silent main-model
+# degradation to a GLM/local fallback (often = Anthropic credits exhausted)
+# never reaches home. It is not a submodule of any prefix above, so list it.
 DEFAULT_LOGGERS: Tuple[str, ...] = (
     "gateway.platforms.signal",
     "agent.conversation_loop",
+    "agent.chat_completion_helpers",
     "model_tools",
     "agent.auxiliary_client",
 )

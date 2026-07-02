@@ -26,6 +26,8 @@ def test_defaults(monkeypatch):
     # cascade + provider fallbacks (incl. auxiliary client) forward by default
     assert "agent.conversation_loop" in c.loggers
     assert "agent.auxiliary_client" in c.loggers
+    # main-cascade "Fallback activated" WARNING lives here; must forward by default
+    assert "agent.chat_completion_helpers" in c.loggers
     assert c.rate == 20 and c.window == 60 and c.dedup_window == 300
 
 
