@@ -33,6 +33,7 @@ from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
 from agent.memory_manager import build_memory_context_block
+from agent.model_awareness import append_current_model_line
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
@@ -619,6 +620,14 @@ def run_conversation(
                         _injections.append(_fenced)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
+                # Model self-awareness: surface the LIVE model so the LLM can
+                # answer "what model are you?" truthfully instead of guessing.
+                # Read here — at per-API-call assembly, after any
+                # try_activate_fallback() mutation of agent.model/provider — so
+                # a degraded turn shows the fallback backend, not the configured
+                # primary. Call-time only (never persisted), like the injections
+                # above. See agent/model_awareness.py.
+                append_current_model_line(_injections, agent)
                 if _injections:
                     _base = api_msg.get("content", "")
                     if isinstance(_base, str):
