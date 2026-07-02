@@ -33,11 +33,23 @@ def test_forwards_submodule_of_allowed_prefix():
 
 
 def test_default_loggers_route_main_cascade_fallback_warning():
-    # The main-cascade "Fallback activated" WARNING is emitted by
-    # agent.chat_completion_helpers.try_activate_fallback(). It must reach home
-    # so a silent main-model degradation (often = Anthropic credits exhausted)
-    # is loud, not invisible. Regression guard for [home-log-fallback-gap].
+    # The main-cascade "Fallback activated" WARNING rides the dedicated
+    # agent.degradation logger (emitted by try_activate_fallback()). It must
+    # reach home so a silent main-model degradation (often = Anthropic credits
+    # exhausted) is loud, not invisible. Regression guard for
+    # [home-log-fallback-gap].
+    policy = RoutePolicy(logger_prefixes=DEFAULT_LOGGERS, level=logging.WARNING)
+    assert policy.should_forward(
+        _record("agent.degradation", logging.WARNING)
+    ) is True
+
+
+def test_default_loggers_do_not_route_chat_helper_lifecycle_noise():
+    # agent.chat_completion_helpers also emits stream TTFB/stale timeouts,
+    # partial-stream drops, and schema-sanitize WARNINGs. Those must NOT reach
+    # the home channel — routing the whole module prefix would spam it and
+    # violate the no-lifecycle-spam rule. Only agent.degradation is routed.
     policy = RoutePolicy(logger_prefixes=DEFAULT_LOGGERS, level=logging.WARNING)
     assert policy.should_forward(
         _record("agent.chat_completion_helpers", logging.WARNING)
-    ) is True
+    ) is False

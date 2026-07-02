@@ -38,6 +38,13 @@ from utils import base_url_host_matches, base_url_hostname, env_int
 
 logger = logging.getLogger(__name__)
 
+# Dedicated channel for main-cascade degradation events (e.g. "Fallback
+# activated"). Split out from the module `logger` so home_log_router can forward
+# ONLY the degradation signal to the home channel, without dragging this
+# module's other WARNINGs (stream TTFB/stale timeouts, partial-stream drops,
+# schema-sanitize warnings) into the chat — those stay on `logger`, unrouted.
+degradation_logger = logging.getLogger("agent.degradation")
+
 
 def _ra():
     """Lazy ``run_agent`` reference.
@@ -1251,7 +1258,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             f"🔄 Primary model failed — switching to fallback: "
             f"{fb_model} via {fb_provider}"
         )
-        logger.warning(
+        degradation_logger.warning(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
         )
