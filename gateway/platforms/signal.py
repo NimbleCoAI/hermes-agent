@@ -65,6 +65,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 SIGNAL_MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024  # 100 MB
 
+# Minimum seconds between allowlist re-resolution attempts triggered by
+# envelopes from unknown senders (see _handle_envelope). Prevents a stranger
+# spamming DMs from turning every message into a listContacts/getUserStatus
+# RPC storm.
+SIGNAL_ALLOWLIST_RERESOLVE_MIN_INTERVAL = 30.0
+
 # Persistence file for runtime-accepted group allowlist (relative to HERMES_HOME).
 # Groups added via invite acceptance are written here so they survive restarts.
 _APPROVED_GROUPS_FILE = "signal_approved_groups.json"
@@ -301,6 +307,10 @@ class SignalAdapter(BasePlatformAdapter):
         # phone-number sets when UUID resolution wasn't possible.
         self.dm_allow_from_uuids: set = set()
         self.group_allow_from_uuids: set = set()
+        # Monotonic timestamp of the last envelope-triggered allowlist
+        # re-resolution (see _handle_envelope). -inf so the first unknown
+        # sender is always allowed to trigger one.
+        self._last_allowlist_reresolve: float = float("-inf")
 
         logger.info("Signal adapter initialized: url=%s account=%s groups=%s",
                      self.http_url, redact_phone(self.account),
@@ -1027,6 +1037,50 @@ class SignalAdapter(BasePlatformAdapter):
 
         logger.debug("Signal: message from %s in %s: %s",
                       redact_phone(sender), chat_id[:20], (text or "")[:50])
+
+        # Sealed-sender DMs carry only the sender's ACI UUID. The startup
+        # _resolve_allowlist_uuids() pass may have cached the wrong UUID for
+        # an allowlisted phone: pre-first-contact, getUserStatus returns the
+        # PNI — the ACI is unknowable until the first envelope arrives. So
+        # when a DM arrives from a service-id we don't recognize and the
+        # allowlist still has phone entries, re-resolve once (rate-limited)
+        # before dispatch — post-first-envelope the daemon can now map
+        # phone→ACI, which authorizes the named admin's very first message.
+        if not is_group:
+            try:
+                _known = (
+                    sender in self.dm_allow_from
+                    or sender in self.dm_allow_from_uuids
+                    or (sender_uuid and sender_uuid in self.dm_allow_from)
+                    or (sender_uuid and sender_uuid in self.dm_allow_from_uuids)
+                )
+                _has_phone_entries = any(
+                    _looks_like_e164_number(e) for e in self.dm_allow_from
+                )
+                if (
+                    not _known
+                    and self.dm_allow_from
+                    and "*" not in self.dm_allow_from
+                    and _has_phone_entries
+                ):
+                    _now = time.monotonic()
+                    if (
+                        _now - self._last_allowlist_reresolve
+                        >= SIGNAL_ALLOWLIST_RERESOLVE_MIN_INTERVAL
+                    ):
+                        self._last_allowlist_reresolve = _now
+                        logger.info(
+                            "Signal: unknown DM sender %s with phone allowlist "
+                            "entries — re-resolving allowlist UUIDs",
+                            (sender_uuid or sender or "?")[:12],
+                        )
+                        await self._resolve_allowlist_uuids()
+            except Exception:
+                # Re-resolution is best-effort — never break message handling.
+                logger.warning(
+                    "Signal: allowlist re-resolution failed (non-fatal)",
+                    exc_info=True,
+                )
 
         await self.handle_message(event)
 

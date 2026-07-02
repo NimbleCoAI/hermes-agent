@@ -236,3 +236,92 @@ class TestRunPySignalAuthRegression:
         assert runner._is_user_authorized(_make_signal_dm_source(ADMIN_PHONE)) is True
 
 
+# ---------------------------------------------------------------------------
+# Test B — signal.py: rate-limited re-resolution on unknown inbound sender
+# ---------------------------------------------------------------------------
+
+class TestSignalAdapterReResolve:
+
+    @pytest.mark.asyncio
+    async def test_unknown_aci_triggers_reresolve_before_dispatch(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, allowed_users=ADMIN_PHONE)
+        assert adapter.dm_allow_from == {ADMIN_PHONE}
+        assert adapter.dm_allow_from_uuids == set()
+
+        adapter._resolve_allowlist_uuids = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(_dm_envelope(ADMIN_ACI))
+
+        adapter._resolve_allowlist_uuids.assert_awaited_once()
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_second_envelope_within_rate_window_does_not_retrigger(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, allowed_users=ADMIN_PHONE)
+        adapter._resolve_allowlist_uuids = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(_dm_envelope(ADMIN_ACI, text="one"))
+        await adapter._handle_envelope(_dm_envelope(ADMIN_ACI, text="two"))
+
+        assert adapter._resolve_allowlist_uuids.await_count == 1
+        assert adapter.handle_message.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_known_uuid_sender_does_not_trigger_reresolve(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, allowed_users=ADMIN_PHONE)
+        adapter.dm_allow_from_uuids.add(ADMIN_ACI)
+        adapter._resolve_allowlist_uuids = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(_dm_envelope(ADMIN_ACI))
+
+        adapter._resolve_allowlist_uuids.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_wildcard_allowlist_does_not_trigger_reresolve(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, allowed_users="*")
+        adapter._resolve_allowlist_uuids = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(_dm_envelope(UNKNOWN_ACI))
+
+        adapter._resolve_allowlist_uuids.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_uuid_only_allowlist_does_not_trigger_reresolve(self, monkeypatch):
+        """No phone entries ⇒ nothing a re-resolve could learn; skip it."""
+        adapter = _make_signal_adapter(monkeypatch, allowed_users=ADMIN_ACI)
+        adapter._resolve_allowlist_uuids = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(_dm_envelope(UNKNOWN_ACI))
+
+        adapter._resolve_allowlist_uuids.assert_not_awaited()
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reresolve_failure_does_not_break_message_handling(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, allowed_users=ADMIN_PHONE)
+        adapter._resolve_allowlist_uuids = AsyncMock(side_effect=RuntimeError("daemon down"))
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(_dm_envelope(ADMIN_ACI))
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reresolve_allowed_again_after_rate_window(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, allowed_users=ADMIN_PHONE)
+        adapter._resolve_allowlist_uuids = AsyncMock()
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope(_dm_envelope(ADMIN_ACI, text="one"))
+        # Simulate the rate window elapsing.
+        adapter._last_allowlist_reresolve -= 31.0
+        await adapter._handle_envelope(_dm_envelope(ADMIN_ACI, text="two"))
+
+        assert adapter._resolve_allowlist_uuids.await_count == 2
