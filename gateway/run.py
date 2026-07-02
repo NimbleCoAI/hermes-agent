@@ -7565,6 +7565,40 @@ class GatewayRunner:
             if normalized_user_id:
                 check_ids.add(normalized_user_id)
 
+        # Signal: sealed-sender envelopes identify the sender only by their
+        # ACI UUID, so a phone-number entry in SIGNAL_ALLOWED_USERS can never
+        # match source.user_id directly. Mirror the WhatsApp phone↔LID
+        # expansion above using the Signal adapter's observed phone↔UUID
+        # caches and its resolved allowlist UUID set (dm_allow_from_uuids).
+        # Note: at startup (pre-first-contact) getUserStatus can only return
+        # the PNI — a different UUID from the ACI carried by sealed-sender
+        # envelopes — so the adapter also re-resolves lazily once envelopes
+        # arrive (see signal.py). This block is additive: it can only widen
+        # the comparison with adapter-verified aliases, never toward
+        # allow-all ("*" was already handled above).
+        if source.platform == Platform.SIGNAL:
+            try:
+                _signal_adapter = (getattr(self, "adapters", None) or {}).get(Platform.SIGNAL)
+                if _signal_adapter is not None:
+                    _uuid_by_number = getattr(_signal_adapter, "_recipient_uuid_by_number", None) or {}
+                    for allowed_id in list(allowed_ids):
+                        if allowed_id.startswith("+"):
+                            _alias_uuid = _uuid_by_number.get(allowed_id)
+                            if _alias_uuid:
+                                allowed_ids.add(_alias_uuid)
+                    _dm_uuids = getattr(_signal_adapter, "dm_allow_from_uuids", None)
+                    if _dm_uuids:
+                        allowed_ids.update(_dm_uuids)
+                    _number_by_uuid = getattr(_signal_adapter, "_recipient_number_by_uuid", None) or {}
+                    _alias_number = _number_by_uuid.get(user_id)
+                    if _alias_number:
+                        check_ids.add(_alias_number)
+            except Exception:
+                # Never let adapter introspection break auth — fall back to
+                # the raw env-string comparison (fail toward deny, never
+                # toward allow-all).
+                logger.debug("Signal auth alias expansion failed (non-fatal)", exc_info=True)
+
         # SimpleX: SIMPLEX_ALLOWED_USERS accepts either the numeric contactId
         # or the contact's display name. The adapter sets user_id=contactId for
         # stability across renames, but the SimpleX UI never surfaces the
