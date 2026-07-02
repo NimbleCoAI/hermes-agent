@@ -391,7 +391,7 @@ Slack supports both patterns: `@mention` required to start a conversation by def
 
 ### Channel allowlist (`allowed_channels`)
 
-Restrict the bot to a fixed set of Slack channels — useful when the bot is invited to many channels but should only respond in a few. When set, messages from channels NOT in this list are **silently ignored**, even if the bot is `@mentioned`.
+Restrict the bot to a fixed set of Slack channels — useful when the bot is invited to many channels but should only respond in a few. When set, messages from channels NOT in this list are **ignored** (with an INFO-level log line), even if the bot is `@mentioned`.
 
 **DMs are exempt** from this filter, so authorized users can always reach the bot in a direct message.
 
@@ -411,7 +411,8 @@ SLACK_ALLOWED_CHANNELS="C0123456789,C0987654321"
 Behavior:
 
 - Empty / unset → no restriction (fully backward compatible).
-- Non-empty → channel ID must be on the list, or the message is dropped before any other gating (mention requirement, `free_response_channels`, etc.) runs.
+- `*` anywhere in the list → wildcard, no restriction (matches the Signal group allowlist contract).
+- Non-empty → channel ID must be on the list, or the message is dropped before any other gating (mention requirement, `free_response_channels`, etc.) runs. Drops are logged at INFO (`Ignoring message in non-allowed channel`), so a misconfigured allowlist is diagnosable from default-level logs.
 - Slack channel IDs start with `C` (public), `G` (private), or `D` (DM). Look them up via the Slack UI's "Open channel details" → "About" panel, or via the API.
 
 See also: [admin/user slash command split](../../reference/slash-commands.md#permissions-and-adminuser-split).
