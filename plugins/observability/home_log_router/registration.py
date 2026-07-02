@@ -35,9 +35,20 @@ logger = logging.getLogger(__name__)
 # Loggers whose suppressed records are worth surfacing to home, grounded in the
 # real module logger names: Signal reconnect/health, model cascade fallbacks, and
 # provider errors during model calls. Prefix-matched, so submodules are covered.
+#
+# agent.degradation is a dedicated channel carrying ONLY main-cascade
+# degradation events — right now the "Fallback activated" WARNING emitted by
+# chat_completion_helpers.try_activate_fallback(). Without it, a silent
+# main-model degradation to a GLM/local fallback (often = Anthropic credits
+# exhausted) never reaches home. We route this dedicated logger rather than
+# the whole agent.chat_completion_helpers module: that module also emits stream
+# TTFB/stale timeouts, partial-stream drops, and schema-sanitize warnings, and
+# prefix-matching the module would spam the home channel with that lifecycle
+# noise (violates the no-lifecycle-spam rule).
 DEFAULT_LOGGERS: Tuple[str, ...] = (
     "gateway.platforms.signal",
     "agent.conversation_loop",
+    "agent.degradation",
     "model_tools",
     "agent.auxiliary_client",
 )
