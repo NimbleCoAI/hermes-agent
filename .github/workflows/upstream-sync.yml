@@ -66,12 +66,20 @@ jobs:
         run: |
           BRANCH="${{ steps.merge.outputs.branch }}"
           git push origin "$BRANCH"
-          gh pr create \
+          # --repo is REQUIRED: the job adds an `upstream` remote, and without
+          # an explicit repo gh resolves against NousResearch/hermes-agent,
+          # where the workflow token 403s. That 403 was then swallowed by the
+          # fallback echo, so the run went green with nothing created.
+          if ! gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
             --title "chore: sync with upstream $(date +%Y-%m-%d)" \
             --body "Automated weekly merge of \`upstream/main\` (NousResearch/hermes-agent). Merged cleanly — no conflicts. **Review CI before merging**; a clean text merge can still silently drop a fork patch where upstream rewrote the same region, so let the test suite gate it." \
             --base main \
-            --head "$BRANCH" \
-          || echo "PR already exists for $BRANCH"
+            --head "$BRANCH"; then
+            # Only tolerate the duplicate-PR case; any other failure must fail the run.
+            gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --json number -q '.[0].number' | grep -q . \
+              && echo "PR already exists for $BRANCH"
+          fi
 
       - name: Open issue on conflict
         if: steps.merge.outputs.status == 'conflict'
@@ -82,15 +90,25 @@ jobs:
           # whole job (could not add label: 'upstream-sync' not found), so the
           # conflict was never reported. --force is create-or-update; the
           # `|| true` is belt-and-suspenders for a races/permission hiccup.
+          # --repo is REQUIRED here too (see PR step): without it gh targeted
+          # the upstream remote's repo and 403'd.
           gh label create upstream-sync \
+            --repo "$GITHUB_REPOSITORY" \
             --color FBCA04 \
             --description "Weekly upstream merge needs manual conflict resolution" \
             --force || true
 
           CONFLICTS="$(cat /tmp/conflicts.txt 2>/dev/null || echo '(see workflow logs)')"
           DATE="$(date +%Y%m%d)"
-          gh issue create \
-            --title "Upstream sync conflict $(date +%Y-%m-%d)" \
-            --label upstream-sync \
-            --body "$(printf 'Weekly merge of \x60upstream/main\x60 hit conflicts in:\n\n\x60\x60\x60\n%s\n\x60\x60\x60\n\nResolve locally:\n\n\x60\x60\x60bash\ngit fetch upstream main\ngit checkout -b upstream-sync-%s origin/main\ngit merge upstream/main   # resolve the files above\nuv lock                   # if pyproject changed\n# run the full suite, then open a PR to main\n\x60\x60\x60\n' "$CONFLICTS" "$DATE")" \
-          || echo "Issue may already exist"
+          TITLE="Upstream sync conflict $(date +%Y-%m-%d)"
+          # Skip only a true duplicate; otherwise let a create failure fail the run
+          # instead of masking it (masked 403s hid three weeks of conflicts).
+          if gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number -q '.[0].number' | grep -q .; then
+            echo "Issue already exists: $TITLE"
+          else
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" \
+              --label upstream-sync \
+              --body "$(printf 'Weekly merge of \x60upstream/main\x60 hit conflicts in:\n\n\x60\x60\x60\n%s\n\x60\x60\x60\n\nResolve locally:\n\n\x60\x60\x60bash\ngit fetch upstream main\ngit checkout -b upstream-sync-%s origin/main\ngit merge upstream/main   # resolve the files above\nuv lock                   # if pyproject changed\n# run the full suite, then open a PR to main\n\x60\x60\x60\n' "$CONFLICTS" "$DATE")"
+          fi
