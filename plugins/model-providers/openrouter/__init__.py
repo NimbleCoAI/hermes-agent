@@ -51,6 +51,7 @@ class OpenRouterProfile(ProviderProfile):
         self,
         *,
         api_key: str | None = None,
+        base_url: str | None = None,
         timeout: float = 8.0,
     ) -> list[str] | None:
         """Fetch from public OpenRouter catalog — no auth required.
@@ -64,7 +65,7 @@ class OpenRouterProfile(ProviderProfile):
         if _CACHE is not None:
             return _CACHE
         try:
-            result = super().fetch_models(api_key=None, timeout=timeout)
+            result = super().fetch_models(api_key=None, base_url=base_url, timeout=timeout)
             if result is not None:
                 _CACHE = result
             return result
@@ -116,28 +117,54 @@ class OpenRouterProfile(ProviderProfile):
         the same backend server across turns.
         """
         extra_body: dict[str, Any] = {}
+        top_level: dict[str, Any] = {}
+        extra_headers: dict[str, Any] = {}
         if supports_reasoning:
-            if reasoning_config is not None:
-                cfg = dict(reasoning_config)
-                # Reasoning-mandatory Anthropic models (Claude 4.6+ / fable /
-                # future named models) have no "off" switch. Forwarding
-                # ``{enabled: false}`` makes OpenRouter emit Anthropic's manual
-                # ``thinking: {type: "disabled"}``, which those models reject
-                # with a non-retryable HTTP 400. Omit reasoning entirely so the
-                # model falls back to its default (adaptive) thinking instead.
-                disabling = cfg.get("enabled") is False or cfg.get("effort") == "none"
-                if disabling and _anthropic_reasoning_is_mandatory(model):
-                    pass  # leave reasoning unset → adaptive default
-                else:
-                    extra_body["reasoning"] = cfg
+            # Reasoning-mandatory Anthropic models (Claude 4.6+ / fable /
+            # future named models) use *adaptive* thinking: the model decides
+            # how much to think, and OpenRouter ignores ``reasoning.effort`` for
+            # them entirely. Sending any ``reasoning`` field is therefore both
+            # pointless and actively harmful:
+            #   - ``{enabled: false}`` → OpenRouter emits Anthropic's manual
+            #     ``thinking: {type: "disabled"}``, which these models 400 on.
+            #   - any enabled form, on a tool-continuation turn whose prior
+            #     assistant tool_call carries no thinking block (chat_completions
+            #     never replays signed thinking blocks), ALSO makes OpenRouter
+            #     emit ``thinking: {type: "disabled"}`` → the same 400 on every
+            #     turn after the first tool call.
+            # The only reliable behavior is to omit ``reasoning`` and let the
+            # model default to adaptive. See hermes-agent#42991 (disable case)
+            # and the tool-replay follow-up.
+            #
+            # ``reasoning.effort`` being ignored does NOT mean these models have
+            # no effort lever — OpenRouter honors the requested effort on the
+            # top-level ``verbosity`` field instead (it maps to Anthropic's
+            # ``output_config.effort``; ``reasoning.effort`` is accepted but
+            # ignored — confirmed by OpenRouter's Claude migration docs and a
+            # live token-spend probe in hermes-agent#43432). Route the existing
+            # ``reasoning_config["effort"]`` (sourced from
+            # ``agent.reasoning_effort``) onto ``verbosity`` so the knob the user
+            # already sets keeps working for these models. We still send NO
+            # ``reasoning`` field, preserving the #42991 400 fix.
+            if _anthropic_reasoning_is_mandatory(model):
+                cfg = reasoning_config or {}
+                effort = cfg.get("effort")
+                # Only emit when effort is actually requested and reasoning
+                # isn't explicitly disabled. Otherwise omit ``verbosity`` so the
+                # model keeps its own adaptive default (``high``).
+                if cfg.get("enabled", True) is not False and effort and effort != "none":
+                    top_level["verbosity"] = effort
+            elif reasoning_config is not None:
+                extra_body["reasoning"] = dict(reasoning_config)
             else:
                 extra_body["reasoning"] = {"enabled": True, "effort": "medium"}
 
-        extra_headers: dict[str, Any] = {}
         if session_id and model and model.startswith(("x-ai/grok-", "xai/grok-")):
             extra_headers["x-grok-conv-id"] = session_id
+        if extra_headers:
+            top_level["extra_headers"] = extra_headers
 
-        return extra_body, {"extra_headers": extra_headers} if extra_headers else {}
+        return extra_body, top_level
 
 
 openrouter = OpenRouterProfile(

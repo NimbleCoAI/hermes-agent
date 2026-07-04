@@ -3,17 +3,17 @@ name: Build Skills Index
 on:
   schedule:
     # Run twice daily: 6 AM and 6 PM UTC
-    - cron: '0 6,18 * * *'
-  workflow_dispatch:  # Manual trigger
+    - cron: "0 6,18 * * *"
+  workflow_dispatch: # Manual trigger
   push:
     branches: [main]
     paths:
-      - 'scripts/build_skills_index.py'
-      - '.github/workflows/skills-index.yml'
+      - "scripts/build_skills_index.py"
+      - ".github/workflows/skills-index.yml"
 
 permissions:
   contents: read
-  actions: write   # to trigger deploy-site.yml on schedule
+  actions: write # to trigger deploy-site.yml on schedule
 
 jobs:
   build-index:
@@ -23,9 +23,9 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: pip install httpx==0.28.1 pyyaml==6.0.2
@@ -53,4 +53,4 @@ jobs:
       - name: Trigger Deploy Site workflow
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run deploy-site.yml --repo ${{ github.repository }}
+        run: gh workflow run deploy-site.yml --repo ${{ github.repository }} -f skills_index_run_id=${{ github.run_id }}
