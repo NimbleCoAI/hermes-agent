@@ -17,7 +17,7 @@ def _make_adapter(allow_from=None, allowed_chats=None, group_allowed_chats=None,
     try:
         from plugins.platforms.telegram.adapter import TelegramAdapter
     except ModuleNotFoundError:  # PR branch before Telegram plugin extraction
-        from gateway.platforms.telegram import TelegramAdapter
+        from plugins.platforms.telegram.adapter import TelegramAdapter
 
     extra = {}
     if allow_from is not None:
