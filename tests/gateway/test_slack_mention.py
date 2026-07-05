@@ -876,7 +876,7 @@ async def test_channel_drop_logged_at_info_or_higher(monkeypatch, caplog):
     """A dropped channel must be visible at the default INFO log level."""
     monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
     adapter = _make_real_adapter(allowed_channels=[CHANNEL_ID])
-    with caplog.at_level(logging.DEBUG, logger="gateway.platforms.slack"):
+    with caplog.at_level(logging.DEBUG, logger="plugins.platforms.slack.adapter"):
         await adapter._handle_slack_message(_channel_event(OTHER_CHANNEL_ID))
     adapter.handle_message.assert_not_called()
     drop_records = [

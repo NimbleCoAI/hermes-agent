@@ -75,6 +75,11 @@ def _make_runner():
     runner._draining = False
     runner.session_store = None
     runner._is_user_authorized = lambda _source: True
+    # Fork semantics: /approve + /deny (and therefore the plaintext synonyms,
+    # which synthesize those commands) are admin-gated. The routing tests
+    # exercise the dispatch, so run them as an approval admin; the non-admin
+    # refusal is pinned in test_plaintext_from_non_admin_does_not_resolve.
+    runner._is_approval_admin = lambda _source: True
     # _handle_active_session_busy_message uses these only on the
     # non-approval fall-through path; harmless to stub.
     runner._busy_input_mode = "interrupt"
@@ -152,6 +157,25 @@ def test_plaintext_session_maps_to_session_choice():
 
     assert handled is True
     assert entry.result == "session"
+    _clear_approval_state()
+
+
+def test_plaintext_from_non_admin_does_not_resolve():
+    """Fork gate: a plaintext 'yes' from a NON-admin participant must not
+    resolve a dangerous-command approval — same rule as /approve itself.
+    Without this, plaintext synonyms would be an admin-gate bypass."""
+    _clear_approval_state()
+    runner, adapter = _make_runner()
+    runner._is_approval_admin = lambda _source: False
+    session_key, entry = _register_blocking_approval(runner)
+
+    handled = asyncio.run(
+        runner._handle_active_session_busy_message(_make_event("yes"), session_key)
+    )
+
+    assert handled is True  # consumed (refusal reply sent), not queued
+    assert not entry.event.is_set()
+    assert entry.result is None
     _clear_approval_state()
 
 

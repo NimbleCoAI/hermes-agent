@@ -74,6 +74,8 @@ AUTHOR_MAP = {
     "hodlclone@gmail.com": "HODLCLONE",  # PR #49351 salvage (Nous Portal token resilience: rotate refresh tokens write-through to the source auth store in profile mode, skip Nous fallback when no local token, sync gateway session model after fallback)
     "7698789+abchiaravalle@users.noreply.github.com": "abchiaravalle",  # PR #46997 salvage (recover resume_pending sessions: dual freshness signal + empty-turn safety net so restart auto-resume never sends a blank user turn)
     "swissly@users.noreply.github.com": "swissly",  # PR #47167 salvage (wrap cron delivery thread-pool fallback in its own try/except so a per-target failure can't escape the except-RuntimeError block and crash the multi-target delivery loop; #47163)
+    "DavidMetcalfe@users.noreply.github.com": "DavidMetcalfe",  # upstream merge 2026-07-03
+    "konsisumer@users.noreply.github.com": "konsisumer",  # upstream merge 2026-07-03
     "53571168+shawchanshek@users.noreply.github.com": "shawchanshek",  # PR #44126 salvage (strip <think>...</think> reasoning blocks from title-generator LLM output via the canonical strip_think_blocks scrubber so reasoning-model output can't leak into session titles)
     "30854794+YLChen-007@users.noreply.github.com": "YLChen-007",  # PR #27289 salvage (case-insensitive streaming reasoning-tag filter in cli.py _stream_delta + gateway stream_consumer so mixed-case variants like <Think>/<ThInK> are suppressed, not just the hardcoded case literals)
     "27672904+kangsoo-bit@users.noreply.github.com": "kangsoo-bit",  # PR #47508 salvage (keep Telegram gateway alive on transient bootstrap network errors: best-effort deleteWebhook + resilient start_polling degrade to background recovery instead of failing startup)
