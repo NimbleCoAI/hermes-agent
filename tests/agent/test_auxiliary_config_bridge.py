@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 
+import pytest
+
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -239,29 +241,30 @@ class TestGatewayBridgeCodeParity:
 class TestVisionModelOverride:
     """Test that AUXILIARY_VISION_MODEL env var overrides the default model in the handler."""
 
-    def test_env_var_overrides_default(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_env_var_overrides_default(self, monkeypatch):
         monkeypatch.setenv("AUXILIARY_VISION_MODEL", "openai/gpt-4o")
         from tools.vision_tools import _handle_vision_analyze
-        # Force the aux path (no native fast-path / cascade) and await the now-async handler.
-        with patch("tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock) as mock_tool, \
-             patch("tools.vision_tools._supports_media_in_tool_results", return_value=False):
+        with (
+            patch("tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock) as mock_tool,
+            patch("tools.vision_tools._should_use_native_vision_fast_path", return_value=False),
+        ):
             mock_tool.return_value = '{"success": true}'
-            asyncio.get_event_loop().run_until_complete(
-                _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"})
-            )
+            await _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"})
             call_args = mock_tool.call_args
             # 3rd positional arg = model
             assert call_args[0][2] == "openai/gpt-4o"
 
-    def test_default_model_when_no_override(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_default_model_when_no_override(self, monkeypatch):
         monkeypatch.delenv("AUXILIARY_VISION_MODEL", raising=False)
         from tools.vision_tools import _handle_vision_analyze
-        with patch("tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock) as mock_tool, \
-             patch("tools.vision_tools._supports_media_in_tool_results", return_value=False):
+        with (
+            patch("tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock) as mock_tool,
+            patch("tools.vision_tools._should_use_native_vision_fast_path", return_value=False),
+        ):
             mock_tool.return_value = '{"success": true}'
-            asyncio.get_event_loop().run_until_complete(
-                _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"})
-            )
+            await _handle_vision_analyze({"image_url": "http://test.jpg", "question": "test"})
             call_args = mock_tool.call_args
             # With no AUXILIARY_VISION_MODEL env var, model should be None
             # (the centralized call_llm router picks the provider default)

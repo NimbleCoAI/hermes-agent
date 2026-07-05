@@ -9,6 +9,7 @@ import { Switch } from '@/components/ui/switch'
 import { TextTab, TextTabMeta } from '@/components/ui/text-tab'
 import { getSkills, getToolsets, toggleSkill, toggleToolset } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { isDesktopToolsetVisible } from '@/lib/desktop-toolsets'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import type { SkillInfo, ToolsetInfo } from '@/types/hermes'
@@ -17,11 +18,14 @@ import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
 import { PAGE_INSET_X } from '../layout-constants'
 import { PageSearchShell } from '../page-search-shell'
+import { ComputerUsePanel } from '../settings/computer-use-panel'
 import { asText, includesQuery, prettyName, toolNames, toolsetDisplayLabel } from '../settings/helpers'
 import { ToolsetConfigPanel } from '../settings/toolset-config-panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
-const SKILLS_MODES = ['skills', 'toolsets'] as const
+import { SkillsHub } from './hub'
+
+const SKILLS_MODES = ['skills', 'toolsets', 'hub'] as const
 type SkillsMode = (typeof SKILLS_MODES)[number]
 
 function categoryFor(skill: SkillInfo): string {
@@ -51,6 +55,10 @@ function filteredToolsets(toolsets: ToolsetInfo[], query: string): ToolsetInfo[]
 
   return toolsets
     .filter(toolset => {
+      if (!isDesktopToolsetVisible(toolset.name)) {
+        return false
+      }
+
       if (!q) {
         return true
       }
@@ -210,8 +218,16 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
         ) : undefined
       }
       onSearchChange={setQuery}
-      searchHidden={mode === 'skills' ? (skills?.length ?? 0) === 0 : (toolsets?.length ?? 0) === 0}
-      searchPlaceholder={mode === 'skills' ? t.skills.searchSkills : t.skills.searchToolsets}
+      searchHidden={
+        mode === 'skills' ? (skills?.length ?? 0) === 0 : mode === 'toolsets' && (toolsets?.length ?? 0) === 0
+      }
+      searchPlaceholder={
+        mode === 'skills'
+          ? t.skills.searchSkills
+          : mode === 'hub'
+            ? t.skills.hub.searchPlaceholder
+            : t.skills.searchToolsets
+      }
       searchTrailingAction={
         <Button
           aria-label={refreshing ? t.skills.refreshing : t.skills.refresh}
@@ -235,10 +251,17 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
           <TextTab active={mode === 'toolsets'} onClick={() => setMode('toolsets')}>
             {t.skills.tabToolsets}
           </TextTab>
+          <TextTab active={mode === 'hub'} onClick={() => setMode('hub')}>
+            {t.skills.tabHub}
+          </TextTab>
         </>
       }
     >
-      {!skills || !toolsets ? (
+      {mode === 'hub' ? (
+        <div className={cn('h-full overflow-y-auto py-3', PAGE_INSET_X)}>
+          <SkillsHub onInstalledChange={() => void refreshCapabilities()} query={query} />
+        </div>
+      ) : !skills || !toolsets ? (
         <PageLoader label={t.skills.loading} />
       ) : mode === 'skills' ? (
         <div className={cn('h-full overflow-y-auto py-3', PAGE_INSET_X)}>
@@ -333,6 +356,9 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
                             </span>
                           ))}
                         </div>
+                      )}
+                      {expanded && toolset.name === 'computer_use' && (
+                        <ComputerUsePanel onConfiguredChange={refreshToolsets} />
                       )}
                       {expanded && <ToolsetConfigPanel onConfiguredChange={refreshToolsets} toolset={toolset.name} />}
                     </div>
