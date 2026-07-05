@@ -390,7 +390,9 @@ class TestSignalConnectionRetry:
             )
         )
 
-        assert result == {"success": True, "platform": "signal", "chat_id": "group:abc123"}
+        # Fork: _display_chat_id masks Signal group ids in tool results
+        # (group ids are treated as sensitive identifiers).
+        assert result == {"success": True, "platform": "signal", "chat_id": "group:***"}
         assert len(fake.calls) == 2
         assert len(sleep_calls) >= 1
 
