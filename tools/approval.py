@@ -2557,11 +2557,12 @@ def check_all_command_guards(command: str, env_type: str,
                     "approved": False,
                     "message": (
                         f"BLOCKED: Command {reason} ({combined_desc}). "
-                        f"Do NOT retry this command or any variant using the "
-                        f"same pattern. Use a fundamentally different approach: "
-                        f"download to a file first then process the file "
-                        f"separately, use jq for JSON, or use a language's "
-                        f"HTTP library directly."
+                        f"The user has NOT consented to this action. Do NOT "
+                        f"retry this command, do NOT rephrase it, and do NOT "
+                        f"attempt the same outcome via a different command. "
+                        f"Stop the current workflow and wait for the user to "
+                        f"respond before taking any further destructive or "
+                        f"irreversible action."
                         f"{timeout_addendum}"
                     ),
                     "pattern_key": primary_key,
@@ -2638,11 +2639,12 @@ def check_all_command_guards(command: str, env_type: str,
         return {
             "approved": False,
             "message": (
-                f"BLOCKED: User denied ({combined_desc}). "
-                "Do NOT retry this command or any variant using the same "
-                "pattern. Use a fundamentally different approach: download "
-                "to a file first then process the file separately, use jq "
-                "for JSON, or use a language's HTTP library directly."
+                f"BLOCKED: User denied this command ({combined_desc}). "
+                "The user has NOT consented to this action. Do NOT retry "
+                "this command, do NOT rephrase it, and do NOT attempt the "
+                "same outcome via a different command. Stop the current "
+                "workflow and wait for the user to respond before taking "
+                "any further destructive or irreversible action."
             ),
             "pattern_key": primary_key,
             "description": combined_desc,
