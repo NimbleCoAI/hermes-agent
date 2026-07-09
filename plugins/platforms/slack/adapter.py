@@ -62,6 +62,12 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 logger = logging.getLogger(__name__)
 
+# Persistence file for runtime-approved channels (relative to HERMES_HOME).
+# Mirrors Signal's ``signal_approved_groups.json``: when the bot is added to a
+# channel, that channel is auto-approved into the runtime allowlist and written
+# here so the approval survives restarts.
+_APPROVED_CHANNELS_FILE = "slack_approved_channels.json"
+
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
 # stashed response_url when multiple users issue commands on the same
@@ -486,6 +492,16 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+
+        # Runtime-approved channels — auto-approved when the bot is added to a
+        # channel (member_joined_channel) or discovered as a member at connect
+        # time (_reconcile_channels). Mirrors Signal's group reconcile: when a
+        # SLACK_ALLOWED_CHANNELS whitelist is active, these are unioned into the
+        # effective allowlist so an admin adding the bot to a channel doesn't
+        # need a manual env-var edit. Loaded from a persisted JSON file so the
+        # approvals survive restarts.
+        self._runtime_approved_channels: set = set()
+        self._load_approved_channels()
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -1126,6 +1142,13 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_reaction_removed(event, say):
                 pass
 
+            # Auto-approve channels the bot is added to (issue #68 — parity
+            # with Signal's group reconcile). member_joined_channel fires for
+            # every join; the handler no-ops unless the joiner is our bot.
+            @self._app.event("member_joined_channel")
+            async def handle_member_joined_channel(event, say):
+                await self._handle_member_joined_channel(event)
+
             @self._app.event("assistant_thread_started")
             async def handle_assistant_thread_started(event, say):
                 await self._handle_assistant_thread_lifecycle_event(event)
@@ -1261,6 +1284,17 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Socket Mode connected (%d workspace(s))",
                 len(self._team_clients),
             )
+
+            # Auto-approve channels the bot is already a member of (issue #68).
+            # Best-effort and non-fatal — a failure here must never fail connect.
+            try:
+                await self._reconcile_channels()
+            except Exception:  # pragma: no cover - defensive; reconcile self-guards
+                logger.debug(
+                    "[Slack] Channel reconciliation raised (non-fatal)",
+                    exc_info=True,
+                )
+
             return True
 
         except Exception as e:  # pragma: no cover - defensive logging
@@ -4217,14 +4251,13 @@ class SlackAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
-    def _slack_allowed_channels(self) -> set:
-        """Return the whitelist of channel IDs the bot will respond in.
+    def _slack_configured_channels(self) -> set:
+        """Parse the *statically configured* channel whitelist.
 
-        When non-empty, messages from channels NOT in this set are ignored —
-        even if the bot is @mentioned.  DMs are never filtered.
-        Empty set means no restriction (fully backward compatible).
-        A "*" entry is treated as a wildcard by the caller (no restriction),
-        matching the Signal group allowlist behavior.
+        Reads ``slack.allowed_channels`` (list or CSV string) or the
+        ``SLACK_ALLOWED_CHANNELS`` env var. This is the operator-authored set
+        only — runtime auto-approvals are layered on top by
+        :meth:`_slack_allowed_channels`.
         """
         raw = self.config.extra.get("allowed_channels")
         if raw is None:
@@ -4234,6 +4267,273 @@ class SlackAdapter(BasePlatformAdapter):
         if isinstance(raw, str) and raw.strip():
             return {part.strip() for part in raw.split(",") if part.strip()}
         return set()
+
+    def _slack_allowed_channels(self) -> set:
+        """Return the effective whitelist of channel IDs the bot responds in.
+
+        When non-empty, messages from channels NOT in this set are ignored —
+        even if the bot is @mentioned.  DMs are never filtered.
+        Empty set means no restriction (fully backward compatible).
+        A "*" entry is treated as a wildcard by the caller (no restriction),
+        matching the Signal group allowlist behavior.
+
+        Runtime-approved channels (auto-approved when the bot is added to a
+        channel — see :meth:`_reconcile_channels` and the
+        ``member_joined_channel`` handler) are unioned in **only when a static
+        whitelist is active**. With no static whitelist the bot already
+        responds everywhere, so approvals are irrelevant and would only turn an
+        unrestricted install into a restricted one — hence they are ignored.
+        """
+        configured = self._slack_configured_channels()
+        # No static whitelist → unrestricted; runtime approvals don't apply.
+        # "*" wildcard → unrestricted; nothing to union.
+        if not configured or "*" in configured:
+            return configured
+        # getattr keeps object.__new__-constructed test adapters working.
+        approved = getattr(self, "_runtime_approved_channels", None) or set()
+        if approved:
+            return configured | approved
+        return configured
+
+    # ------------------------------------------------------------------
+    # Channel auto-approval (parity with Signal group reconcile — issue #68)
+    # ------------------------------------------------------------------
+
+    def _channel_join_policy(self) -> str:
+        """Return the auto-approval policy for channels the bot is added to.
+
+        * ``"auto"`` (default) — auto-approve channels the bot is a member of.
+          A Slack workspace is admin-managed, so being added to a channel is
+          already an admin-gated action; the bot trusts it the way Signal's
+          invite handler trusts the inviter.
+        * ``"disabled"`` — never auto-approve; channels must be listed in
+          ``SLACK_ALLOWED_CHANNELS`` manually (pre-#68 behavior).
+
+        Reads ``slack.channel_join_policy`` or ``SLACK_CHANNEL_JOIN_POLICY``.
+        """
+        raw = None
+        if getattr(self, "config", None) is not None and self.config.extra:
+            raw = self.config.extra.get("channel_join_policy")
+        if raw is None:
+            raw = os.getenv("SLACK_CHANNEL_JOIN_POLICY", "auto")
+        value = str(raw).strip().lower()
+        return value if value in ("auto", "disabled") else "auto"
+
+    def _channel_approval_active(self) -> bool:
+        """Whether runtime channel approvals are meaningful right now.
+
+        Only when a static whitelist is configured (non-empty, no ``*``) does
+        auto-approval matter — otherwise the bot already responds everywhere,
+        so approving/persisting a channel is pointless churn (mirrors Signal
+        reconcile's early return when ``*`` is in the group allowlist).
+        """
+        if self._channel_join_policy() == "disabled":
+            return False
+        configured = self._slack_configured_channels()
+        return bool(configured) and "*" not in configured
+
+    def _load_approved_channels(self) -> None:
+        """Load runtime-approved channels persisted from previous sessions.
+
+        Corrupted or missing files are non-fatal — we log and continue with an
+        empty set. Mirrors the Signal persisted-group loader.
+        """
+        try:
+            from hermes_constants import get_hermes_home
+
+            path = get_hermes_home() / _APPROVED_CHANNELS_FILE
+            if not path.exists():
+                return
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                loaded = {str(k) for k in data.keys() if str(k).strip()}
+                if loaded:
+                    self._runtime_approved_channels.update(loaded)
+                    logger.info(
+                        "[Slack] Loaded %d persisted approved channel(s) from %s",
+                        len(loaded),
+                        _APPROVED_CHANNELS_FILE,
+                    )
+        except Exception:
+            logger.warning(
+                "[Slack] Failed to load persisted channel allowlist from %s — "
+                "continuing with configured channels only",
+                _APPROVED_CHANNELS_FILE,
+                exc_info=True,
+            )
+
+    def _persist_approved_channel(
+        self,
+        channel_id: str,
+        team_id: str = "",
+        added_by: str = "",
+    ) -> None:
+        """Write a newly-approved channel to the persistent JSON allowlist.
+
+        Read-modify-write so multiple channels accumulate correctly. Uses a
+        tmp-file + ``os.replace`` for atomicity. Failures are logged as
+        warnings and never propagated — this is a best-effort side effect of a
+        successful approval. Mirrors Signal's ``_persist_approved_group``.
+        """
+        try:
+            from datetime import datetime, timezone
+            from hermes_constants import get_hermes_home
+
+            path = get_hermes_home() / _APPROVED_CHANNELS_FILE
+            existing: dict = {}
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text())
+                    if not isinstance(existing, dict):
+                        existing = {}
+                except Exception:
+                    existing = {}
+            existing[channel_id] = {
+                "team_id": team_id or "",
+                "added_by": added_by or "",
+                "approved_at": datetime.now(timezone.utc).isoformat(),
+            }
+            import tempfile
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                dir=str(path.parent),
+                prefix=f".{path.stem}_",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w") as fh:
+                    json.dump(existing, fh, indent=2)
+                os.replace(tmp, str(path))
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except Exception:
+            logger.warning(
+                "[Slack] Failed to persist approved channel %s to %s (non-fatal)",
+                channel_id,
+                _APPROVED_CHANNELS_FILE,
+                exc_info=True,
+            )
+
+    def _approve_channel(
+        self,
+        channel_id: str,
+        team_id: str = "",
+        added_by: str = "",
+        reason: str = "",
+    ) -> bool:
+        """Add a channel to the runtime allowlist and persist it.
+
+        Returns True if this was a newly-approved channel, False if it was
+        already approved/configured or approval is not currently active. Safe
+        to call repeatedly (idempotent).
+        """
+        if not channel_id:
+            return False
+        if not self._channel_approval_active():
+            return False
+        if channel_id in self._slack_configured_channels():
+            return False
+        if channel_id in self._runtime_approved_channels:
+            return False
+        self._runtime_approved_channels.add(channel_id)
+        logger.info(
+            "[Slack] Auto-approving channel %s%s",
+            channel_id,
+            f" ({reason})" if reason else "",
+        )
+        self._persist_approved_channel(channel_id, team_id, added_by)
+        return True
+
+    async def _reconcile_channels(self) -> None:
+        """Auto-approve channels the bot is already a member of.
+
+        Closes the add-at-creation gap: when an admin adds the bot to a channel
+        while the gateway is offline (or the ``member_joined_channel`` event is
+        missed), no event fires and the channel stays outside the whitelist. On
+        connect we list the bot's member channels via ``users.conversations``
+        and approve them, reusing the same persistence so they survive
+        restarts. Best-effort — failures never break startup. Mirrors Signal's
+        :meth:`_reconcile_groups`.
+        """
+        if not self._channel_approval_active():
+            return
+        approved = 0
+        for team_id, client in list(getattr(self, "_team_clients", {}).items()):
+            cursor: Optional[str] = None
+            pages = 0
+            try:
+                while True:
+                    pages += 1
+                    resp = await client.users_conversations(
+                        types="public_channel,private_channel",
+                        exclude_archived=True,
+                        limit=200,
+                        **({"cursor": cursor} if cursor else {}),
+                    )
+                    channels = (resp.get("channels") or []) if isinstance(resp, dict) else []
+                    for ch in channels:
+                        if not isinstance(ch, dict):
+                            continue
+                        cid = ch.get("id")
+                        if not cid:
+                            continue
+                        if self._approve_channel(
+                            cid, team_id=team_id, reason="member at connect"
+                        ):
+                            approved += 1
+                    cursor = None
+                    meta = resp.get("response_metadata") if isinstance(resp, dict) else None
+                    if isinstance(meta, dict):
+                        cursor = (meta.get("next_cursor") or "").strip() or None
+                    # Cap pagination so a pathological workspace can't stall connect.
+                    if not cursor or pages >= 20:
+                        break
+            except Exception:
+                logger.debug(
+                    "[Slack] Channel reconciliation skipped for team %s "
+                    "(users.conversations failed)",
+                    team_id,
+                    exc_info=True,
+                )
+        if approved:
+            logger.info(
+                "[Slack] Channel reconciliation auto-approved %d channel(s)",
+                approved,
+            )
+
+    async def _handle_member_joined_channel(self, event: dict) -> None:
+        """Auto-approve a channel when the bot itself is added to it.
+
+        The ``member_joined_channel`` event is an *action* — an admin added a
+        member — so, like Signal's invite handler, we trust it and approve when
+        the joining member is our own bot user. Best-effort; never raises into
+        the Bolt dispatcher.
+        """
+        try:
+            if not isinstance(event, dict):
+                return
+            channel_id = event.get("channel")
+            joiner = event.get("user")
+            team_id = event.get("team") or self._channel_team.get(channel_id, "")
+            bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+            if not channel_id or not joiner or joiner != bot_uid:
+                return
+            self._approve_channel(
+                channel_id,
+                team_id=team_id,
+                added_by=event.get("inviter") or "",
+                reason="bot added to channel",
+            )
+        except Exception:
+            logger.warning(
+                "[Slack] member_joined_channel handling failed (non-fatal)",
+                exc_info=True,
+            )
 
     def _slack_mention_patterns(self) -> List["re.Pattern"]:
         """Compile optional regex wake-word patterns for channel triggers.
