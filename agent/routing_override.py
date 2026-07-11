@@ -21,13 +21,29 @@ the turn's first API call assembles.
 ── Turn-scoping (the load-bearing detail) ──
 Proactive routing is a PER-TURN decision, exactly like reactive fallback — it
 must NOT pin the session to the cheap model. We reuse the agent's existing,
-tested ``switch_model`` (full atomic client rebuild + rollback), but
-``switch_model`` persists the swap into ``_primary_runtime`` (it's built for the
-session-scoped ``/model`` command). So after the swap we:
-  1. restore the pre-swap ``_primary_runtime`` snapshot, and
-  2. arm ``_fallback_activated``,
-which makes ``restore_primary_runtime`` revert the swap at the top of the NEXT
-turn — identical turn-scoping to the reactive fallback path, on a different axis.
+tested ``switch_model`` (full atomic client rebuild + rollback), which persists
+the swap into ``_primary_runtime``. Crucially we then scope it with a DEDICATED
+flag, NOT by overloading reactive-fallback state:
+
+  1. Stash the pre-swap premium ``_primary_runtime`` in
+     ``_routing_override_saved_primary``.
+  2. Set ``_routing_override_active = True``.
+  3. LEAVE ``_primary_runtime`` pointing at the CHEAP runtime for the turn, and
+     do NOT touch ``_fallback_activated``.
+
+``restore_primary_runtime`` then reverts the swap at the top of the NEXT turn via
+a dedicated block that runs BEFORE the ``_fallback_activated`` and rate-limit
+cooldown gates, so a routed turn always reverts regardless of cooldown state.
+
+Why the dedicated flag (three audit-confirmed bugs the old overload caused):
+  - Overloading ``_rate_limited_until``/``_fallback_activated`` for scoping let a
+    cheap turn LEAK past its turn when a cooldown gate skipped restoration
+    (Blocker 1); pointing ``_primary_runtime`` at premium made in-turn transient
+    recovery jump the routed turn onto premium (Major 2); and pre-arming
+    ``_fallback_activated`` corrupted the reactive cooldown accounting so a cheap
+    429 got no cooldown (Major 3). Keeping ``_primary_runtime`` == cheap and using
+    a dedicated flag fixes all three: reactive fallback runs normally UNDERNEATH a
+    routed turn with the cheap runtime as its "primary".
 
 ── Fail-safe ──
 Any error (bad override, ``switch_model`` raising on a bad key/network) leaves
@@ -92,8 +108,11 @@ def apply_routing_override(agent: Any, override: Optional[dict]) -> bool:
     ):
         return False
 
-    # Snapshot the configured-primary runtime so we can re-scope the swap to this
-    # turn only (switch_model would otherwise persist it across turns).
+    # Stash the configured-primary runtime so restore_primary_runtime can revert
+    # the swap next turn. switch_model will overwrite _primary_runtime with the
+    # cheap runtime — we deliberately KEEP that (so in-turn recovery paths that
+    # read _primary_runtime stay on cheap) and use the stash + a dedicated flag
+    # for the revert, NOT the reactive-fallback state.
     primary_snapshot = getattr(agent, "_primary_runtime", None)
 
     kwargs = {
@@ -108,14 +127,14 @@ def apply_routing_override(agent: Any, override: Optional[dict]) -> bool:
         )
         return False
 
-    # Re-scope to this turn: restore the primary snapshot and arm the fallback
-    # flag so restore_primary_runtime reverts the swap next turn.
+    # Mark the override turn-scoped with a DEDICATED flag. Do NOT restore the
+    # premium snapshot into _primary_runtime (keep it == cheap) and do NOT arm
+    # _fallback_activated (that would corrupt reactive cooldown accounting).
     try:
-        if primary_snapshot is not None:
-            agent._primary_runtime = primary_snapshot
-        agent._fallback_activated = True
-    except Exception:  # noqa: BLE001 — best-effort re-scoping; swap already applied
-        logger.debug("intelligent_routing: could not re-scope override to turn",
+        agent._routing_override_saved_primary = primary_snapshot
+        agent._routing_override_active = True
+    except Exception:  # noqa: BLE001 — best-effort scoping; swap already applied
+        logger.debug("intelligent_routing: could not scope override to turn",
                      exc_info=True)
 
     logger.info(

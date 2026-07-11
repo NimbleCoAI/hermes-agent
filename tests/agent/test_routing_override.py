@@ -87,15 +87,25 @@ def test_apply_actuates_the_swap():
     agent.switch_model.assert_called_once()
 
 
-def test_apply_is_turn_scoped():
-    """After applying, _primary_runtime must still point at the CONFIGURED primary
-    and _fallback_activated must be armed, so restore_primary_runtime reverts the
-    swap next turn (proactive routing is turn-scoped, like reactive fallback)."""
+def test_apply_is_turn_scoped_with_dedicated_flag():
+    """After applying, scoping uses a DEDICATED flag — NOT reactive-fallback state.
+
+    _primary_runtime stays == cheap (so in-turn recovery paths don't jump tiers),
+    the premium snapshot is stashed for the revert, _routing_override_active is
+    set, and _fallback_activated is left untouched (arming it would corrupt
+    reactive cooldown accounting — audit Major 3)."""
     agent = _fake_agent()
     apply_routing_override(agent, {"model": "deepseek/deepseek-v3.2",
                                    "provider": "openrouter"})
-    assert agent._primary_runtime == {"model": "claude-sonnet-5", "provider": "anthropic"}
-    assert agent._fallback_activated is True
+    # _primary_runtime is the CHEAP runtime during the routed turn.
+    assert agent._primary_runtime == {"model": "deepseek/deepseek-v3.2",
+                                      "provider": "openrouter"}
+    # The premium snapshot is stashed for restore_primary_runtime to revert.
+    assert agent._routing_override_saved_primary == {"model": "claude-sonnet-5",
+                                                     "provider": "anthropic"}
+    assert agent._routing_override_active is True
+    # Reactive-fallback state is NOT touched.
+    assert agent._fallback_activated is False
 
 
 def test_apply_noop_when_target_equals_current():

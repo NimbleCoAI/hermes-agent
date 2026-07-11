@@ -57,10 +57,15 @@ def test_mechanical_turn_swaps_to_cheap_end_to_end():
     # The agent is now on the cheap tier for THIS turn.
     assert agent.model == "deepseek/deepseek-v3.2"
     assert agent.provider == "openrouter"
-    # ...but turn-scoped: primary snapshot preserved + fallback armed so the
-    # next turn's restore_primary_runtime reverts it.
-    assert agent._primary_runtime == {"model": "claude-sonnet-5", "provider": "anthropic"}
-    assert agent._fallback_activated is True
+    # ...turn-scoped via a DEDICATED flag: _primary_runtime stays cheap (so
+    # in-turn recovery stays on cheap), the premium snapshot is stashed for the
+    # revert, and reactive-fallback state is untouched. (The actual next-turn
+    # revert against the real restore_primary_runtime is proven in
+    # tests/agent/test_routing_override_revert.py.)
+    assert agent._routing_override_active is True
+    assert agent._routing_override_saved_primary == {"model": "claude-sonnet-5",
+                                                     "provider": "anthropic"}
+    assert agent._fallback_activated is False
 
 
 def test_judgment_turn_does_not_swap_end_to_end():

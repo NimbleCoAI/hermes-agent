@@ -62,12 +62,27 @@ turn arrives
   list of `pre_llm_call` results (first well-formed, `model` required).
 - `apply_routing_override(agent, override)` — actuate the swap by delegating to
   the agent's existing, tested `switch_model` (full atomic client rebuild +
-  rollback), then **re-scope it to this turn**: restore the pre-swap
-  `_primary_runtime` snapshot and arm `_fallback_activated`, so
-  `restore_primary_runtime` reverts it at the top of the next turn. Identical
-  turn-scoping to the reactive fallback path — a different axis, same data
-  structure. Fail-safe: any error leaves the agent on its configured primary and
-  never raises into the turn loop.
+  rollback), then **scope it to this turn with a DEDICATED flag**
+  (`_routing_override_active`), stashing the premium `_primary_runtime` snapshot
+  in `_routing_override_saved_primary`. It deliberately leaves `_primary_runtime`
+  pointing at the **cheap** runtime for the turn and does **not** touch
+  `_fallback_activated`. `restore_primary_runtime` reverts the swap at the top of
+  the next turn via a dedicated block that runs **before** both the
+  `_fallback_activated` gate and the rate-limit cooldown gate. Fail-safe: any
+  error leaves the agent on its configured primary and never raises into the turn
+  loop.
+
+  > **Why the dedicated flag (three audit-confirmed bugs the earlier design had).**
+  > An earlier version scoped the override by restoring the premium snapshot into
+  > `_primary_runtime` and arming `_fallback_activated`. That overloaded reactive-
+  > fallback state and broke three error-adjacent paths: (1) the cheap model
+  > **leaked past its turn** when `restore_primary_runtime`'s rate-limit cooldown
+  > gate skipped restoration (Blocker 1); (2) in-turn transient-transport recovery
+  > (which rebuilds from `_primary_runtime`) **jumped the routed turn onto premium**
+  > (Major 2); (3) pre-arming `_fallback_activated` made a cheap-model 429 **skip
+  > arming its cooldown** (Major 3). Keeping `_primary_runtime == cheap` + a
+  > dedicated flag fixes all three, and lets reactive fallback run correctly
+  > UNDERNEATH a routed turn with the cheap runtime as its "primary".
 
 Call site: `agent/turn_context.py`, immediately after the `pre_llm_call` results
 are collected (before the turn's first API call assembles). That is the whole
@@ -121,13 +136,17 @@ The **only** core-runtime changes are `agent/routing_override.py` and the single
 call site in `agent/turn_context.py`. They touch the model-selection path and are
 **user-visible** (they change which model answers a turn). Everything else is
 plugin-local. Audit focus points:
-- Turn-scoping correctness: is the swap really reverted next turn? (relies on
-  `restore_primary_runtime`'s `_fallback_activated` gate — same mechanism reactive
-  fallback uses).
-- Interaction with reactive fallback within the same turn (both mutate
-  `agent.model`; proactive runs first, in the prologue; reactive still applies
-  underneath on failure).
+- Turn-scoping correctness: proven against the REAL `restore_primary_runtime` in
+  `tests/agent/test_routing_override_revert.py` — the revert runs before both the
+  `_fallback_activated` and rate-limit cooldown gates, so it happens regardless of
+  cooldown state (the first-round audit's leak repro is now a passing regression
+  test there).
+- Interaction with reactive fallback within the same turn: `_primary_runtime`
+  stays == cheap during the routed turn, so reactive fallback engages with the
+  cheap runtime as its "primary" and cooldown accounting is intact (covered by
+  `test_reactive_fallback_engages_under_a_routed_turn`).
 - Fail-safe coverage: a bad/unreachable cheap provider must degrade to the
   primary, not break the turn.
-- The swap is verified against a fake agent only — a live-agent run is required
-  before fleet rollout.
+- **The swap is verified against faithful fake agents + the real
+  `restore_primary_runtime`, but NOT yet against a live agent hitting OpenRouter —
+  a live-agent run is required before fleet rollout.**

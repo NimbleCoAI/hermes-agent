@@ -1109,7 +1109,28 @@ def restore_primary_runtime(agent) -> bool:
     The gateway caches agents across messages (``_agent_cache`` in
     ``gateway/run.py``), so this restoration IS needed there too.
     """
-    if not agent._fallback_activated:
+    # ── Proactive intelligent-routing override revert (dedicated, scoped) ──
+    # A routed turn (intelligent_routing plugin) swaps to a cheap tier via a
+    # DEDICATED flag, keeping _primary_runtime == cheap during the turn so
+    # in-turn recovery paths don't jump tiers. This block reverts it FIRST —
+    # before both the _fallback_activated gate and the rate-limit cooldown gate
+    # below — so a routed turn ALWAYS reverts to the configured primary next
+    # turn, regardless of any cooldown a cheap-model 429 may have armed. It must
+    # not be gated on _fallback_activated (the override never sets it) or on the
+    # cooldown (that gate would leak the cheap model past its turn — see
+    # audit Blocker 1). Falls through to the shared rebuild body below.
+    _override_revert = bool(getattr(agent, "_routing_override_active", False))
+    if _override_revert:
+        _saved = getattr(agent, "_routing_override_saved_primary", None)
+        if isinstance(_saved, dict):
+            agent._primary_runtime = _saved
+        # Clear the scoping state so this runs exactly once.
+        agent._routing_override_active = False
+        agent._routing_override_saved_primary = None
+        # Do NOT return here — proceed to rebuild the runtime from the restored
+        # (premium) _primary_runtime via the shared body below.
+
+    if not _override_revert and not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was
         # called but returned False (chain exhausted or provider not
@@ -1120,7 +1141,7 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_index = 0
         return False
 
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+    if not _override_revert and getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
 
     rt = agent._primary_runtime
