@@ -1,0 +1,14 @@
+name: intelligent_routing
+version: "0.1.0"
+description: >-
+  Opt-in pre-turn cost routing. When enabled per-agent (routing.intelligent:
+  true in config.yaml, default OFF), a cheap local heuristic (Option A, no extra
+  LLM call) classifies each turn as mechanical vs judgment and surfaces the
+  routing decision in the model-awareness line. Fails open to the premium tier
+  on any uncertainty — never silently downgrades a judgment turn. The reactive
+  fallback chain (try_activate_fallback / FailoverReason) is untouched; this is a
+  proactive layer on a different axis. Stage-1 dogfood build; actuation of the
+  model swap awaits a plugin-interface extension (see README).
+author: NimbleCo
+hooks:
+  - pre_llm_call
