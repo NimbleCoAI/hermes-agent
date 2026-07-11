@@ -25,6 +25,15 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 _DEFAULT_MODE = "heuristic"
 
+# The cheap-metered tier target a mechanical/orchestration turn routes TO.
+# Default: OpenRouter deepseek/deepseek-v3.2 — deliberately v3.2, NOT v4-Pro
+# (grounded in PR #43534's DeepSWE data: V4-Pro's coding throughput is
+# directionally lower, so we route DeepSeek only to mechanical/orchestration
+# work where its Terminal-Bench data shows it competitive AND cheap, never to
+# code-gen). Overridable per-agent via routing.cheap_model / routing.cheap_provider.
+_DEFAULT_CHEAP_MODEL = "deepseek/deepseek-v3.2"
+_DEFAULT_CHEAP_PROVIDER = "openrouter"
+
 
 def _load_config() -> Dict[str, Any]:
     """Load the full config dict (``{}`` on any failure). Patched in tests."""
@@ -62,3 +71,11 @@ def routing_mode() -> str:
     mode = _routing_section().get("mode", _DEFAULT_MODE)
     mode = str(mode).strip().lower() if mode else _DEFAULT_MODE
     return mode or _DEFAULT_MODE
+
+
+def cheap_tier_target() -> tuple[str, str]:
+    """Return ``(model, provider)`` for the cheap tier. Defaults to v3.2/openrouter."""
+    section = _routing_section()
+    model = str(section.get("cheap_model") or _DEFAULT_CHEAP_MODEL).strip() or _DEFAULT_CHEAP_MODEL
+    provider = str(section.get("cheap_provider") or _DEFAULT_CHEAP_PROVIDER).strip() or _DEFAULT_CHEAP_PROVIDER
+    return model, provider

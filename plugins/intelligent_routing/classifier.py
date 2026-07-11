@@ -1,38 +1,64 @@
 """Pre-turn heuristic classifier (Option A) for intelligent routing.
 
-Classifies an incoming turn as ``mechanical`` (route to the cheap-metered tier)
-vs. ``judgment`` (route to the premium tier) using ONLY cheap, local signals
-available before the LLM call — zero extra API cost, zero added latency. When
-the signals don't add up to a confident ``mechanical`` classification, the
-result is ``uncertain`` and ``route_for`` FAILS OPEN to premium: a judgment turn
-must never be silently downgraded to the cheap model, because a visibly worse
-answer to a human is the expensive failure mode (spec open-question #4). This
-mirrors the fail-open discipline HSM's ``validateCascadeEntries`` already uses
-for credential checks.
+Classifies an incoming turn using ONLY cheap, local signals available before the
+LLM call — zero extra API cost, zero added latency. When the signals don't add
+up to a confident cheap-tier classification, it FAILS OPEN to premium: a judgment
+turn must never be silently downgraded, because a visibly worse answer to a human
+is the expensive failure mode (spec open-question #4). This mirrors the fail-open
+discipline HSM's ``validateCascadeEntries`` already uses for credential checks.
 
 Everything here is a PURE function of ``TurnSignals`` — deterministic, no I/O,
 no globals — so it is trivially testable and safe to call on the hot path.
 
-"Mechanical" is defined concretely (spec open-question #3, per D-2026-07-08-01):
-  - cron / background / non-interactive jobs, OR
-  - kanban-triage-shaped requests, OR
-  - short, single-tool-call-shaped asks (no multi-step reasoning),
-and NEVER anything public-facing.
-"Judgment" is everything substantive: open-ended / multi-step reasoning, long
-human messages, or anything public-facing.
+── Two layers ──
+1. **Binary** (``classify_turn`` / ``route_for``) — mechanical vs judgment. The
+   original, minimal split. Retained for back-compat.
+2. **Task-TYPE** (``classify_task_type`` / ``tier_for_task_type`` / ``route_task``)
+   — adopted from upstream **PR #43534** (model-task-router, closed on
+   NousResearch/hermes-agent), which routes by task TYPE rather than a binary
+   split and grounds the mapping in DeepSWE reliability data.
+
+── What we ADOPTED vs ADAPTED from #43534 ──
+ADOPTED: the five task categories (code-gen / hard-architecture / orchestration /
+research / mechanical), its keyword-priority decision tree (code > architecture >
+mechanical > research > orchestration), and its core principle — *route by task
+TYPE, not brand loyalty; treat benchmarks as directional* (see
+``references/prior-art.md``, credited to Sugumaran Balasubramaniyan +
+the deep-swe#21 correction thread).
+ADAPTED: the tier mapping is to OUR fleet's actual tiers, NOT #43534's non-fleet
+GPT-5.4/5.5. Specifically we route the cheap tier to OpenRouter
+``deepseek/deepseek-v3.2`` — deliberately v3.2, NOT v4-Pro. That choice is
+grounded directly in #43534's data: V4-Pro's DeepSWE *coding* throughput is
+directionally lower (~8%, heavily caveated), so we do NOT route hard code-gen to
+DeepSeek at all (code-gen -> premium/Claude); we route DeepSeek only where its
+own data shows it competitive AND cheap — CLI/tool orchestration and mechanical
+work (Terminal-Bench 67.9% @ $0.87/1M). See ``tier_for_task_type`` for the
+per-category grounding.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Classification labels.
+# --- Binary classification labels (layer 1) ---
 MECHANICAL = "mechanical"
 JUDGMENT = "judgment"
 UNCERTAIN = "uncertain"
 
-# Routing tiers.
+# --- Task-TYPE categories (layer 2, adopted from PR #43534) ---
+TASK_CODE_GEN = "code_gen"
+TASK_ARCHITECTURE = "architecture"
+TASK_ORCHESTRATION = "orchestration"
+TASK_RESEARCH = "research"
+TASK_MECHANICAL = "mechanical_task"
+TASK_UNCERTAIN = "uncertain_task"
+
+# Routing tiers (our fleet):
+#   premium — Claude (per-agent primary: sonnet-5 / fable-5 / opus)
+#   cheap   — OpenRouter deepseek/deepseek-v3.2 (see module docstring for why v3.2)
+#   local   — ollama qwen/glm floor (not auto-selected by this classifier)
 TIER_CHEAP = "cheap"
 TIER_PREMIUM = "premium"
+TIER_LOCAL = "local"
 
 # A short mechanical ask is bounded in characters. Above this, a message carries
 # enough substance that we no longer treat it as a one-shot mechanical request
@@ -149,10 +175,138 @@ def classify_turn(sig: TurnSignals) -> str:
 
 
 def route_for(sig: TurnSignals) -> str:
-    """Collapse a classification to a routing tier, failing open to premium.
+    """Collapse a binary classification to a routing tier, failing open to premium.
 
     ``mechanical`` -> ``TIER_CHEAP``. Everything else (``judgment`` AND
     ``uncertain``) -> ``TIER_PREMIUM``. Only a confident mechanical result ever
     reaches the cheap tier.
     """
     return TIER_CHEAP if classify_turn(sig) == MECHANICAL else TIER_PREMIUM
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Layer 2: task-TYPE classification (adopted from PR #43534's model-task-router)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Keyword sets track #43534's decision tree (SKILL.md lines 101-121). Matched on
+# a lowercased message. Priority order (first match wins) is #43534's:
+#   code-gen > architecture > mechanical > research > orchestration.
+# Architecture is checked before code-gen here ONLY when an explicit architecture
+# phrase is present, because "design a system" would otherwise be miscaught by a
+# bare code verb; the tests pin both orderings.
+
+# Hard-architecture / high-stakes reasoning (checked first when explicit).
+_ARCH_MARKERS = (
+    "architecture", "design a system", "design the", "design an",
+    "how would you structure", "security review", "complex debugging",
+    "distributed race", "threat model", "system design",
+)
+
+# Code generation: implement / fix / refactor / write code / PR.
+_CODE_MARKERS = (
+    "implement", "refactor", "write code", "fix the bug", "fix bug",
+    "add a feature", "add feature", "open a pr", "patch", "write a function",
+    "write the migration", "migration script",
+)
+# Bare code verbs (need "first word" or standalone match to avoid false hits).
+_CODE_VERBS = frozenset({"implement", "refactor", "code"})
+
+# Research / analysis / lookup. Note: bare "what is"/"what's" are deliberately
+# NOT here — they collide with the idiomatic "what's up" and with trivial lookups
+# already handled by _TRIVIAL_QUERY_PREFIXES; research needs a stronger verb.
+_RESEARCH_MARKERS = (
+    "research", "summarize", "summarise", "explain", "look up", "look up the",
+    "search the web", "analyze", "analyse", "compare the", "what are the tradeoffs",
+)
+
+# Mechanical: read-only or single-command shell/file ops.
+_MECHANICAL_MARKERS = (
+    "grep", "find all", "list files", "list all files", "run the test",
+    "run tests", "check if", "what's the content of", "list all", "show me the file",
+)
+
+
+def _has_any(text: str, markers) -> bool:
+    return any(m in text for m in markers)
+
+
+def classify_task_type(sig: TurnSignals) -> str:
+    """Classify a turn into one of #43534's five task types (or uncertain).
+
+    Priority (per #43534, SKILL.md line 92): code-gen > architecture > mechanical
+    > research > orchestration; orchestration is the catch-all. Structural
+    signals (background / kanban-triage) resolve to mechanical directly — those
+    are unambiguous non-interactive/triage work.
+    """
+    message = (sig.user_message or "").strip()
+    if not message and not (sig.is_background or sig.is_kanban_triage):
+        return TASK_UNCERTAIN
+
+    # Structural mechanical signals (no keyword needed).
+    if sig.is_background or not sig.is_interactive or sig.is_kanban_triage:
+        return TASK_MECHANICAL
+
+    text = message.lower()
+
+    # code-gen has top priority (a coding task that also says "run" is still
+    # code-gen — #43534 priority order).
+    if _has_any(text, _CODE_MARKERS) or text.split(maxsplit=1)[0].strip(".,!?:") in _CODE_VERBS:
+        # ...unless it's explicitly an architecture ask, which outranks routine
+        # coding (#43534: "do NOT use the architecture model for routine coding"
+        # — but DO for explicit design/security/hard-debug).
+        if _has_any(text, _ARCH_MARKERS):
+            return TASK_ARCHITECTURE
+        return TASK_CODE_GEN
+
+    if _has_any(text, _ARCH_MARKERS):
+        return TASK_ARCHITECTURE
+
+    # Mechanical: an explicit mechanical marker, OR a short SINGLE-CLAUSE direct
+    # command. Multi-clause asks ("check the deploy status AND tell me...") are
+    # orchestration/diagnostics, not a single mechanical op — so a conjunction
+    # disqualifies the short-command shortcut.
+    _is_multi_clause = any(c in text for c in (" and ", " then ", ", ", " tell me"))
+    if _has_any(text, _MECHANICAL_MARKERS) or (
+        not _is_multi_clause and _is_short_mechanical_ask(message)
+    ):
+        return TASK_MECHANICAL
+
+    if _has_any(text, _RESEARCH_MARKERS):
+        return TASK_RESEARCH
+
+    # Everything else — tool calls, shell, navigation, diagnostics, config,
+    # planning — is orchestration (the catch-all, per #43534).
+    return TASK_ORCHESTRATION
+
+
+def tier_for_task_type(task_type: str) -> str:
+    """Map a task type to one of our fleet tiers. Fail open to premium.
+
+    Grounding (see ``references/prior-art.md``):
+      - ARCHITECTURE -> premium: highest reasoning; Claude Opus 4.7 competitive on
+        DeepSWE (54%). Never cheap-route hard design/security/debugging.
+      - CODE_GEN     -> premium: DeepSWE indicates DeepSeek coding throughput is
+        directionally lower (V4-Pro ~8%, caveated); keep multi-file code-gen on
+        Claude for our fleet rather than risk a visibly worse implementation.
+      - RESEARCH     -> premium: analysis/judgment, frequently public-facing.
+      - ORCHESTRATION-> cheap:   DeepSeek is competitive at CLI/tool orchestration
+        (V4-Pro Terminal-Bench 67.9% @ $0.87/1M) — this is the empirical basis
+        for putting v3.2 here, NOT on code-gen.
+      - MECHANICAL   -> cheap:   fast/cheap delegated workhorse tier.
+      - anything else / UNCERTAIN -> premium (fail open).
+    """
+    if task_type in (TASK_ORCHESTRATION, TASK_MECHANICAL):
+        return TIER_CHEAP
+    # architecture, code_gen, research, uncertain, and any unknown -> premium.
+    return TIER_PREMIUM
+
+
+def route_task(sig: TurnSignals) -> str:
+    """Task-type-aware routing: classify -> map to tier, with fail-open guards.
+
+    Public-facing ALWAYS goes premium (dominates task type) — a public-facing
+    turn must never be cheap-routed regardless of its shape.
+    """
+    if sig.is_public_facing:
+        return TIER_PREMIUM
+    return tier_for_task_type(classify_task_type(sig))

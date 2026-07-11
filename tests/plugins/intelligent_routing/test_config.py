@@ -57,3 +57,20 @@ def test_mode_llm_router_is_read():
     with patch.object(cfgmod, "_load_config",
                       return_value={"routing": {"mode": "llm-router"}}):
         assert cfgmod.routing_mode() == "llm-router"
+
+
+def test_cheap_tier_default_is_deepseek_v32_openrouter():
+    """Default cheap target is deepseek/deepseek-v3.2 via openrouter (NOT v4)."""
+    with patch.object(cfgmod, "_load_config", return_value={"routing": {}}):
+        model, provider = cfgmod.cheap_tier_target()
+    assert model == "deepseek/deepseek-v3.2"
+    assert provider == "openrouter"
+
+
+def test_cheap_tier_overridable():
+    with patch.object(cfgmod, "_load_config", return_value={
+        "routing": {"cheap_model": "qwen/qwen-2.5", "cheap_provider": "ollama"}
+    }):
+        model, provider = cfgmod.cheap_tier_target()
+    assert model == "qwen/qwen-2.5"
+    assert provider == "ollama"

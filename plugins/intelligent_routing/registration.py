@@ -6,37 +6,60 @@ gates whether it does anything. When the toggle is OFF the hook returns ``None``
 — zero behavior change, the opt-in guarantee.
 
 When ON, the hook runs the Option-A heuristic classifier over cheap local
-signals derived from the hook kwargs and returns a context injection that
-EXTENDS the existing model-awareness line (``agent/model_awareness.py``,
-spec B1) with the routing reason, e.g.::
+signals derived from the hook kwargs and returns:
+  1. a context injection that EXTENDS the model-awareness line
+     (``agent/model_awareness.py``, spec B1) with the routing reason, e.g.::
 
-    [Current model: claude-sonnet-5 via anthropic — routed: mechanical]
+         [Current model: claude-sonnet-5 via anthropic — routed: mechanical → cheap]
 
-so a user is never confused by a silent tier switch mid-thread (spec §"Where
-this plugs in").
+     so a user is never confused by a silent tier switch mid-thread; and
+  2. for a cheap-tier turn, a ``route`` override
+     (``{"model": ..., "provider": ...}``) that the runtime ACTUATES via the
+     routing-override interface extension (``agent/routing_override.py``), which
+     swaps the model for THIS turn (turn-scoped, fail-safe). Premium / uncertain
+     / public-facing turns emit NO override and stay on the configured primary.
 
-── Honest scope / the hook-surface limitation ──
-This hook can only INJECT CONTEXT; its return value cannot override
-``agent.model`` / ``agent.provider`` for the turn (the model is frozen by
-``restore_primary_runtime`` at ``turn_context.py:174``, ~250 lines before this
-hook fires, and the hook receives ``model`` as a read-only value, not the agent).
-So this Stage-1 slice computes and SURFACES the routing decision but does not yet
-ACTUATE the model swap. Actuation needs the plugin-interface extension teknium1
-offered on PR #43534: a per-turn hook whose return value can set
-``model``/``provider`` before the client is built. See README for the concrete
-ask.
+This is the clean plugin form of upstream PR #43534, and the interface extension
+is teknium1's offered "add to the plugin interface" made concrete: a
+``pre_llm_call`` result may now carry a per-turn model/provider override.
 
-The reactive fallback chain (``try_activate_fallback`` /
-``FailoverReason``) is deliberately untouched — intelligent routing is a
-proactive pre-turn layer on a different axis.
+The reactive fallback chain (``try_activate_fallback`` / ``FailoverReason``) is
+deliberately untouched — intelligent routing is a proactive pre-turn layer on a
+different axis; reactive escalation still applies underneath the chosen tier.
 """
 from __future__ import annotations
 
 import logging
 from typing import Any, Optional
 
-from .classifier import MECHANICAL, TurnSignals, classify_turn
-from .config import is_intelligent_routing_enabled
+from .classifier import (
+    TASK_ARCHITECTURE,
+    TASK_CODE_GEN,
+    TASK_MECHANICAL,
+    TASK_ORCHESTRATION,
+    TASK_RESEARCH,
+    TASK_UNCERTAIN,
+    TIER_PREMIUM,
+    TurnSignals,
+    classify_task_type,
+    tier_for_task_type,
+)
+from .classifier import TIER_CHEAP
+from .config import cheap_tier_target, is_intelligent_routing_enabled
+
+# Human-readable labels for the routing-reason line.
+_TASK_LABELS = {
+    TASK_CODE_GEN: "code-gen",
+    TASK_ARCHITECTURE: "architecture",
+    TASK_ORCHESTRATION: "orchestration",
+    TASK_RESEARCH: "research",
+    TASK_MECHANICAL: "mechanical",
+    TASK_UNCERTAIN: "uncertain",
+}
+
+
+def _task_label(task_type: str) -> str:
+    return _TASK_LABELS.get(task_type, task_type)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +88,7 @@ def _signals_from_kwargs(**kwargs: Any) -> TurnSignals:
         user_message=message,
         is_interactive=not is_background,
         is_background=is_background,
+        is_public_facing=bool(kwargs.get("is_public_facing", False)),
     )
 
 
@@ -99,14 +123,29 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[dict]:
             return None
 
         sig = _signals_from_kwargs(**kwargs)
-        classification = classify_turn(sig)
-        # route_for semantics: only a confident MECHANICAL reaches cheap; both
-        # JUDGMENT and UNCERTAIN surface as "judgment" (fail open — we never tell
-        # the user a turn was cheap-routed unless it was confidently mechanical).
-        reason = "mechanical" if classification == MECHANICAL else "judgment"
+        # Task-TYPE routing (adopted from PR #43534): classify the turn into one
+        # of five task types, then map to a fleet tier (fail open to premium).
+        # Public-facing dominates — handled inside tier selection below.
+        if sig.is_public_facing:
+            task_type = classify_task_type(sig)
+            tier = TIER_PREMIUM  # never cheap-route public-facing
+        else:
+            task_type = classify_task_type(sig)
+            tier = tier_for_task_type(task_type)
+        reason = f"{_task_label(task_type)} → {tier}"
 
         line = _reason_line(kwargs.get("model"), kwargs.get("provider"), reason)
-        return {"context": line}
+        result: dict = {"context": line}
+
+        # Emit a `route` override ONLY for the cheap tier — this is what the
+        # runtime's routing-override extension (agent/routing_override.py)
+        # actuates. Premium/fail-open turns emit no override and stay on the
+        # configured primary. Never route public-facing to cheap.
+        if tier == TIER_CHEAP:
+            cheap_model, cheap_provider = cheap_tier_target()
+            if cheap_model:
+                result["route"] = {"model": cheap_model, "provider": cheap_provider}
+        return result
     except Exception as exc:  # noqa: BLE001 — must never break the turn
         logger.warning("intelligent_routing: pre_llm_call failed (inert): %s", exc)
         return None

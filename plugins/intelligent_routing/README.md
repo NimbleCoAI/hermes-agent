@@ -1,18 +1,24 @@
 # intelligent_routing
 
-Opt-in **pre-turn cost routing** for the Hermes main chat turn.
+Opt-in **pre-turn cost routing** for the Hermes main chat turn, built as the
+clean answer to how upstream PR #43534 was closed.
 
-When enabled per-agent, a cheap local heuristic classifies each incoming turn as
-**mechanical** (route to the cheap-metered tier — e.g. an OpenRouter workhorse)
-vs. **judgment** (route to the premium, Claude-class tier), and surfaces *why* in
-the model-awareness prompt line so a user is never confused by a silent quality-
-tier switch mid-thread.
+teknium1 closed #43534 (model-task-router) with a steer, not a merits rejection:
+> *"If you do want it, please create a plugin. Happy to support adding to the
+> plugin interface to make this work as one."*
 
-This is the plugin form of the routing mechanism four upstream issues have asked
-for (#30652, #61371/#61373, #32704) and PR #43534 attempted — built as a plugin
-per teknium1's steer on that PR, and motivated by NimbleCo's real fleet cost
-(`[intelligent-routing-cost]`: ~$1k/mo, 6/6 agents primary on metered Sonnet with
-no cheap rung anywhere in any cascade).
+This directory is both halves of that answer:
+
+1. **The plugin** — classifies each turn and, when it's mechanical/orchestration
+   work, routes it to a cheap-metered tier; premium/uncertain/public-facing stay
+   on the configured primary (fail-open).
+2. **The interface extension he offered** — `agent/routing_override.py` (+ one
+   call site in `agent/turn_context.py`): a `pre_llm_call` hook result may now
+   carry a `route` override that the runtime **actuates** for the turn. Without
+   it, `pre_llm_call` could only inject context, never change which model runs.
+
+The classifier is deliberately simple — it is **not** the contribution. The
+plugin form + the interface extension are.
 
 ## Enable
 
@@ -20,88 +26,108 @@ no cheap rung anywhere in any cascade).
 hermes plugins enable intelligent_routing
 ```
 
-Then, per agent, in `config.yaml` (default **OFF** — this is opt-in because it
-changes which model answers a user's message):
+Per agent, in `config.yaml` (default **OFF** — opt-in; it changes which model
+answers a user's message):
 
 ```yaml
 routing:
-  intelligent: true      # default false
-  mode: heuristic        # Option A (default). "llm-router" (Option B) = Phase 2, not built.
+  intelligent: true                       # default false
+  mode: heuristic                         # Option A (default); "llm-router" (Option B) = Phase 2, not built
+  cheap_model: deepseek/deepseek-v3.2     # cheap-tier target (default)
+  cheap_provider: openrouter              # cheap-tier provider (default)
 ```
 
-With the plugin enabled but `routing.intelligent` OFF, the hook is **inert** —
-it returns `None` and there is zero behavior change.
+Enabled but `routing.intelligent` OFF ⇒ the hook is inert (`None`, zero change).
 
-## What it classifies (Option A — heuristic, no extra LLM call)
-
-`classifier.classify_turn(TurnSignals) -> "mechanical" | "judgment" | "uncertain"`
-is a pure, deterministic function of cheap local signals. Definitions
-(spec open-question #3, per D-2026-07-08-01):
-
-**mechanical** (→ cheap tier):
-- cron / background / non-interactive jobs, OR
-- kanban-triage-shaped requests, OR
-- a **short, direct single-action ask** — a bare imperative command
-  (`mark card 42 done`, `close #17`) or a trivial lookup (`what's 2+2`).
-
-**judgment** (→ premium tier):
-- open-ended / multi-step reasoning,
-- long substantive human messages,
-- anything public-facing,
-- **any short-but-hedged / deferred / context-referencing ask**
-  (`Can you look at the thing we discussed and get back to me?`) — short length
-  is necessary but NOT sufficient for mechanical.
-
-**uncertain** → **fails open to premium.** `route_for()` only sends a turn to the
-cheap tier on a *confident* mechanical classification; judgment AND uncertain
-both go premium. This mirrors HSM's `validateCascadeEntries` fail-open discipline
-and honors the spec's rule: never silently downgrade a judgment turn.
-
-## What it surfaces
-
-The `pre_llm_call` hook injects an extended model-awareness line (built on
-`agent.model_awareness.format_current_model_line`, so the base format stays
-byte-identical):
+## How a turn flows
 
 ```
-[Current model: x-ai/grok via openrouter — routed: mechanical]
-[Current model: claude-sonnet-5 via anthropic — routed: judgment]
+turn arrives
+  └─ pre_llm_call hook (plugins/intelligent_routing/registration.py)
+       ├─ classify task type (classifier.py)  ── code-gen / architecture /
+       │                                          research / orchestration / mechanical
+       ├─ map to tier: mechanical|orchestration → cheap ; else → premium (fail open)
+       ├─ inject model-awareness reason line:
+       │     [Current model: … — routed: mechanical → cheap]
+       └─ if cheap: return {"route": {"model": …, "provider": …}}
+             └─ turn_context extracts + applies it (agent/routing_override.py)
+                  └─ agent.switch_model(...)  ── turn-scoped: reverted next turn
 ```
+
+## The interface extension (the centerpiece)
+
+`agent/routing_override.py` — a minimal, additive, reference implementation:
+
+- `extract_routing_override(results)` — pull the first `{"route": {...}}` from the
+  list of `pre_llm_call` results (first well-formed, `model` required).
+- `apply_routing_override(agent, override)` — actuate the swap by delegating to
+  the agent's existing, tested `switch_model` (full atomic client rebuild +
+  rollback), then **re-scope it to this turn**: restore the pre-swap
+  `_primary_runtime` snapshot and arm `_fallback_activated`, so
+  `restore_primary_runtime` reverts it at the top of the next turn. Identical
+  turn-scoping to the reactive fallback path — a different axis, same data
+  structure. Fail-safe: any error leaves the agent on its configured primary and
+  never raises into the turn loop.
+
+Call site: `agent/turn_context.py`, immediately after the `pre_llm_call` results
+are collected (before the turn's first API call assembles). That is the whole
+core change — one module + one call site.
+
+**Why this is the right shape for upstream.** It generalizes: any `pre_llm_call`
+plugin can now return a per-turn model/provider override, not just this one. It
+reuses `switch_model` rather than duplicating the swap logic. It's turn-scoped and
+fail-safe by construction. This is what teknium1 offered to add to the interface.
+
+## Task types → tiers
+
+Adopted from #43534 (see `references/prior-art.md`), adapted to our fleet:
+
+| task type      | tier    | why (directional, recalibrate from fleet data) |
+|----------------|---------|--------------------------------------------------|
+| architecture   | premium | highest reasoning; never cheap-route hard design/security/debug |
+| code-gen       | premium | DeepSWE: DeepSeek coding throughput directionally lower — keep on Claude |
+| research       | premium | analysis/judgment, often public-facing |
+| orchestration  | cheap   | DeepSeek competitive at CLI/tool orchestration (Terminal-Bench 67.9% @ $0.87/1M) |
+| mechanical     | cheap   | fast/cheap delegated workhorse |
+| uncertain / public-facing | premium | fail open — never silently downgrade |
+
+Cheap tier defaults to `deepseek/deepseek-v3.2` — v3.2, **not** v4-Pro; that
+choice is grounded in #43534's data (see `references/prior-art.md`).
 
 ## Scope — DONE vs DEFERRED
 
-**Done (this Stage-1 slice):**
-- Per-agent `routing.intelligent` toggle, default OFF, with `routing.mode`.
-- Option-A heuristic classifier as a pure, fully-tested function (mechanical /
-  judgment / uncertain, fail-open to premium).
-- `pre_llm_call` wiring that computes the decision and injects the routing-reason
-  line; inert when disabled; never raises into the turn loop.
-- Full RGTDD coverage (see `tests/plugins/intelligent_routing/`).
+**Done (Stage 1, our fork):**
+- Per-agent `routing.intelligent` toggle (default OFF), `routing.mode`,
+  `routing.cheap_model` / `cheap_provider`.
+- Task-type heuristic classifier (pure, deterministic, fail-open to premium).
+- `pre_llm_call` wiring: injects the routing-reason line AND emits the `route`
+  override for cheap turns; inert when disabled; never raises.
+- **Interface extension** (`routing_override.py` + `turn_context.py` call site)
+  that actuates the swap, turn-scoped and fail-safe.
+- Full RGTDD, incl. an end-to-end actuation test (decision → real swap).
 
 **Deferred:**
-- **Actuation of the model swap.** See below — needs a plugin-interface
-  extension. This slice *surfaces* the decision; it does not yet *change* which
-  model runs.
-- **Option B (`mode: llm-router`)** — cheap-LLM-as-router. Config key is read but
-  not implemented.
+- **Phase 3 measurement** — before/after per-agent token spend on a pilot agent
+  (the interface extension unlocks this; not yet run).
+- **Option B (`mode: llm-router`)** — cheap-LLM-as-router. Config key read, not built.
 - **HSM UI toggle** (Phase 2) — the Switch beside the cascade editor.
-- **Phase 3 measurement** — before/after per-agent token spend on a pilot agent.
-- Richer signals (tool-call history, kanban-shape detection from real context,
-  public-facing detection) — currently derived only from message text + platform;
-  absent signals default conservatively (keep the turn OUT of cheap).
+- Richer signals (tool-call history, real kanban/public-facing detection).
+- **Live-agent E2E** — the swap is proven against a faithful fake agent in tests,
+  NOT yet against a real running agent hitting OpenRouter.
 
-## The hook-surface limitation (concrete ask for the interface extension)
+## ⚠️ For the independent audit
 
-The existing `pre_llm_call` hook can only **inject context** — its return value
-cannot override `model` / `provider` for the turn. The model is frozen by
-`restore_primary_runtime` at `agent/turn_context.py:174`, ~250 lines before this
-hook fires (`turn_context.py:436`), and the hook receives `model` as a read-only
-value, not the agent object. Mutating `agent.model` in `on_session_start` is
-session-scoped, not per-turn, so it can't do per-turn routing either.
-
-**Concrete extension request** (answers teknium1's offer on PR #43534): a
-pre-turn hook whose return value may carry a `{"model": ..., "provider": ...}`
-override that `turn_context` applies *before* the client is built for the turn —
-i.e. select the tier's runtime the same way `restore_primary_runtime` sets it,
-but from a plugin decision rather than only the reactive fallback chain. With
-that, this plugin's `route_for()` result becomes actuating instead of advisory.
+The **only** core-runtime changes are `agent/routing_override.py` and the single
+call site in `agent/turn_context.py`. They touch the model-selection path and are
+**user-visible** (they change which model answers a turn). Everything else is
+plugin-local. Audit focus points:
+- Turn-scoping correctness: is the swap really reverted next turn? (relies on
+  `restore_primary_runtime`'s `_fallback_activated` gate — same mechanism reactive
+  fallback uses).
+- Interaction with reactive fallback within the same turn (both mutate
+  `agent.model`; proactive runs first, in the prologue; reactive still applies
+  underneath on failure).
+- Fail-safe coverage: a bad/unreachable cheap provider must degrade to the
+  primary, not break the turn.
+- The swap is verified against a fake agent only — a live-agent run is required
+  before fleet rollout.
