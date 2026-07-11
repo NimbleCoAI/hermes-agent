@@ -69,10 +69,11 @@ _SHORT_MESSAGE_CHARS = 120
 
 # Short length is NECESSARY but NOT SUFFICIENT for mechanical: plenty of short
 # human messages are judgment calls (e.g. "Can you look at the thing we
-# discussed and get back to me?"). A short interactive ask is only mechanical
-# when it ALSO looks like a direct single action — a bare imperative command or
-# a trivial factual/lookup query — and carries none of the deferral / prior-
-# context markers that signal an open, context-dependent request.
+# discussed and get back to me?", or "what's the best architecture for this?").
+# A short interactive ask is only mechanical when it ALSO leads with an imperative
+# command verb (a positive signal). Question-shaped short asks fail open to
+# premium — we do NOT special-case "what's X" prefixes (they front real judgment
+# questions far more often than trivial lookups).
 
 # Leading imperative verbs that mark a direct single-action command. Includes the
 # unambiguous read-only shell verbs (grep/find/cat/ls/search/count) that are
@@ -85,12 +86,10 @@ _IMPERATIVE_VERBS = frozenset({
     "grep", "find", "cat", "ls", "search", "count", "diff", "print",
 })
 
-# Trivial factual/lookup query openers (short "what's X" style asks).
-_TRIVIAL_QUERY_PREFIXES = ("what's ", "whats ", "what is ", "how many ", "when is ")
-
-# Markers of a hedged / deferred / context-dependent request — these push a
-# short message OUT of mechanical (fail open to judgment). "the thing we
-# discussed", "get back to me", "look into", etc.
+# Markers of a hedged / deferred / context-dependent request — a defensive
+# early-out that keeps such short messages OUT of mechanical. Kept as a
+# belt-and-braces guard; the POSITIVE mechanical signal below is a leading
+# imperative verb, so this blocklist is not load-bearing on its own.
 _DEFERRAL_MARKERS = (
     "get back to me", "look at the", "look into", "we discussed", "we talked",
     "the thing", "figure out", "think about", "your thoughts", "what do you think",
@@ -99,18 +98,21 @@ _DEFERRAL_MARKERS = (
 
 
 def _is_short_mechanical_ask(message: str) -> bool:
-    """True when a short message is a direct single-action command or trivial query.
+    """True when a short message is a direct single-action command.
 
-    Returns False for hedged/deferred/context-referencing short messages so they
-    fail open to judgment rather than being silently cheap-routed.
+    Mechanical requires a POSITIVE signal — a leading imperative verb
+    (grep/list/mark/close/…). We deliberately DO NOT treat trivial-query prefixes
+    ("what's X" / "how many" / "when is") as mechanical: those routinely front
+    real JUDGMENT questions ("what's the best architecture for this?",
+    "when is it worth adding a cache?"), and a fail-*closed*-to-cheap prefix rule
+    can't be patched with a blocklist. A genuinely trivial "what's 2+2" going
+    premium is harmless — fail open to premium is the whole point.
     """
     text = message.strip().lower()
     if not text:
         return False
     if any(marker in text for marker in _DEFERRAL_MARKERS):
         return False
-    if text.startswith(_TRIVIAL_QUERY_PREFIXES):
-        return True
     first_word = text.split(maxsplit=1)[0].strip(".,!?:")
     return first_word in _IMPERATIVE_VERBS
 
@@ -169,8 +171,8 @@ def classify_turn(sig: TurnSignals) -> str:
         and len(message) <= _SHORT_MESSAGE_CHARS
         and _is_short_mechanical_ask(message)
     ):
-        # Short, interactive, not multi-step, not public-facing, AND shaped like
-        # a direct single action or trivial lookup: a one-shot mechanical ask.
+        # Short, interactive, not multi-step, not public-facing, AND leading with
+        # an imperative command verb: a one-shot mechanical ask.
         return MECHANICAL
 
     # Nothing decisive -> fail open.
@@ -233,8 +235,9 @@ _CODE_MARKERS = (
 _CODE_VERBS = frozenset({"implement", "refactor", "code"})
 
 # Research / analysis / lookup. Note: bare "what is"/"what's" are deliberately
-# NOT here — they collide with the idiomatic "what's up" and with trivial lookups
-# already handled by _TRIVIAL_QUERY_PREFIXES; research needs a stronger verb.
+# NOT here — they collide with the idiomatic "what's up" and, more importantly,
+# front real judgment questions; research needs a stronger verb. (This is the
+# descriptive task-type layer, not the routing path.)
 _RESEARCH_MARKERS = (
     "research", "summarize", "summarise", "explain", "look up", "look up the",
     "search the web", "analyze", "analyse", "compare the", "what are the tradeoffs",

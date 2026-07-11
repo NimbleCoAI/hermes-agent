@@ -54,6 +54,15 @@ PREMIUM_MESSAGES = [
     "Think through the tradeoffs between OpenRouter and z.ai and recommend an approach.",
     # a plain question with no mechanical shape
     "Why is the deploy flaky lately?",
+    # SHORT judgment questions fronted by a trivial-query prefix — these are the
+    # round-3 leak: "what's/what is/how many/when is" prefixes routinely front
+    # real judgment questions and must NOT be cheap-routed just because they're
+    # short. Dropping _TRIVIAL_QUERY_PREFIXES fixes this (fail open to premium).
+    "what's the best architecture for this?",
+    "what's the right way to handle auth here?",
+    "whats your opinion on the design?",
+    "how many ways could this deadlock?",
+    "when is it worth adding a cache layer?",
 ]
 
 # Messages that SHOULD route cheap — confidently mechanical only.

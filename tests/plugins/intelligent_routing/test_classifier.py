@@ -50,8 +50,22 @@ def test_kanban_triage_shaped_request_is_mechanical():
 
 
 def test_short_mechanical_ask_routes_cheap():
-    sig = TurnSignals(user_message="what's 2+2", is_interactive=True)
+    # A short ask with a leading imperative verb is mechanical -> cheap.
+    sig = TurnSignals(user_message="list open PRs", is_interactive=True)
     assert route_for(sig) == TIER_CHEAP
+
+
+def test_trivial_query_prefix_is_not_cheap():
+    """"what's/how many/when is" prefixes front real judgment questions — they must
+    fail open to premium, not cheap-route just because they're short. (A genuinely
+    trivial "what's 2+2" going premium is harmless.)"""
+    for msg in (
+        "what's 2+2",
+        "what's the best architecture for this?",
+        "when is it worth adding a cache layer?",
+    ):
+        sig = TurnSignals(user_message=msg, is_interactive=True)
+        assert route_for(sig) == TIER_PREMIUM, msg
 
 
 # ------------------------------------------------------------------ judgment ---
