@@ -33,33 +33,12 @@ import logging
 from typing import Any, Optional
 
 from .classifier import (
-    TASK_ARCHITECTURE,
-    TASK_CODE_GEN,
-    TASK_MECHANICAL,
-    TASK_ORCHESTRATION,
-    TASK_RESEARCH,
-    TASK_UNCERTAIN,
-    TIER_PREMIUM,
+    TIER_CHEAP,
     TurnSignals,
-    classify_task_type,
-    tier_for_task_type,
+    classify_turn,
+    decide_tier,
 )
-from .classifier import TIER_CHEAP
 from .config import cheap_tier_target, is_intelligent_routing_enabled
-
-# Human-readable labels for the routing-reason line.
-_TASK_LABELS = {
-    TASK_CODE_GEN: "code-gen",
-    TASK_ARCHITECTURE: "architecture",
-    TASK_ORCHESTRATION: "orchestration",
-    TASK_RESEARCH: "research",
-    TASK_MECHANICAL: "mechanical",
-    TASK_UNCERTAIN: "uncertain",
-}
-
-
-def _task_label(task_type: str) -> str:
-    return _TASK_LABELS.get(task_type, task_type)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +69,19 @@ def _signals_from_kwargs(**kwargs: Any) -> TurnSignals:
         is_background=is_background,
         is_public_facing=bool(kwargs.get("is_public_facing", False)),
     )
+
+
+def probe_route(message: str, **signals: Any) -> dict:
+    """Probe the routing decision for a message in ISOLATION — no config, no hook.
+
+    Returns ``{"tier": "cheap"|"premium", "classification": ...}`` so a live-probe
+    or re-audit can feed a batch of representative messages and see exactly what
+    each would route to, without mocking config or the pre_llm_call plumbing.
+    ``signals`` accepts the same kwargs as the hook (e.g. ``platform="cron"``,
+    ``is_public_facing=True``).
+    """
+    sig = _signals_from_kwargs(user_message=message, **signals)
+    return {"tier": decide_tier(sig), "classification": classify_turn(sig)}
 
 
 def _reason_line(model: Any, provider: Any, reason: str) -> str:
@@ -123,24 +115,25 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[dict]:
             return None
 
         sig = _signals_from_kwargs(**kwargs)
-        # Task-TYPE routing (adopted from PR #43534): classify the turn into one
-        # of five task types, then map to a fleet tier (fail open to premium).
-        # Public-facing dominates — handled inside tier selection below.
-        if sig.is_public_facing:
-            task_type = classify_task_type(sig)
-            tier = TIER_PREMIUM  # never cheap-route public-facing
-        else:
-            task_type = classify_task_type(sig)
-            tier = tier_for_task_type(task_type)
-        reason = f"{_task_label(task_type)} → {tier}"
+
+        # THE routing decision — deliberately SIMPLE (the classifier is not the
+        # contribution; the interface extension is). decide_tier() gates cheap on
+        # the CONSERVATIVE binary classifier: cheap ONLY on a confident MECHANICAL,
+        # else premium. No catch-all-to-cheap.
+        tier = decide_tier(sig)
+
+        # Reason line reflects the ACTUAL decider (the binary classification), so
+        # the label never disagrees with the tier.
+        classification = classify_turn(sig)  # mechanical | judgment | uncertain
+        reason = f"{classification} → {tier}"
 
         line = _reason_line(kwargs.get("model"), kwargs.get("provider"), reason)
         result: dict = {"context": line}
 
         # Emit a `route` override ONLY for the cheap tier — this is what the
         # runtime's routing-override extension (agent/routing_override.py)
-        # actuates. Premium/fail-open turns emit no override and stay on the
-        # configured primary. Never route public-facing to cheap.
+        # actuates. Premium / fail-open turns emit no override and stay on the
+        # configured primary.
         if tier == TIER_CHEAP:
             cheap_model, cheap_provider = cheap_tier_target()
             if cheap_model:

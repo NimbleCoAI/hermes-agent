@@ -39,8 +39,11 @@ def test_inert_when_disabled():
     assert result is None
 
 
-def test_mechanical_turn_injects_task_type_and_cheap_tier():
-    """A mechanical task surfaces its task type AND the cheap tier it routes to."""
+def test_mechanical_turn_injects_cheap_tier_reason():
+    """A confidently mechanical turn surfaces the cheap tier it routes to.
+
+    The reason line reflects the ACTUAL decider — the binary classification —
+    so the label never disagrees with the tier."""
     with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
                return_value=True):
         result = registration.on_pre_llm_call(
@@ -54,6 +57,7 @@ def test_mechanical_turn_injects_task_type_and_cheap_tier():
 
 
 def test_architecture_turn_routes_premium():
+    """A hard architecture question fails open to premium (binary: judgment)."""
     with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
                return_value=True):
         result = registration.on_pre_llm_call(
@@ -61,19 +65,22 @@ def test_architecture_turn_routes_premium():
             model="claude-sonnet-5", platform="cli",
         )
     ctx_text = result["context"] if isinstance(result, dict) else result
-    assert "routed: architecture → premium" in ctx_text
+    assert "→ premium" in ctx_text
+    assert "→ cheap" not in ctx_text
 
 
 def test_code_gen_turn_routes_premium():
-    """Code-gen -> premium (DeepSWE-grounded: keep coding on Claude)."""
+    """Code-gen -> premium: the binary classifier reads it as judgment (never
+    cheap), so multi-file coding stays on Claude."""
     with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
                return_value=True):
         result = registration.on_pre_llm_call(
-            user_message="implement the retry logic and open a PR",
+            user_message="Write a Python function that merges two sorted linked lists.",
             model="claude-sonnet-5", platform="cli",
         )
     ctx_text = result["context"] if isinstance(result, dict) else result
-    assert "routed: code-gen → premium" in ctx_text
+    assert "→ premium" in ctx_text
+    assert "→ cheap" not in ctx_text
 
 
 def test_uncertain_turn_fails_open_to_premium_reason():

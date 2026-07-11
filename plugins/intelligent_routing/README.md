@@ -44,14 +44,26 @@ Enabled but `routing.intelligent` OFF ⇒ the hook is inert (`None`, zero change
 ```
 turn arrives
   └─ pre_llm_call hook (plugins/intelligent_routing/registration.py)
-       ├─ classify task type (classifier.py)  ── code-gen / architecture /
-       │                                          research / orchestration / mechanical
-       ├─ map to tier: mechanical|orchestration → cheap ; else → premium (fail open)
+       ├─ decide_tier(sig) (classifier.py) ── gate cheap on the CONSERVATIVE
+       │     binary classifier: cheap ONLY if classify_turn == MECHANICAL,
+       │     else PREMIUM (fail open). NO catch-all-to-cheap.
        ├─ inject model-awareness reason line:
-       │     [Current model: … — routed: mechanical → cheap]
+       │     [Current model: … — routed: mechanical → cheap]   (or "judgment → premium")
        └─ if cheap: return {"route": {"model": …, "provider": …}}
              └─ turn_context extracts + applies it (agent/routing_override.py)
                   └─ agent.switch_model(...)  ── turn-scoped: reverted next turn
+```
+
+**Probe the decision in isolation** (for re-audit / live-probe, no config/plumbing):
+
+```python
+from plugins.intelligent_routing.registration import probe_route
+probe_route("Write a Python function that merges two sorted linked lists.")
+#   -> {"tier": "premium", "classification": "uncertain"}
+probe_route("grep for TODO in the repo")
+#   -> {"tier": "cheap", "classification": "mechanical"}
+probe_route("run the nightly digest", platform="cron")
+#   -> {"tier": "cheap", "classification": "mechanical"}
 ```
 
 ## The interface extension (the centerpiece)
@@ -93,21 +105,33 @@ plugin can now return a per-turn model/provider override, not just this one. It
 reuses `switch_model` rather than duplicating the swap logic. It's turn-scoped and
 fail-safe by construction. This is what teknium1 offered to add to the interface.
 
-## Task types → tiers
+## The routing decision (simplified after a live-deploy bug)
 
-Adopted from #43534 (see `references/prior-art.md`), adapted to our fleet:
+**The decider is the conservative binary classifier, not the task-type table.**
+`decide_tier(sig)` routes to cheap **only** when `classify_turn(sig) == MECHANICAL`
+(a confident positive: cron/background, kanban-triage, or a short direct
+single-action ask). Everything else — architecture, code-gen, open-ended
+reasoning, hedged/ambiguous asks, long messages, public-facing — **fails open to
+premium**.
 
-| task type      | tier    | why (directional, recalibrate from fleet data) |
-|----------------|---------|--------------------------------------------------|
-| architecture   | premium | highest reasoning; never cheap-route hard design/security/debug |
-| code-gen       | premium | DeepSWE: DeepSeek coding throughput directionally lower — keep on Claude |
-| research       | premium | analysis/judgment, often public-facing |
-| orchestration  | cheap   | DeepSeek competitive at CLI/tool orchestration (Terminal-Bench 67.9% @ $0.87/1M) |
-| mechanical     | cheap   | fast/cheap delegated workhorse |
-| uncertain / public-facing | premium | fail open — never silently downgrade |
+> **Why (the live-deploy bug this fixes).** An earlier version routed on the
+> 5-way `classify_task_type`, whose catch-all default was `orchestration → cheap`.
+> A live deploy on the cyborg agent proved that hard architecture questions,
+> multi-file code-gen ("Write a Python function that merges two sorted linked
+> lists"), and hedged/uncertain asks ALL fell through the catch-all onto cheap —
+> the "fail open to premium" guarantee was false in practice. The fix: gate cheap
+> on the conservative binary classifier and make the default premium. There is no
+> catch-all-to-cheap. `tests/plugins/intelligent_routing/test_realistic_distribution.py`
+> feeds a representative batch through the FULL hook and asserts what actually
+> routes — the regression that would have caught this.
 
-Cheap tier defaults to `deepseek/deepseek-v3.2` — v3.2, **not** v4-Pro; that
-choice is grounded in #43534's data (see `references/prior-art.md`).
+`classify_task_type` (the 5-way path) still exists as a descriptive utility and
+is unit-tested, but it is **NOT consulted in the routing path**.
+
+Cheap tier defaults to `deepseek/deepseek-v3.2` — v3.2, **not** v4-Pro; grounded
+in #43534's data (DeepSeek coding throughput directionally lower → keep code-gen
+on Claude; DeepSeek only competitive AND cheap at CLI/tool orchestration). See
+`references/prior-art.md`.
 
 ## Scope — DONE vs DEFERRED
 

@@ -74,12 +74,15 @@ _SHORT_MESSAGE_CHARS = 120
 # a trivial factual/lookup query — and carries none of the deferral / prior-
 # context markers that signal an open, context-dependent request.
 
-# Leading imperative verbs that mark a direct single-action command.
+# Leading imperative verbs that mark a direct single-action command. Includes the
+# unambiguous read-only shell verbs (grep/find/cat/ls/search/count) that are
+# plainly mechanical work.
 _IMPERATIVE_VERBS = frozenset({
     "mark", "add", "remove", "delete", "close", "open", "set", "move", "assign",
     "list", "show", "get", "fetch", "run", "start", "stop", "restart", "rename",
     "tag", "label", "archive", "unarchive", "create", "update", "check", "sort",
     "clear", "reset", "enable", "disable", "send", "post", "pin", "unpin",
+    "grep", "find", "cat", "ls", "search", "count", "diff", "print",
 })
 
 # Trivial factual/lookup query openers (short "what's X" style asks).
@@ -180,6 +183,24 @@ def route_for(sig: TurnSignals) -> str:
     ``mechanical`` -> ``TIER_CHEAP``. Everything else (``judgment`` AND
     ``uncertain``) -> ``TIER_PREMIUM``. Only a confident mechanical result ever
     reaches the cheap tier.
+    """
+    return TIER_CHEAP if classify_turn(sig) == MECHANICAL else TIER_PREMIUM
+
+
+def decide_tier(sig: TurnSignals) -> str:
+    """THE routing decision — the single source of truth, easy to probe in isolation.
+
+    A turn goes to ``TIER_CHEAP`` ONLY when the CONSERVATIVE binary classifier is
+    confidently ``MECHANICAL``. Everything the binary reads as ``JUDGMENT`` or
+    ``UNCERTAIN`` — hard architecture, code-gen, open-ended reasoning,
+    hedged/ambiguous asks, long messages, public-facing — FAILS OPEN to
+    ``TIER_PREMIUM``. There is NO catch-all-to-cheap: the default is premium and
+    only a proven-mechanical turn escapes it.
+
+    This is intentionally identical to ``route_for``; it exists as a named,
+    stable entry point the live-probe / re-audit calls directly. (The 5-way
+    ``classify_task_type`` is NOT consulted here — it is a descriptive utility
+    only, kept out of the routing path after the live-deploy catch-all bug.)
     """
     return TIER_CHEAP if classify_turn(sig) == MECHANICAL else TIER_PREMIUM
 
