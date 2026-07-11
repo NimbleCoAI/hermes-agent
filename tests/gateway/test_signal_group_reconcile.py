@@ -318,6 +318,7 @@ class TestReconcileWiredIntoConnect:
 
         # Replace the network-touching collaborators so connect() stays local.
         monkeypatch.setattr(adapter, "_resolve_allowlist_uuids", AsyncMock())
+        monkeypatch.setattr(adapter, "_resolve_own_uuid", AsyncMock())
         monkeypatch.setattr(adapter, "_set_profile_name", AsyncMock())
         monkeypatch.setattr(adapter, "_sse_listener", AsyncMock())
         monkeypatch.setattr(adapter, "_health_monitor", AsyncMock())

@@ -363,6 +363,13 @@ class SignalAdapter(BasePlatformAdapter):
         # Normalize account for self-message filtering
         self._account_normalized = self.account.strip()
 
+        # The bot's own ACI (Signal service id / UUID). Resolved once at
+        # connect() from the bot's own number. Stays None if resolution fails
+        # (fail-soft — mention/reply matching then falls back to phone only).
+        # Modern Signal delivers @mentions by ACI with no phone number, so the
+        # metadata mention-match needs this to recognize a mention of the bot.
+        self._own_uuid: Optional[str] = None
+
         # Track recently sent message timestamps to prevent echo-back loops
         # in Note to Self / self-chat mode and linked-device group sync-sents.
         # OrderedDict[timestamp_ms -> insertion_monotonic_seconds] gives us
@@ -451,6 +458,10 @@ class SignalAdapter(BasePlatformAdapter):
 
             # Resolve phone-number allowlists to UUIDs now that RPC is live.
             await self._resolve_allowlist_uuids()
+
+            # Resolve the bot's own ACI (needed to recognize @mentions that
+            # arrive by ACI/UUID rather than phone number). Fail-soft.
+            await self._resolve_own_uuid()
 
             # Auto-approve pre-existing groups the agent was added to without
             # an invite envelope (e.g. added at group creation). Best-effort.
@@ -979,8 +990,16 @@ class SignalAdapter(BasePlatformAdapter):
             mentioned_in_text = account_norm and (
                 f"@{account_norm}" in (text or "")
             )
+            # Match a mention by the bot's phone number OR its own ACI. Modern
+            # Signal delivers @mentions as metadata carrying only the ACI
+            # (a `uuid` with no `number`), so the own-ACI check is required for
+            # a genuine @mention to be recognized. _own_uuid may be None if
+            # resolution failed at connect() — then only the phone check applies.
+            own_uuid = self._own_uuid
             mentioned_in_metadata = any(
-                m.get("number") == account_norm or m.get("uuid") == account_norm
+                m.get("number") == account_norm
+                or m.get("uuid") == account_norm
+                or (own_uuid and m.get("uuid") == own_uuid)
                 for m in (data_message.get("mentions") or [])
             )
             if not mentioned_in_text and not mentioned_in_metadata:
@@ -988,7 +1007,11 @@ class SignalAdapter(BasePlatformAdapter):
                 is_reply_to_bot = False
                 quote_data = data_message.get("quote") or {}
                 if quote_data:
-                    bot_uuid = self._recipient_uuid_by_number.get(account_norm, "")
+                    bot_uuid = (
+                        self._recipient_uuid_by_number.get(account_norm, "")
+                        or self._own_uuid
+                        or ""
+                    )
                     quote_author = quote_data.get("authorNumber") or ""
                     quote_uuid = quote_data.get("authorUuid") or ""
                     is_reply_to_bot = (
@@ -1425,6 +1448,47 @@ class SignalAdapter(BasePlatformAdapter):
                 len(unresolved),
                 ", ".join(redact_phone(n) for n in unresolved),
             )
+
+    async def _resolve_own_uuid(self) -> None:
+        """Resolve the bot's own ACI (service id) from its own phone number.
+
+        Modern Signal delivers group @mentions as mention metadata carrying
+        only the mentioned party's ACI (a ``uuid``, often with no ``number``).
+        The metadata mention-match needs the bot's own ACI to recognize such a
+        mention. We resolve it once at connect() via ``getUserStatus`` — the
+        same RPC already used for allowlist resolution — on ``self.account``.
+
+        Fail-soft: on any error, or if only a PNI (not an ACI) comes back,
+        ``self._own_uuid`` stays ``None`` and all downstream behavior is
+        unchanged (mention/reply matching falls back to the phone number).
+        """
+        try:
+            statuses = await self._rpc("getUserStatus", {
+                "account": self.account,
+                "recipients": [self.account],
+            })
+        except Exception:
+            logger.debug("Signal: own-ACI resolution failed (getUserStatus)", exc_info=True)
+            return
+
+        if not isinstance(statuses, list):
+            return
+
+        for status in statuses:
+            if not isinstance(status, dict):
+                continue
+            sid = status.get("uuid") or status.get("serviceId")
+            # Only accept a bare ACI (UUID). A PNI:-prefixed id is not the ACI
+            # that mention metadata uses, so reject it and stay fail-soft.
+            if sid and _is_signal_service_id(sid) and not sid.startswith("PNI:"):
+                self._own_uuid = sid
+                # Also cache it as the number→UUID mapping so reply-to-bot and
+                # self-mention stripping can reuse it.
+                self._remember_recipient_identifiers(self._account_normalized, sid)
+                logger.info("Signal: resolved own ACI → %s", sid[:12])
+                return
+
+        logger.debug("Signal: own ACI unresolved (no bare service id from getUserStatus)")
 
     # ------------------------------------------------------------------
     # Profile Name Setting
