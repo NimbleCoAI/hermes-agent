@@ -136,3 +136,113 @@ def test_apply_ignores_empty_override():
     assert apply_routing_override(agent, {}) is False
     assert apply_routing_override(agent, None) is False
     agent.switch_model.assert_not_called()
+
+
+# ---- base_url resolution on cross-provider routes (cyborg 404 regression) ----
+#
+# The plugin emits {"model": ..., "provider": ...} with NO base_url. switch_model
+# keeps the CURRENT base_url when none is supplied (its `if base_url:` guard), so
+# a route from an Anthropic primary to an OpenRouter model would dispatch the
+# OpenRouter model to api.anthropic.com/chat/completions → 404, silently
+# cascading to the bottom of the fallback chain. apply_routing_override must
+# resolve the new provider's canonical endpoint up front when the override omits
+# it AND the provider changes.
+
+
+class _FakeClient:
+    def __init__(self, base_url, api_key):
+        self.base_url = base_url
+        self.api_key = api_key
+
+
+def _stub_resolver(monkeypatch, fn):
+    """Inject a fake ``agent.auxiliary_client`` so the lazy
+    ``from agent.auxiliary_client import resolve_provider_client`` in
+    apply_routing_override picks up ``fn`` without importing the heavy real
+    module (and its runtime deps) at unit-test time."""
+    import sys
+    import types
+
+    mod = types.ModuleType("agent.auxiliary_client")
+    mod.resolve_provider_client = fn
+    monkeypatch.setitem(sys.modules, "agent.auxiliary_client", mod)
+
+
+def test_apply_resolves_base_url_when_provider_changes(monkeypatch):
+    agent = _fake_agent()  # primary: anthropic
+    seen = {}
+
+    def _resolve(provider, model=None, **kw):
+        seen["provider"] = provider
+        seen["model"] = model
+        return _FakeClient("https://openrouter.ai/api/v1/", "sk-or-test"), model
+
+    _stub_resolver(monkeypatch, _resolve)
+
+    ok = apply_routing_override(
+        agent, {"model": "deepseek/deepseek-v3.2", "provider": "openrouter"}
+    )
+    assert ok is True
+    assert seen["provider"] == "openrouter"
+    _, kwargs = agent.switch_model.call_args
+    # The resolved endpoint (and key) must be forwarded so switch_model does NOT
+    # inherit the Anthropic primary's base_url.
+    assert kwargs.get("base_url") == "https://openrouter.ai/api/v1/"
+    assert kwargs.get("api_key") == "sk-or-test"
+
+
+def test_apply_does_not_resolve_when_provider_unchanged(monkeypatch):
+    """Same-provider route (e.g. anthropic sonnet → anthropic haiku) must not
+    inject base_url — switch_model correctly keeps the same-provider base_url
+    and re-derives api_mode. Forcing a resolve here is needless and risky."""
+    agent = _fake_agent()  # primary: anthropic
+
+    def _resolve(*a, **k):
+        raise AssertionError("resolve_provider_client should not be called")
+
+    _stub_resolver(monkeypatch, _resolve)
+
+    ok = apply_routing_override(
+        agent, {"model": "claude-haiku-4-5-20251001", "provider": "anthropic"}
+    )
+    assert ok is True
+    _, kwargs = agent.switch_model.call_args
+    assert "base_url" not in kwargs
+
+
+def test_apply_preserves_explicit_base_url(monkeypatch):
+    """An override that DOES carry base_url wins — no resolve, no overwrite."""
+    agent = _fake_agent()
+
+    def _resolve(*a, **k):
+        raise AssertionError("resolve_provider_client should not be called")
+
+    _stub_resolver(monkeypatch, _resolve)
+
+    apply_routing_override(
+        agent,
+        {
+            "model": "deepseek/deepseek-v3.2",
+            "provider": "openrouter",
+            "base_url": "https://custom.example/v1",
+        },
+    )
+    _, kwargs = agent.switch_model.call_args
+    assert kwargs["base_url"] == "https://custom.example/v1"
+
+
+def test_apply_resolve_failure_is_fail_safe(monkeypatch):
+    """A resolve miss must not break the turn — the swap still proceeds and
+    switch_model falls back to provider defaults."""
+    agent = _fake_agent()
+
+    def _resolve(*a, **k):
+        raise RuntimeError("registry down")
+
+    _stub_resolver(monkeypatch, _resolve)
+
+    ok = apply_routing_override(
+        agent, {"model": "deepseek/deepseek-v3.2", "provider": "openrouter"}
+    )
+    assert ok is True
+    agent.switch_model.assert_called_once()
