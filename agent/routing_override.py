@@ -118,6 +118,38 @@ def apply_routing_override(agent: Any, override: Optional[dict]) -> bool:
     kwargs = {
         k: override[k] for k in _PASSTHROUGH_FIELDS if override.get(k)
     }
+    # When the route switches provider but the override carries no explicit
+    # base_url, resolve the new provider's canonical endpoint up front. Without
+    # this, switch_model()'s ``if base_url:`` guard keeps the CURRENT base_url,
+    # so the routed model is dispatched to the previous provider's endpoint —
+    # e.g. an OpenRouter model sent to api.anthropic.com/chat/completions → 404,
+    # silently cascading to the bottom of the fallback chain. Mirrors the
+    # reactive-fallback path in chat_completion_helpers. (cyborg routed-turn
+    # 404 regression.) Fail-safe: a resolve miss must never break the turn —
+    # fall through and let switch_model use provider defaults.
+    if (
+        "base_url" not in kwargs
+        and target_provider
+        and target_provider.strip().lower() != cur_provider.strip().lower()
+    ):
+        try:
+            from agent.auxiliary_client import resolve_provider_client
+
+            _client, _ = resolve_provider_client(target_provider, model=target_model)
+            if _client is not None:
+                _resolved_base = str(getattr(_client, "base_url", "") or "").strip()
+                if _resolved_base:
+                    kwargs["base_url"] = _resolved_base
+                if "api_key" not in kwargs:
+                    _resolved_key = getattr(_client, "api_key", None)
+                    if _resolved_key:
+                        kwargs["api_key"] = _resolved_key
+        except Exception:  # noqa: BLE001 — never break the turn on a resolve miss
+            logger.debug(
+                "intelligent_routing: could not pre-resolve endpoint for %s; "
+                "switch_model will fall back to provider defaults",
+                target_provider, exc_info=True,
+            )
     try:
         agent.switch_model(target_model, target_provider, **kwargs)
     except Exception as exc:  # noqa: BLE001 — a routing miss must never break the turn
