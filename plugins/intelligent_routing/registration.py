@@ -48,6 +48,36 @@ logger = logging.getLogger(__name__)
 # signal fires. Kept as a small, explicit set rather than guessing.
 _NON_INTERACTIVE_PLATFORMS = frozenset({"cron", "background", "scheduler", "batch"})
 
+# --- User model directive ("use fable for this") ---
+# A user can explicitly request a model by name. The directive short-circuits
+# the classifier entirely — fires BEFORE the mechanical/judgment split.
+# Critical: "use" IS in _IMPERATIVE_VERBS, so without this early intercept
+# a bare "use fable" would be classified mechanical → cheap → deepseek.
+#
+# Map: lowercase keyword → (model_id, provider). None means "stay on primary".
+_USER_MODEL_MAP = {
+    "fable": ("claude-fable-5", "anthropic"),
+    "opus": ("claude-opus-4-8", "anthropic"),
+    "sonnet": ("claude-sonnet-4-6", "anthropic"),
+    "haiku": ("claude-haiku-4-5-20251001", "anthropic"),
+    "deepseek": ("deepseek/deepseek-v3.2", "openrouter"),
+    "claude": None,  # "use claude" = stay on configured primary
+}
+_DIRECTIVE_RE = re.compile(
+    r"\buse\s+({models})\b".format(models="|".join(re.escape(k) for k in _USER_MODEL_MAP)),
+    re.IGNORECASE,
+)
+# Sentinel: "no directive found" — separate from None ("use claude" / no override).
+_NO_DIRECTIVE = object()
+
+
+def _parse_model_directive(message: str) -> object:
+    """Return (model, provider), None (stay on primary), or ``_NO_DIRECTIVE``."""
+    m = _DIRECTIVE_RE.search(message)
+    if not m:
+        return _NO_DIRECTIVE
+    return _USER_MODEL_MAP.get(m.group(1).lower(), _NO_DIRECTIVE)
+
 # Shared multi-user (group) sessions prepend a sender attribution to the message
 # before it reaches pre_llm_call — gateway/run.py emits ``f"[{user_name}] {text}"``.
 # Left in place, that "[mare] " prefix makes the classifier's leading-imperative
@@ -134,6 +164,28 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[dict]:
         if not is_intelligent_routing_enabled():
             return None
 
+        # Strip sender prefix before any further parsing (group-chat attribution).
+        raw_message = kwargs.get("user_message") or ""
+        if not isinstance(raw_message, str):
+            raw_message = str(raw_message)
+        stripped = _strip_sender_prefix(raw_message)
+
+        # ── User model directive ("use fable for this") ───────────────────────
+        # Check BEFORE the classifier. "use" is in _IMPERATIVE_VERBS so without
+        # this intercept "use fable" would be classified mechanical → deepseek.
+        directive = _parse_model_directive(stripped)
+        if directive is not _NO_DIRECTIVE:
+            if directive is None:
+                # "use claude" — stay on configured primary; inject a context note.
+                reason = "user-requested → primary"
+                line = _reason_line(kwargs.get("model"), kwargs.get("provider"), reason)
+                return {"context": line}
+            model, provider = directive
+            reason = f"user-requested → {model.split('/')[0] if '/' in model else model}"
+            line = _reason_line(kwargs.get("model"), kwargs.get("provider"), reason)
+            return {"route": {"model": model, "provider": provider}, "context": line}
+
+        # ── Heuristic classifier (no explicit directive) ───────────────────────
         sig = _signals_from_kwargs(**kwargs)
 
         # THE routing decision — deliberately SIMPLE (the classifier is not the
