@@ -1,0 +1,9 @@
+name: bestiary
+version: 1.0.0
+description: "Crypto token intelligence via the Bestiary data substrate — resolve tokens by any identifier, check social signal aggregates, and verify connectivity. Set BESTIARY_URL to point at your bestiary API instance."
+author: nimbleco
+kind: backend
+provides_tools:
+  - bestiary_resolve
+  - bestiary_signals
+  - bestiary_health
