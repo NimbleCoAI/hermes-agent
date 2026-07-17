@@ -497,6 +497,20 @@ class SlackAdapter(BasePlatformAdapter):
         )
         _apply_slack_proxy(self._handler.client, self._proxy_url)
 
+        # Guard: if the new SocketModeClient's aiohttp session is already closed
+        # (can happen in rare race conditions during teardown), replace it with a
+        # fresh one. Without this, SocketModeClient.connect() enters an infinite
+        # retry loop — "RuntimeError: Session is closed" every ping_interval seconds.
+        sm_client = getattr(self._handler, "client", None)
+        if sm_client is not None:
+            session = getattr(sm_client, "aiohttp_client_session", None)
+            if session is not None and getattr(session, "closed", False):
+                logger.warning(
+                    "[Slack] New SocketModeClient has a closed aiohttp session; "
+                    "replacing with a fresh one to avoid stuck reconnect loop"
+                )
+                sm_client.aiohttp_client_session = aiohttp.ClientSession(trust_env=True)
+
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
         task.add_done_callback(self._on_socket_mode_task_done)
@@ -590,6 +604,19 @@ class SlackAdapter(BasePlatformAdapter):
                 if task.done():
                     await self._restart_socket_mode("socket task stopped")
                     continue
+
+                # Detect the "Session is closed" stuck state: the task is still
+                # running (start_async sleeps forever) but ws_connect() is looping
+                # forever on a closed aiohttp session — neither done() nor
+                # transport_connected() catches this.
+                handler = self._handler
+                if handler is not None:
+                    sm_client = getattr(handler, "client", None)
+                    if sm_client is not None:
+                        session = getattr(sm_client, "aiohttp_client_session", None)
+                        if session is not None and getattr(session, "closed", False):
+                            await self._restart_socket_mode("aiohttp session closed")
+                            continue
 
                 connected = await self._socket_transport_connected()
                 if connected is False:
