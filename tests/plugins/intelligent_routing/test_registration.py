@@ -181,3 +181,56 @@ def test_route_override_honors_config_target():
             user_message="grep for TODO", model="claude-sonnet-5", platform="cli",
         )
     assert result["route"] == {"model": "qwen/qwen-2.5", "provider": "ollama"}
+
+
+# ---- group [sender] attribution prefix (Signal/group classifier bug) ---------
+#
+# In a shared multi-user (group) session the gateway prepends "[sender] " to the
+# message before it reaches pre_llm_call (gateway/run.py: `[{user_name}] {text}`).
+# That prefix made the classifier's leading-imperative-verb check see "[mare]"
+# instead of "list", so EVERY group turn failed the mechanical test and routed
+# premium — the intelligent router was inert in exactly the place agents live.
+# _signals_from_kwargs must strip a leading "[sender] " attribution before
+# classifying, without over-triggering on genuine judgment content.
+
+
+def test_group_prefixed_mechanical_turn_routes_cheap():
+    """A mechanical ask carrying a "[sender] " group prefix still routes cheap."""
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="[mare] list the numbers one to five",
+            model="claude-sonnet-5", platform="signal",
+        )
+    assert isinstance(result, dict)
+    assert result.get("route") == {
+        "model": "deepseek/deepseek-v3.2", "provider": "openrouter",
+    }
+
+
+def test_group_prefix_probe_matches_unprefixed():
+    """probe_route: the "[sender] " prefix must not change the tier vs. the bare
+    message — the classifier decides on the real content, not the attribution."""
+    bare = registration.probe_route("grep for TODO in the repo")
+    prefixed = registration.probe_route("[oz] grep for TODO in the repo")
+    assert prefixed["tier"] == bare["tier"] == "cheap"
+
+
+def test_group_prefix_does_not_make_judgment_cheap():
+    """Stripping the prefix must NOT over-trigger: a judgment ask that happens to
+    carry a group prefix still routes premium (no route override)."""
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="[mare] what should we prioritize next quarter and why?",
+            model="claude-sonnet-5", platform="signal",
+        )
+    assert "route" not in result
+
+
+def test_group_prefix_strip_is_single_leading_token_only():
+    """Only ONE leading bracketed attribution token is stripped; a second bracket
+    in the body is left intact (the strip is an attribution peel, not a cleaner)."""
+    # After peeling "[mare] ", the remaining "grep [WIP] logs" still leads with a
+    # verb → cheap. This pins that we peel exactly one leading token.
+    assert registration.probe_route("[mare] grep [WIP] logs")["tier"] == "cheap"
