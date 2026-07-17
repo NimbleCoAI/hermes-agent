@@ -30,6 +30,7 @@ different axis; reactive escalation still applies underneath the chosen tier.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 from .classifier import (
@@ -47,6 +48,23 @@ logger = logging.getLogger(__name__)
 # signal fires. Kept as a small, explicit set rather than guessing.
 _NON_INTERACTIVE_PLATFORMS = frozenset({"cron", "background", "scheduler", "batch"})
 
+# Shared multi-user (group) sessions prepend a sender attribution to the message
+# before it reaches pre_llm_call — gateway/run.py emits ``f"[{user_name}] {text}"``.
+# Left in place, that "[mare] " prefix makes the classifier's leading-imperative
+# check read "[mare]" instead of the real first word ("list"), so EVERY group
+# turn fails the mechanical test and routes premium — the router goes inert in
+# exactly the place agents live. Peel a SINGLE leading "[token] " attribution
+# (one line, bounded length, no nested "]") so the classifier sees the real ask.
+# Deliberately conservative: only one leading token, and the peeled remainder
+# still runs the full conservative classifier (fails open to premium on anything
+# non-mechanical), so an over-peel can never wrongly cheap-route real work.
+_SENDER_PREFIX_RE = re.compile(r"^\[[^\]\n]{1,64}\]\s+")
+
+
+def _strip_sender_prefix(message: str) -> str:
+    """Peel one leading ``[sender] `` group-attribution prefix, if present."""
+    return _SENDER_PREFIX_RE.sub("", message, count=1)
+
 
 def _signals_from_kwargs(**kwargs: Any) -> TurnSignals:
     """Derive cheap ``TurnSignals`` from the ``pre_llm_call`` kwargs.
@@ -60,6 +78,8 @@ def _signals_from_kwargs(**kwargs: Any) -> TurnSignals:
     message = kwargs.get("user_message") or ""
     if not isinstance(message, str):
         message = str(message)
+    # Peel the group sender-attribution prefix before classifying (see above).
+    message = _strip_sender_prefix(message)
     platform = (kwargs.get("platform") or "")
     platform = platform.strip().lower() if isinstance(platform, str) else ""
     is_background = platform in _NON_INTERACTIVE_PLATFORMS
