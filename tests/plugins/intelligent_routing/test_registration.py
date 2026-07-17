@@ -234,3 +234,96 @@ def test_group_prefix_strip_is_single_leading_token_only():
     # After peeling "[mare] ", the remaining "grep [WIP] logs" still leads with a
     # verb → cheap. This pins that we peel exactly one leading token.
     assert registration.probe_route("[mare] grep [WIP] logs")["tier"] == "cheap"
+
+
+# ---- user model directive ("use fable for this") ----------------------------
+#
+# A user can explicitly request a model tier mid-message. The directive wins
+# over the classifier: "use fable" routes to Fable even if the turn looks
+# mechanical; "use deepseek" routes cheap even if the classifier would go
+# premium. The parse fires BEFORE the classifier so "use fable" isn't
+# misread as an imperative verb → mechanical → cheap route to deepseek
+# (which is what would happen without the directive intercept — "use" IS in
+# _IMPERATIVE_VERBS, so a bare "use fable" would currently route deepseek).
+
+
+def test_user_directive_fable_routes_to_fable():
+    """'use fable' overrides the classifier and routes to claude-fable-5."""
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="hey can you use fable for this task?",
+            model="claude-sonnet-5", platform="signal",
+        )
+    assert isinstance(result, dict)
+    assert result["route"] == {"model": "claude-fable-5", "provider": "anthropic"}
+    assert "user-requested" in result["context"]
+
+
+def test_user_directive_deepseek_routes_cheap():
+    """'use deepseek' routes to the cheap deepseek tier even on a judgment-shaped ask."""
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="design the multi-tenant auth system, use deepseek",
+            model="claude-sonnet-5", platform="cli",
+        )
+    assert isinstance(result, dict)
+    assert result["route"] == {"model": "deepseek/deepseek-v3.2", "provider": "openrouter"}
+
+
+def test_user_directive_opus_routes_to_opus():
+    """'use opus' routes to claude-opus-4-8 / anthropic."""
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="use opus — this needs max reasoning",
+            model="claude-sonnet-5", platform="cli",
+        )
+    assert isinstance(result, dict)
+    assert result["route"]["model"] == "claude-opus-4-8"
+    assert result["route"]["provider"] == "anthropic"
+
+
+def test_user_directive_group_prefix_plus_model():
+    """Directive still fires when a group [sender] prefix is present."""
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="[mare] use fable for this please",
+            model="claude-sonnet-5", platform="signal",
+        )
+    assert isinstance(result, dict)
+    assert result["route"] == {"model": "claude-fable-5", "provider": "anthropic"}
+
+
+def test_user_directive_wins_over_mechanical_classifier():
+    """'use fable' on a mechanical-shaped message routes to fable, NOT deepseek.
+
+    Without directive intercept, 'use' is in _IMPERATIVE_VERBS so a message
+    starting with 'use fable' would be classified mechanical → cheap → deepseek.
+    The directive must short-circuit the classifier and route to fable instead.
+    """
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="use fable",
+            model="claude-sonnet-5", platform="cli",
+        )
+    assert isinstance(result, dict)
+    route = result.get("route", {})
+    assert route.get("model") == "claude-fable-5", (
+        f"'use fable' must route to fable, not deepseek; got route={route}"
+    )
+
+
+def test_no_directive_falls_through_to_classifier():
+    """Without a model directive the classifier runs normally."""
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="grep for TODO in the repo",
+            model="claude-sonnet-5", platform="cli",
+        )
+    assert isinstance(result, dict)
+    assert result.get("route") == {"model": "deepseek/deepseek-v3.2", "provider": "openrouter"}
