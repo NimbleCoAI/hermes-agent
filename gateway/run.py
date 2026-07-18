@@ -20326,7 +20326,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         name="gateway-housekeeping",
     )
     housekeeping_thread.start()
-    
+
+    # Last-resort safety net: a hung synchronous call anywhere on the loop
+    # thread silently stalls every coroutine at once (SSE listeners, health
+    # monitors, message handling) with near-zero CPU, and nothing else in
+    # the gateway can detect it since the freeze is upstream of their own
+    # tasks too. Dumps all-thread stacks and hard-exits so s6 restarts the
+    # gateway instead of it staying dead for hours with no explanation in
+    # the logs. See gateway/event_loop_watchdog.py.
+    try:
+        from gateway.event_loop_watchdog import start_event_loop_watchdog
+        start_event_loop_watchdog(asyncio.get_running_loop(), cron_stop)
+    except Exception:
+        logger.warning("Event loop watchdog failed to start (non-fatal)", exc_info=True)
+
     # Wait for shutdown
     await runner.wait_for_shutdown()
 
