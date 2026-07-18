@@ -95,21 +95,24 @@ from .whatsapp_identity import (
 )
 from utils import atomic_replace
 
-# Session keys/ids flow into filesystem paths downstream (e.g.
+# session_id (not session_key) flows into filesystem paths downstream (e.g.
 # ``sessions_dir / f"{session_id}.json"`` in hermes_state, request-dump
-# filenames in agent_runtime_helpers). Any value that could escape the
-# sessions directory as a path must be rejected at the entry boundary.
-# Rejects: parent traversal (``..``), a path separator anywhere (``/`` or
-# ``\``, so a non-leading Windows separator can't slip through), and a
-# leading Windows drive letter (``C:``). Legitimate session keys are
-# colon-delimited multi-segment ids (``agent:main:<platform>:...``) and
-# never contain these, so there are no false positives in practice.
-def _is_path_unsafe(value: object) -> bool:
+# filenames in agent_runtime_helpers) — session_key is only ever used as a
+# dict key / JSON field, never interpolated into a path. Any value that
+# could escape the sessions directory as a path must be rejected at the
+# entry boundary. Rejects: parent traversal (``..``, always — both fields),
+# a path separator (``/`` or ``\``; ``/`` is allowed in session_key via
+# ``allow_forward_slash``, since platforms with base64 native chat ids
+# (Signal groups) legitimately produce a "/" there and it never reaches a
+# filesystem join), and a leading Windows drive letter (``C:``).
+def _is_path_unsafe(value: object, *, allow_forward_slash: bool = False) -> bool:
     """Return True if ``value`` could traverse outside the sessions dir."""
     if not value:
         return False
     s = str(value)
-    if ".." in s or "/" in s or "\\" in s:
+    if ".." in s or "\\" in s:
+        return True
+    if "/" in s and not allow_forward_slash:
         return True
     # Leading Windows drive path, e.g. "C:\..." or "d:/...". A bare "x:"
     # with no following separator isn't a usable absolute path, and the
@@ -741,9 +744,15 @@ class SessionEntry:
         session_key = data["session_key"]
         session_id = data["session_id"]
 
-        # Validate path-sensitive fields to prevent directory traversal (CWE-22)
-        for _field, _val in (("session_key", session_key), ("session_id", session_id)):
-            if _is_path_unsafe(_val):
+        # Validate path-sensitive fields to prevent directory traversal (CWE-22).
+        # session_key allows "/" (base64 native chat ids, e.g. Signal groups —
+        # never reaches a filesystem join); session_id stays strict since it
+        # is interpolated directly into transcript filenames.
+        for _field, _val, _allow_slash in (
+            ("session_key", session_key, True),
+            ("session_id", session_id, False),
+        ):
+            if _is_path_unsafe(_val, allow_forward_slash=_allow_slash):
                 raise ValueError(
                     f"Invalid {_field}: potential directory traversal detected"
                 )
@@ -893,7 +902,16 @@ def build_session_key(
     key_parts = [ns, platform, source.chat_type]
 
     if source.chat_id:
-        key_parts.append(source.chat_id)
+        # Some adapters (Signal: gateway/platforms/signal.py) already bake
+        # the chat_type into chat_id itself ("group:<id>"). Strip a
+        # redundant leading "<chat_type>:" so the key doesn't double up
+        # ("signal:group:group:<id>") — chat_type above already supplies
+        # that segment once.
+        chat_id_for_key = source.chat_id
+        _type_prefix = f"{source.chat_type}:"
+        if chat_id_for_key.startswith(_type_prefix):
+            chat_id_for_key = chat_id_for_key[len(_type_prefix):]
+        key_parts.append(chat_id_for_key)
     if source.thread_id:
         key_parts.append(source.thread_id)
 
