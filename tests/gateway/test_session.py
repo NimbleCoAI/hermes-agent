@@ -6,6 +6,7 @@ from unittest.mock import patch, MagicMock
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import (
+    SessionEntry,
     SessionSource,
     SessionStore,
     build_session_context,
@@ -1186,13 +1187,22 @@ class TestSessionEntryFromDictTraversalValidation:
             SessionEntry.from_dict(self._entry(session_id="D:\\path\\to\\file"))
 
     def test_session_id_non_leading_separator_raises(self):
-        """A path separator anywhere — not just leading — must be rejected,
-        since a non-leading backslash is still a Windows traversal vector."""
+        """A path separator anywhere in session_id — not just leading — must
+        be rejected, since a non-leading backslash is still a Windows
+        traversal vector. session_id is interpolated directly into
+        transcript filenames (unlike session_key — see
+        TestSessionKeyPathSafety), so it stays fully strict."""
         from gateway.session import SessionEntry
         with pytest.raises(ValueError, match="session_id"):
             SessionEntry.from_dict(self._entry(session_id="good\\..\\bad"))
+
+    def test_session_key_backslash_raises(self):
+        """Unlike '/' (see TestSessionKeyPathSafety — legitimate for
+        base64 native chat ids like Signal groups), a backslash in
+        session_key is never legitimate and must still be rejected."""
+        from gateway.session import SessionEntry
         with pytest.raises(ValueError, match="session_key"):
-            SessionEntry.from_dict(self._entry(session_key="agent:main:good/sub"))
+            SessionEntry.from_dict(self._entry(session_key="agent:main:good\\sub"))
 
 
 class TestEnsureLoadedSkipsInvalidEntries:
@@ -1580,3 +1590,77 @@ class TestGatewaySessionDbRecovery:
         assert reset.session_id != entry.session_id
         assert reset.was_auto_reset is True
         assert reset.auto_reset_reason == "idle"
+
+
+class TestSignalGroupSessionKey:
+    """Regression: signal.py sets ``chat_id = f"group:{group_id}"`` for
+    groups (gateway/platforms/signal.py:973) — build_session_key must not
+    also prepend chat_type ("group"), or Signal group keys come out
+    double-prefixed ("agent:main:signal:group:group:<id>") instead of the
+    single-prefixed form every other platform produces."""
+
+    def test_signal_group_key_has_single_group_prefix(self):
+        source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="group:f1Ikxzkk8/rr8D4qXG20PyyvqxdLz1ATvwAfr5zunWw=",
+            chat_type="group",
+            user_name="mare",
+        )
+        key = build_session_key(source, group_sessions_per_user=False)
+        assert key == (
+            "agent:main:signal:group:f1Ikxzkk8/rr8D4qXG20PyyvqxdLz1ATvwAfr5zunWw="
+        )
+
+    def test_signal_dm_key_unaffected(self):
+        """DMs don't go through the chat_type/chat_id group branch at all —
+        confirm the fix doesn't touch them."""
+        source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="+13046886277",
+            chat_type="dm",
+        )
+        assert build_session_key(source) == "agent:main:signal:dm:+13046886277"
+
+
+class TestSessionKeyPathSafety:
+    """session_key legitimately contains ``/`` for platforms whose native
+    chat ids are base64 (Signal groups). session_key is never interpolated
+    into a filesystem path — only session_id is (see the comment above
+    ``_is_path_unsafe`` in gateway/session.py) — so it must not be rejected
+    as a directory-traversal attempt. session_id, which *is* used to build
+    ``sessions_dir / f"{session_id}.json"``, must stay strict."""
+
+    def _base_data(self, **overrides):
+        data = {
+            "session_key": "agent:main:signal:dm:+13046886277",
+            "session_id": "20260718_000000_deadbeef",
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+        }
+        data.update(overrides)
+        return data
+
+    def test_from_dict_accepts_slash_in_session_key(self):
+        data = self._base_data(
+            session_key=(
+                "agent:main:signal:group:"
+                "f1Ikxzkk8/rr8D4qXG20PyyvqxdLz1ATvwAfr5zunWw="
+            )
+        )
+        entry = SessionEntry.from_dict(data)
+        assert entry.session_key == data["session_key"]
+
+    def test_from_dict_still_rejects_dotdot_in_session_key(self):
+        data = self._base_data(session_key="agent:main:signal:group:../../etc/passwd")
+        with pytest.raises(ValueError, match="traversal"):
+            SessionEntry.from_dict(data)
+
+    def test_from_dict_still_rejects_slash_in_session_id(self):
+        data = self._base_data(session_id="abc/def")
+        with pytest.raises(ValueError, match="traversal"):
+            SessionEntry.from_dict(data)
+
+    def test_from_dict_still_rejects_dotdot_in_session_id(self):
+        data = self._base_data(session_id="../../etc/passwd")
+        with pytest.raises(ValueError, match="traversal"):
+            SessionEntry.from_dict(data)
