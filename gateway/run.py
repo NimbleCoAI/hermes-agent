@@ -9554,7 +9554,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # ── Observe-only: record in session context, skip agent ───────
         if getattr(event, "observe_only", False):
-            session_entry = self.session_store.get_or_create_session(source)
+            session_entry = await self.async_session_store.get_or_create_session(source)
             ts = datetime.now().isoformat()
             sender = source.user_name or source.user_id or "unknown"
             content = event.text or ""
@@ -9573,7 +9573,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     content = "[shared media]"
 
             tagged_content = f"[{sender}]: {content}" if content else f"[{sender} sent a message]"
-            self.session_store.append_to_transcript(
+            await self.async_session_store.append_to_transcript(
                 session_entry.session_id,
                 {
                     "role": "user",
