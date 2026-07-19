@@ -70,7 +70,9 @@ export interface Translations {
     docs: string
     done: string
     error: string
+    expand: string
     failed: string
+    formatJson: string
     free: string
     loading: string
     notSet: string
@@ -83,6 +85,7 @@ export interface Translations {
     set: string
     skip: string
     update: string
+    tryHint: (term: string) => string
     on: string
     off: string
   }
@@ -130,9 +133,13 @@ export interface Translations {
       retry: string
       repairInstall: string
       useLocalGateway: string
+      gatewaySettings: string
+      back: string
       openLogs: string
       repairHint: string
-      remoteSignInHint: string
+      remoteSignInHint: (signInLabel: string) => string
+      signOutAndSignIn: string
+      remoteFailureHint: string
       hideRecentLogs: string
       showRecentLogs: string
       signedInTitle: string
@@ -158,6 +165,7 @@ export interface Translations {
     copyDetailFailed: string
     backendOutOfDateTitle: string
     backendOutOfDateMessage: string
+    installMethodUnsupportedTitle: string
     updateHermes: string
     updateReadyTitle: string
     updateReadyMessage: (count: number) => string
@@ -208,7 +216,6 @@ export interface Translations {
 
   remoteDisplayBanner: {
     message: (reason: string) => string
-    dismiss: string
   }
 
   titlebar: {
@@ -225,11 +232,14 @@ export interface Translations {
     openSettings: string
     openStarmap: string
     openKeybinds: string
+    layoutEditor: string
+    layoutEditorTitle: string
   }
 
   keybinds: {
     title: string
     subtitle: (open: string) => string
+    search: string
     rebind: string
     reset: string
     resetAll: string
@@ -264,12 +274,27 @@ export interface Translations {
       providerApiKeys: string
       gateway: string
       apiKeys: string
+      keybinds: string
       keysTools: string
       keysSettings: string
       mcp: string
       archivedChats: string
       about: string
       notifications: string
+      plugins: string
+    }
+    plugins: {
+      title: string
+      blurb: string
+      count: (n: number) => string
+      openFolder: string
+      rescan: string
+      reveal: string
+      enable: string
+      disable: string
+      failed: string
+      empty: string
+      kinds: { bundled: string; disk: string; runtime: string }
     }
     notifications: {
       title: string
@@ -300,8 +325,12 @@ export interface Translations {
       colorModeDesc: string
       toolViewTitle: string
       toolViewDesc: string
+      uiScaleTitle: string
+      uiScaleDesc: (percent: number) => string
       translucencyTitle: string
       translucencyDesc: string
+      backdropTitle: string
+      backdropDesc: string
       embedsTitle: string
       embedsDesc: string
       embedsAsk: string
@@ -411,8 +440,6 @@ export interface Translations {
       enterValueFirst: string
       couldNotSave: string
       remove: string
-      or: string
-      escToCancel: string
       getKey: string
       saving: string
     }
@@ -439,10 +466,39 @@ export interface Translations {
       profileConnection: (profile: string) => string
       envOverrideTitle: string
       envOverrideDesc: string
+      modeTitle: string
       localTitle: string
       localDesc: string
       remoteTitle: string
       remoteDesc: string
+      remoteAuthHint: string
+      cloudTitle: string
+      cloudDesc: string
+      cloudSignInTitle: string
+      cloudSignIn: string
+      cloudSignedIn: string
+      cloudNeedsSignIn: string
+      cloudSignedInDesc: string
+      cloudAgentsTitle: string
+      cloudOrgPickerTitle: string
+      cloudOrgSelect: string
+      cloudOrgChange: string
+      cloudOrgRole: (role: string) => string
+      cloudLoadingAgents: string
+      cloudNoAgents: { before: string; linkText: string; after: string }
+      cloudRefresh: string
+      cloudConnect: string
+      cloudConnecting: string
+      cloudDiscoverFailed: string
+      cloudConnectFailed: string
+      cloudSignInFailed: string
+      cloudSignedOutTitle: string
+      cloudSignedOutMessage: string
+      cloudConnectedTitle: string
+      cloudConnectedPill: string
+      cloudConnectedTo: (name: string) => string
+      cloudAgentProvisioning: string
+      cloudStatusLabel: (status: string) => string
       remoteUrlTitle: string
       remoteUrlDesc: string
       probing: string
@@ -543,6 +599,20 @@ export interface Translations {
       catalogInstallFailed: (name: string) => string
       catalogEnvPrompt: (name: string) => string
       catalogEnvRequired: string
+      capabilitySummary: (tools: number, prompts: number, resources: number) => string
+      statusConnecting: string
+      statusNeedsAuth: string
+      statusError: string
+      statusOff: string
+      allServers: string
+      authenticatedTitle: string
+      authenticatedMessage: (server: string, count: number) => string
+      waitingForBrowser: string
+      authenticate: string
+      unsavedConnect: string
+      enableTool: (tool: string) => string
+      disableTool: (tool: string) => string
+      noOutput: string
     }
     model: {
       loading: string
@@ -561,6 +631,9 @@ export interface Translations {
       change: string
       autoUseMain: string
       providerDefault: string
+      fallbackAdd: string
+      fallbackEmpty: string
+      notInCatalog: string
       tasks: Record<string, AuxTaskCopy>
     }
     providers: {
@@ -584,6 +657,10 @@ export interface Translations {
       noProviderKeys: string
       searchKeys: string
       noKeysMatch: string
+      localEndpoint: {
+        title: string
+        description: string
+      }
       loading: string
     }
     sessions: {
@@ -656,6 +733,7 @@ export interface Translations {
   skills: {
     tabSkills: string
     tabToolsets: string
+    tabMcp: string
     tabHub: string
     all: string
     searchSkills: string
@@ -681,6 +759,26 @@ export interface Translations {
     toolsetDisabled: string
     appliesToNewSessions: (name: string) => string
     failedToUpdate: (name: string) => string
+    sortMostUsed: string
+    sortAlpha: string
+    sortMostUsedDesc: string
+    sortLeastUsedAsc: string
+    enableAll: string
+    disableAll: string
+    disableUnused: string
+    bulkUpdated: (count: number) => string
+    bulkNoChange: string
+    usageCount: (count: number | string) => string
+    provenance: Record<'agent' | 'bundled' | 'hub', string>
+    emptyNoneFound: (noun: string) => string
+    emptyNothingMatches: (query: string) => string
+    emptyNoneAvailable: (noun: string) => string
+    changesApplyNewSessions: string
+    skillUpdated: string
+    edit: string
+    archive: string
+    skillArchivedTitle: string
+    skillArchivedMessage: string
     hub: {
       searchPlaceholder: string
       search: string
@@ -696,6 +794,7 @@ export interface Translations {
       install: string
       installing: string
       uninstall: string
+      uninstalling: string
       updateAll: string
       updating: string
       preview: string
@@ -779,8 +878,7 @@ export interface Translations {
     ageHours: (hours: number) => string
     durationSeconds: (seconds: string) => string
     durationMinutes: (minutes: number, seconds: number) => string
-    tokensK: (k: string) => string
-    tokens: (value: number) => string
+    tokens: (value: number | string) => string
   }
 
   commandCenter: {
@@ -791,6 +889,7 @@ export interface Translations {
     goTo: string
     goToSession: string
     branches: string
+    commands: string
     startInBranch: (branch: string) => string
     commandCenter: string
     appearance: string
@@ -843,6 +942,7 @@ export interface Translations {
     }
     installTheme: {
       title: string
+      pageTitle: string
       placeholder: string
       loading: string
       error: string
@@ -1017,6 +1117,8 @@ export interface Translations {
     env: string
     defaultBadge: string
     rename: string
+    renameMenu: string
+    editSoul: string
     copySetup: string
     copying: string
     modelLabel: string
@@ -1134,7 +1236,10 @@ export interface Translations {
     customPlaceholder: string
     customHint: string
     optional: string
+    promptRequired: string
     promptScheduleRequired: string
+    scheduleRequired: string
+    scriptOnlyEditHint: string
     saveChanges: string
     createAction: string
   }
@@ -1232,6 +1337,9 @@ export interface Translations {
       newWorktreeTitle: string
       newWorktreeDesc: string
       branchPlaceholder: string
+      branchOff: () => { after: string; before: string }
+      baseBranchPlaceholder: string
+      baseBranchNone: string
       startWorkFailed: string
       convertBranch: string
       convertBranchTitle: string
@@ -1267,18 +1375,25 @@ export interface Translations {
       rename: string
       archive: string
       newWindow: string
+      hideTabBar: string
+      openInNewTab: string
+      openInSplit: string
       copyIdFailed: string
       actionsFor: (title: string) => string
       sessionActions: string
       sessionRunning: string
       needsInput: string
       waitingForAnswer: string
+      finishedUnread: string
+      backgroundRunning: string
       handoffOrigin: (platform: string) => string
+      ownedByProfile: (profile: string) => string
       renamed: string
       renameFailed: string
       renameTitle: string
       renameDesc: string
       untitledPlaceholder: string
+      untitledChat: (id: string) => string
       ageNow: string
       ageDay: string
       ageHour: string
@@ -1512,6 +1627,7 @@ export interface Translations {
     recommended: string
     connected: string
     featuredPitch: string
+    fireworksPitch: string
     openRouterPitch: string
     apiKeyOptions: Record<string, { short: string; description: string }>
     backToSignIn: string
@@ -1598,7 +1714,9 @@ export interface Translations {
       low: string
       medium: string
       high: string
+      xhigh: string
       max: string
+      ultra: string
       updateFailed: string
       fastFailed: string
     }
@@ -1616,6 +1734,16 @@ export interface Translations {
       recentActivity: string
       viewAllLogs: string
       messagingPlatforms: string
+    }
+    approvalMode: {
+      title: string
+      ariaLabel: (mode: string) => string
+      manual: string
+      manualDescription: string
+      smart: string
+      smartDescription: string
+      off: string
+      offDescription: string
     }
     statusbar: {
       unknown: string
@@ -1680,6 +1808,7 @@ export interface Translations {
       noModel: string
       switchModel: string
       openModelPicker: string
+      modelPinned: string
       modelTitle: (provider: string, model: string) => string
       providerModelTitle: (provider: string, model: string) => string
     }
@@ -1813,6 +1942,51 @@ export interface Translations {
     }
   }
 
+  zones: {
+    showHeader: string
+    hideHeader: string
+    minimize: string
+    restore: string
+    closeRunningTitle: string
+    closeRunningBody: string
+    closeRunningConfirm: string
+    closeOthers: string
+    closeToRight: string
+    closeAll: string
+    split: (dir: string) => string
+    move: (dir: string) => string
+    dirUp: string
+    dirDown: string
+    dirLeft: string
+    dirRight: string
+    pluginDisabled: (pluginId: string) => string
+    pluginDisabledBody: string
+    missingPane: (paneId: string) => string
+    editTitle: string
+    editHint: string
+    reset: string
+    templates: string
+    custom: string
+    newGridLayout: string
+    saveCurrentAs: string
+    nameLayoutPlaceholder: string
+    deletePreset: (name: string) => string
+    zoneEditorTitle: string
+    editorHintPre: string
+    editorHintPost: string
+    templateColumns: string
+    templateRows: string
+    templateGrid: string
+    templatePriority: string
+    zoneTag: (index: number) => string
+    mergeZones: (count: number) => string
+    customZoneName: (count: number) => string
+    layoutNamePlaceholder: (fallback: string) => string
+    saveApply: string
+    notExpressible: string
+    zoneCount: (count: number) => string
+  }
+
   assistant: {
     thread: {
       loadingSession: string
@@ -1868,6 +2042,7 @@ export interface Translations {
       other: string
       placeholder: string
       skip: string
+      skipped: string
       continueLabel: string
     }
     tool: {

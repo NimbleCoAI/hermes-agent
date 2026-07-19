@@ -81,7 +81,7 @@ def dump_diagnostics(dump_path: Path) -> None:
     regardless of what any individual thread is blocked on.
     """
     dump_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(dump_path, "w") as fh:
+    with open(dump_path, "w", encoding="utf-8") as fh:
         fh.write(
             f"Event loop freeze detected at "
             f"{datetime.now(timezone.utc).isoformat()}\n\n"
