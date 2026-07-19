@@ -16222,6 +16222,125 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return url.rstrip("/")
         return None
 
+    # ------------------------------------------------------------------
+    # Letta brain mode: delegate turns to a bound Letta agent (PROTOTYPE)
+    # ------------------------------------------------------------------
+
+    def _get_letta_brain(self) -> Optional[Dict[str, str]]:
+        """Return {"base_url", "agent_id"} if Letta-brain mode is configured.
+
+        SLICE-0 PROTOTYPE (Swarm Map v1 B1). Mirrors _get_proxy_url's
+        convention: env vars first (LETTA_BRAIN_URL + LETTA_BRAIN_AGENT_ID —
+        convenient for Docker; Swarm Map's deploy path injects these), then
+        ``gateway.letta_brain.{base_url, agent_id}`` in config.yaml.
+        """
+        base_url = os.getenv("LETTA_BRAIN_URL", "").strip()
+        agent_id = os.getenv("LETTA_BRAIN_AGENT_ID", "").strip()
+        if base_url and agent_id:
+            return {"base_url": base_url.rstrip("/"), "agent_id": agent_id}
+        cfg = _load_gateway_config()
+        brain = (cfg.get("gateway") or {}).get("letta_brain") or {}
+        if isinstance(brain, dict):
+            base_url = str(brain.get("base_url") or "").strip()
+            agent_id = str(brain.get("agent_id") or "").strip()
+            if base_url and agent_id:
+                return {"base_url": base_url.rstrip("/"), "agent_id": agent_id}
+        return None
+
+    async def _run_agent_via_letta(
+        self,
+        message: str,
+        source: "SessionSource",
+        session_id: str,
+        history: List[Dict[str, Any]],
+        session_key: str = None,
+        run_generation: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Forward one turn to the bound Letta agent and return its reply.
+
+        SLICE-0 PROTOTYPE. The Hermes gateway remains the messaging door —
+        everything upstream of _run_agent (pairing, group approval, budget,
+        audit) already ran; everything downstream (reply delivery, session
+        persistence) consumes the same result-dict shape as proxy mode.
+
+        Unlike proxy mode we send ONLY the new message: Letta keeps its own
+        conversation state server-side (agents are Postgres rows), so history
+        replay would duplicate context.
+
+        TODO(slice-4): per-agent serialization queue (spec B3), streaming,
+        interrupt handling, media/attachment forwarding.
+        """
+        from gateway.letta_brain import LettaBrainError, send_message as _letta_send
+
+        brain = self._get_letta_brain()
+        if not brain:
+            return {
+                "final_response": "⚠️ Letta brain not configured (LETTA_BRAIN_URL + LETTA_BRAIN_AGENT_ID)",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
+
+        # Typing indicator — best-effort, same as proxy mode.
+        _adapter = self.adapters.get(source.platform)
+        if _adapter:
+            try:
+                await _adapter.send_typing(source.chat_id)
+            except Exception:
+                pass
+
+        _start = time.time()
+        try:
+            reply = await asyncio.to_thread(
+                _letta_send, brain["base_url"], brain["agent_id"], message
+            )
+        except LettaBrainError as e:
+            logger.warning("Letta brain turn failed: %s", e)
+            return {
+                "final_response": f"⚠️ {e}",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
+
+        # Staleness guard (same contract as proxy mode): a newer message for
+        # this session may have superseded this run while we were blocked.
+        if run_generation is not None and session_key and not self._is_session_run_current(
+            session_key, run_generation
+        ):
+            logger.info(
+                "Discarding stale Letta brain result for %s — generation %d is no longer current",
+                session_key or "?",
+                run_generation or 0,
+            )
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+                "history_offset": len(history),
+                "session_id": session_id,
+                "response_previewed": False,
+            }
+
+        logger.info(
+            "letta brain response: url=%s agent=%s session=%s time=%.1fs response=%d chars",
+            brain["base_url"], brain["agent_id"][:16],
+            (session_id or "")[:20], time.time() - _start, len(reply),
+        )
+        return {
+            "final_response": reply or "(No response from Letta brain)",
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": reply},
+            ],
+            "api_calls": 1,
+            "tools": [],
+            "history_offset": len(history),
+            "session_id": session_id,
+            "response_previewed": False,
+        }
+
     async def _run_agent_via_proxy(
         self,
         message: str,
@@ -16606,6 +16725,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        # ---- Letta brain mode (SLICE-0 PROTOTYPE): delegate the turn to a
+        # bound Letta agent over REST. Checked before proxy mode — if both are
+        # configured, the more specific brain binding wins. ----
+        if self._get_letta_brain():
+            return await self._run_agent_via_letta(
+                message=message,
+                source=source,
+                session_id=session_id,
+                history=history,
+                session_key=session_key,
+                run_generation=run_generation,
+            )
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
