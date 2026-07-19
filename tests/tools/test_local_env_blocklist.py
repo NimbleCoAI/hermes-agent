@@ -75,6 +75,25 @@ class TestProviderEnvBlocklist:
         for var in leaked_vars:
             assert var not in result_env, f"{var} leaked into subprocess env"
 
+    def test_github_app_credentials_are_stripped(self):
+        """The GitHub App private key must never reach the tool subprocess.
+
+        Agents auth via short-lived installation tokens minted by a credential
+        helper that reads the key from the agent's .env FILE. If the key leaked
+        into the subprocess env, an agent could mint its own tokens directly and
+        the file-only boundary would be pointless.
+        """
+        leaked_vars = {
+            "GITHUB_APP_ID": "123456",
+            "GITHUB_APP_PRIVATE_KEY_B64": "ZmFrZS1wZW0=",
+            "GITHUB_APP_INSTALLATION_ID": "987654",
+            "GITHUB_TOKEN": "ghp_fake",
+        }
+        result_env = _run_with_env(extra_os_env=leaked_vars)
+
+        for var in leaked_vars:
+            assert var not in result_env, f"{var} leaked into subprocess env"
+
     def test_registry_derived_vars_are_stripped(self):
         """Vars from the provider registry (ANTHROPIC_TOKEN, ZAI_API_KEY, etc.)
         must also be blocked — not just the hand-written extras."""

@@ -308,3 +308,87 @@ def test_gh_provisioned_even_when_git_already_present(tmp_path):
     assert "oauth_token: ghp_secret" in _gh_hosts_path(tmp_path).read_text()
     # git config left untouched (apply-if-absent)
     assert _cfg_path(tmp_path).read_text() == "# pre-existing git setup\n"
+
+
+# ---------------------------------------------------------------------------
+# GitHub App mode — mint-on-demand credential helper instead of a static token
+#
+# When the three GITHUB_APP_* vars are present the agent auths with short-lived
+# installation tokens: .gitconfig points credential.helper at the minting CLI
+# and NO .git-credentials is written (there is no long-lived token to store).
+# Agents still on a PAT must be entirely unaffected.
+# ---------------------------------------------------------------------------
+
+import base64 as _b64
+
+from hermes_cli.git_credentials_boot import build_git_config_content_app
+
+
+def _write_app_env(home: Path, *, extra: str = "") -> None:
+    key_b64 = _b64.b64encode(b"-----BEGIN PRIVATE KEY-----\nfake\n").decode("ascii")
+    _write_env(
+        home,
+        "GITHUB_APP_ID=123456\n"
+        "GITHUB_APP_INSTALLATION_ID=987654\n"
+        f"GITHUB_APP_PRIVATE_KEY_B64={key_b64}\n" + extra,
+    )
+
+
+@pytest.fixture
+def _stub_mint(monkeypatch):
+    """Stub the network mint so boot tests stay offline."""
+    import hermes_cli.git_credentials_boot as boot
+
+    monkeypatch.setattr(boot, "get_installation_token", lambda home, force=False: "ghs_minted")
+
+
+def test_app_mode_writes_helper_gitconfig_not_credentials_file(tmp_path, _stub_mint):
+    _write_app_env(tmp_path)
+
+    result = provision_git_credentials(tmp_path)
+
+    assert result.provisioned is True
+    assert result.source == "GITHUB_APP"
+    cfg = _cfg_path(tmp_path).read_text()
+    assert "hermes_cli.github_app_token get-credential" in cfg
+    assert "helper = store" not in cfg
+    # No long-lived token exists in App mode, so nothing to store.
+    assert not _cred_path(tmp_path).exists()
+
+
+def test_app_mode_writes_gh_hosts_with_minted_token(tmp_path, _stub_mint):
+    _write_app_env(tmp_path)
+    provision_git_credentials(tmp_path)
+    assert "oauth_token: ghs_minted" in _gh_hosts_path(tmp_path).read_text()
+
+
+def test_app_mode_preferred_when_both_app_and_pat_present(tmp_path, _stub_mint):
+    _write_app_env(tmp_path, extra="GITHUB_PAT=ghp_legacy\n")
+
+    result = provision_git_credentials(tmp_path)
+
+    assert result.source == "GITHUB_APP"
+    assert not _cred_path(tmp_path).exists()
+    assert "ghp_legacy" not in _cfg_path(tmp_path).read_text()
+
+
+def test_pat_path_untouched_when_no_app_vars(tmp_path):
+    # Regression: agents still on a PAT keep byte-identical behaviour.
+    _write_env(tmp_path, "GITHUB_PAT=ghp_secret\n")
+
+    result = provision_git_credentials(tmp_path)
+
+    assert result.provisioned is True
+    assert result.source == "GITHUB_PAT"
+    assert "helper = store" in _cfg_path(tmp_path).read_text()
+    assert "ghp_secret" in _cred_path(tmp_path).read_text()
+
+
+def test_build_git_config_content_app_shape():
+    out = build_git_config_content_app(
+        name="cryptids", email="c@example.com", python_exe="/opt/hermes/.venv/bin/python"
+    )
+    # Leading empty helper clears any inherited store helper.
+    assert "\thelper =\n" in out
+    assert '\thelper = "!/opt/hermes/.venv/bin/python -m hermes_cli.github_app_token get-credential"' in out
+    assert "\tname = cryptids" in out
