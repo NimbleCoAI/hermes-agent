@@ -60,7 +60,7 @@ OTHER_CHANNEL_ID = "C9999999999"
 
 
 def _make_adapter(require_mention=None, strict_mention=None, free_response_channels=None,
-                  allowed_channels=None, mention_patterns=None):
+                  allowed_channels=None, mention_patterns=None, channel_policy=None):
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
@@ -72,6 +72,8 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
         extra["allowed_channels"] = allowed_channels
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
+    if channel_policy is not None:
+        extra["channel_policy"] = channel_policy
 
     adapter = object.__new__(SlackAdapter)
     adapter.platform = Platform.SLACK
@@ -273,10 +275,16 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
 
     if not is_one_to_one_dm and bot_uid:
         # allowed_channels check (whitelist — must pass before other gating;
-        # "*" is a wildcard meaning no channel restriction)
+        # "*" is a wildcard meaning no channel restriction). Under the
+        # approved-only policy an EMPTY allowed set means no channels are
+        # approved, so channel messages are dropped (secure default).
         allowed = adapter._slack_allowed_channels()
-        if allowed and "*" not in allowed and channel_id not in allowed:
-            return False
+        policy = adapter._slack_channel_policy()
+        if "*" not in allowed:
+            if allowed and channel_id not in allowed:
+                return False
+            if not allowed and policy == "approved-only":
+                return False
 
         if channel_id in adapter._slack_free_response_channels():
             return True
@@ -816,11 +824,13 @@ def test_allowed_channels_env_var_blocks_channel(monkeypatch):
 _TS_COUNTER = iter(range(1, 10_000))
 
 
-def _make_real_adapter(allowed_channels=None):
+def _make_real_adapter(allowed_channels=None, channel_policy=None):
     """Build a full SlackAdapter (real __init__) with I/O mocked out."""
     extra = {}
     if allowed_channels is not None:
         extra["allowed_channels"] = allowed_channels
+    if channel_policy is not None:
+        extra["channel_policy"] = channel_policy
     config = PlatformConfig(enabled=True, token="xoxb-fake-token", extra=extra)
     adapter = SlackAdapter(config)
     adapter._app = MagicMock()
@@ -907,6 +917,179 @@ def test_would_process_wildcard_allows_any_channel(monkeypatch):
     monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
     adapter = _make_adapter(allowed_channels="*")
     assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, mentioned=True) is True
+
+
+# ---------------------------------------------------------------------------
+# Tests: _slack_channel_policy (SLACK_CHANNEL_POLICY knob)
+# ---------------------------------------------------------------------------
+# The policy knob inverts the meaning of an EMPTY allowed-channels set:
+#   allow-all (default) → empty means "no restriction" (upstream behavior)
+#   approved-only       → empty means "no channels approved" (secure default)
+# It fails OPEN: anything not exactly "approved-only" (case-insensitive) is
+# treated as allow-all, so an unset/garbage value can never silently lock the
+# bot out of every channel.
+
+def test_channel_policy_default_is_allow_all(monkeypatch):
+    monkeypatch.delenv("SLACK_CHANNEL_POLICY", raising=False)
+    adapter = _make_adapter()
+    assert adapter._slack_channel_policy() == "allow-all"
+
+
+def test_channel_policy_approved_only_from_config():
+    adapter = _make_adapter(channel_policy="approved-only")
+    assert adapter._slack_channel_policy() == "approved-only"
+
+
+def test_channel_policy_approved_only_case_insensitive():
+    adapter = _make_adapter(channel_policy="Approved-Only")
+    assert adapter._slack_channel_policy() == "approved-only"
+
+
+def test_channel_policy_env_var_fallback(monkeypatch):
+    monkeypatch.setenv("SLACK_CHANNEL_POLICY", "approved-only")
+    adapter = _make_adapter()  # no config value → falls back to env
+    assert adapter._slack_channel_policy() == "approved-only"
+
+
+def test_channel_policy_config_takes_precedence_over_env(monkeypatch):
+    monkeypatch.setenv("SLACK_CHANNEL_POLICY", "approved-only")
+    adapter = _make_adapter(channel_policy="allow-all")
+    assert adapter._slack_channel_policy() == "allow-all"
+
+
+def test_channel_policy_unknown_value_fails_open(monkeypatch):
+    monkeypatch.delenv("SLACK_CHANNEL_POLICY", raising=False)
+    adapter = _make_adapter(channel_policy="whatever")
+    assert adapter._slack_channel_policy() == "allow-all"
+
+
+def test_channel_policy_empty_string_is_allow_all(monkeypatch):
+    monkeypatch.delenv("SLACK_CHANNEL_POLICY", raising=False)
+    adapter = _make_adapter(channel_policy="")
+    assert adapter._slack_channel_policy() == "allow-all"
+
+
+# ---------------------------------------------------------------------------
+# Tests: approved-only policy gating (the inverted-empty-set bug fix)
+# ---------------------------------------------------------------------------
+
+def test_allow_all_empty_list_not_filtered(monkeypatch):
+    """(a) Default/unset policy + empty allowed list → NOT filtered (backward
+    compat: empty means no restriction under allow-all)."""
+    monkeypatch.delenv("SLACK_CHANNEL_POLICY", raising=False)
+    adapter = _make_adapter(allowed_channels="")
+    assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, mentioned=True) is True
+
+
+def test_approved_only_empty_list_channel_ignored():
+    """(b) approved-only + empty allowed list + channel message → ignored."""
+    adapter = _make_adapter(channel_policy="approved-only", allowed_channels="")
+    assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, mentioned=True) is False
+
+
+def test_approved_only_non_empty_list_only_listed_pass():
+    """(c) approved-only + non-empty list → only listed channels pass."""
+    adapter = _make_adapter(channel_policy="approved-only",
+                            allowed_channels=[CHANNEL_ID])
+    assert _would_process(adapter, channel_id=CHANNEL_ID, mentioned=True) is True
+    assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, mentioned=True) is False
+
+
+def test_wildcard_means_all_under_allow_all(monkeypatch):
+    """(d) '*' still means all channels under allow-all."""
+    monkeypatch.delenv("SLACK_CHANNEL_POLICY", raising=False)
+    adapter = _make_adapter(allowed_channels="*")
+    assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, mentioned=True) is True
+
+
+def test_wildcard_means_all_under_approved_only():
+    """(d) '*' still means all channels even under approved-only."""
+    adapter = _make_adapter(channel_policy="approved-only", allowed_channels="*")
+    assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, mentioned=True) is True
+
+
+def test_approved_only_dm_never_filtered():
+    """(e) DMs are never filtered regardless of policy (existing invariant)."""
+    adapter = _make_adapter(channel_policy="approved-only", allowed_channels="")
+    assert _would_process(adapter, is_dm=True, channel_id="DDMCHANNEL") is True
+
+
+def test_allow_all_empty_list_env_var_not_filtered(monkeypatch):
+    """allow-all via env var (default) + empty list → not filtered."""
+    monkeypatch.setenv("SLACK_CHANNEL_POLICY", "allow-all")
+    monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+    adapter = _make_adapter(allowed_channels="")
+    assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, mentioned=True) is True
+
+
+def test_approved_only_empty_list_env_var_channel_ignored(monkeypatch):
+    """approved-only via env var + empty list → channel ignored."""
+    monkeypatch.setenv("SLACK_CHANNEL_POLICY", "approved-only")
+    monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+    adapter = _make_adapter(allowed_channels="")
+    assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, mentioned=True) is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: approved-only real-handler behavior + distinguishable drop log
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_approved_only_empty_real_handler_drops(monkeypatch):
+    """Real _handle_slack_message: approved-only + empty allowlist drops the
+    channel message (no handle_message call)."""
+    monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+    monkeypatch.delenv("SLACK_CHANNEL_POLICY", raising=False)
+    adapter = _make_real_adapter(channel_policy="approved-only")
+    await adapter._handle_slack_message(_channel_event(OTHER_CHANNEL_ID))
+    adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_allow_all_empty_real_handler_passes(monkeypatch):
+    """Real _handle_slack_message: default allow-all + empty allowlist still
+    responds (backward compatibility preserved)."""
+    monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+    monkeypatch.delenv("SLACK_CHANNEL_POLICY", raising=False)
+    adapter = _make_real_adapter()
+    await adapter._handle_slack_message(_channel_event(OTHER_CHANNEL_ID))
+    adapter.handle_message.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_approved_only_drop_log_distinguishable(monkeypatch, caplog):
+    """The approved-only empty-policy drop must be logged distinguishably from
+    the ordinary whitelist drop, at INFO or higher (operational need: the
+    regression went unnoticed for days)."""
+    monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+    monkeypatch.delenv("SLACK_CHANNEL_POLICY", raising=False)
+    adapter = _make_real_adapter(channel_policy="approved-only")
+    with caplog.at_level(logging.DEBUG, logger="plugins.platforms.slack.adapter"):
+        await adapter._handle_slack_message(_channel_event(OTHER_CHANNEL_ID))
+    adapter.handle_message.assert_not_called()
+    policy_records = [
+        r for r in caplog.records
+        if "approved-only" in r.getMessage() and OTHER_CHANNEL_ID in r.getMessage()
+    ]
+    assert policy_records, "approved-only drop was not logged distinguishably"
+    assert all(r.levelno >= logging.INFO for r in policy_records), (
+        "approved-only drop logged below INFO — invisible at default log level"
+    )
+    # Must NOT reuse the ordinary whitelist message (which claims the list is
+    # "active" — misleading when the list is actually empty).
+    assert not any(
+        "whitelist active" in r.getMessage() for r in policy_records
+    ), "approved-only drop reused the whitelist-active message (indistinguishable)"
+
+
+@pytest.mark.asyncio
+async def test_approved_only_wildcard_real_handler_passes(monkeypatch):
+    """approved-only + '*' still lets any channel through (wildcard override)."""
+    monkeypatch.delenv("SLACK_ALLOWED_CHANNELS", raising=False)
+    monkeypatch.delenv("SLACK_CHANNEL_POLICY", raising=False)
+    adapter = _make_real_adapter(allowed_channels="*", channel_policy="approved-only")
+    await adapter._handle_slack_message(_channel_event(OTHER_CHANNEL_ID))
+    adapter.handle_message.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
