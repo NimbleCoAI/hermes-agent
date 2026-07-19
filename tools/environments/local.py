@@ -203,6 +203,7 @@ def _build_provider_env_blocklist() -> frozenset:
         "GH_TOKEN",
         "GITHUB_APP_ID",
         "GITHUB_APP_PRIVATE_KEY_PATH",
+        "GITHUB_APP_PRIVATE_KEY_B64",
         "GITHUB_APP_INSTALLATION_ID",
         "MODAL_TOKEN_ID",
         "MODAL_TOKEN_SECRET",
@@ -402,6 +403,9 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "GITHUB_TOKEN",
     "GITHUB_APP_ID",
     "GITHUB_APP_PRIVATE_KEY_PATH",
+    # The base64 PEM: the credential helper reads it from the agent's .env FILE,
+    # never from env, so the raw key must never reach the tool subprocess.
+    "GITHUB_APP_PRIVATE_KEY_B64",
     "GITHUB_APP_INSTALLATION_ID",
     # Gateway / messaging bot tokens and access control
     "TELEGRAM_BOT_TOKEN",

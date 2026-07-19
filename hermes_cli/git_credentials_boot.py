@@ -29,9 +29,12 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from hermes_cli.github_app_token import get_installation_token, read_app_credentials
 
 GIT_HOST = "github.com"
 
@@ -55,6 +58,36 @@ def build_git_config_content(*, name: str, email: str) -> str:
         [
             "[credential]",
             "\thelper = store",
+            "[user]",
+            f"\tname = {name}",
+            f"\temail = {email}",
+            f'[url "https://{GIT_HOST}/"]',
+            f"\tinsteadOf = git@{GIT_HOST}:",
+            f"\tinsteadOf = ssh://git@{GIT_HOST}/",
+            "",
+        ]
+    )
+
+
+def build_git_config_content_app(
+    *, name: str, email: str, python_exe: str, module: str = "hermes_cli.github_app_token"
+) -> str:
+    """``~/.gitconfig`` for GitHub App mode — mint-on-demand instead of ``store``.
+
+    A GitHub App installation token lives ~1h, so it cannot be written once at
+    boot the way a PAT is. Instead git calls this helper on every
+    ``credential fill``; the helper returns a cached token or mints a fresh one.
+    Always-fresh auth with no daemon and no token at rest in ``.git-credentials``.
+
+    The bare ``helper =`` line first RESETS the helper list, so an inherited
+    ``store`` (e.g. from a previous PAT-mode provisioning) can't answer first
+    with a stale token.
+    """
+    return "\n".join(
+        [
+            "[credential]",
+            "\thelper =",
+            f'\thelper = "!{python_exe} -m {module} get-credential"',
             "[user]",
             f"\tname = {name}",
             f"\temail = {email}",
@@ -139,11 +172,6 @@ def provision_git_credentials(
     Apply-if-absent: never clobbers an existing ``.git-credentials`` /
     ``.gitconfig`` (e.g. an imported agent's own setup) unless ``force``.
     """
-    found = _read_env_token(home_dir / ".env")
-    if found is None:
-        return ProvisionResult(home_dir, False, reason="no GitHub token configured")
-    token, source = found
-
     subprocess_home = home_dir / "home"
     cred_path = subprocess_home / ".git-credentials"
     cfg_path = subprocess_home / ".gitconfig"
@@ -151,6 +179,25 @@ def provision_git_credentials(
 
     resolved_name = name or home_dir.name
     resolved_email = email or f"{resolved_name}@users.noreply.github.com"
+
+    # GitHub App mode takes precedence over a static PAT: an org-owned App is
+    # the credential we want winning wherever both are configured (an agent
+    # mid-migration may still carry its legacy PAT in .env).
+    if read_app_credentials(home_dir / ".env") is not None:
+        return _provision_app_mode(
+            home_dir,
+            subprocess_home=subprocess_home,
+            cfg_path=cfg_path,
+            gh_hosts_path=gh_hosts_path,
+            name=resolved_name,
+            email=resolved_email,
+            force=force,
+        )
+
+    found = _read_env_token(home_dir / ".env")
+    if found is None:
+        return ProvisionResult(home_dir, False, reason="no GitHub token configured")
+    token, source = found
 
     # git and gh are provisioned INDEPENDENTLY (apply-if-absent each). An agent
     # provisioned by an older build has git set up but no gh hosts.yml — gating
@@ -179,6 +226,61 @@ def provision_git_credentials(
             source=source,
         )
     return ProvisionResult(home_dir, True, reason="wrote " + "+".join(wrote), source=source)
+
+
+def _provision_app_mode(
+    home_dir: Path,
+    *,
+    subprocess_home: Path,
+    cfg_path: Path,
+    gh_hosts_path: Path,
+    name: str,
+    email: str,
+    force: bool,
+) -> ProvisionResult:
+    """Provision GitHub App auth: helper-based ``.gitconfig`` + boot-fresh ``gh``.
+
+    No ``.git-credentials`` is written — in App mode there is no long-lived
+    token to store; git mints one per ``credential fill``. ``gh`` reads a static
+    ``hosts.yml`` and has no credential-helper hook, so it gets one token minted
+    at boot (documented tradeoff: ``gh`` is boot-fresh, ``git`` is always-fresh).
+    """
+    wrote: list[str] = []
+
+    if force or not cfg_path.exists():
+        subprocess_home.mkdir(parents=True, exist_ok=True)
+        _write_file(
+            cfg_path,
+            build_git_config_content_app(
+                name=name, email=email, python_exe=sys.executable
+            ),
+            mode=0o644,
+        )
+        wrote.append("git(app)")
+
+    if force or not gh_hosts_path.exists():
+        # Best-effort: a mint failure (network, bad key) must not break boot —
+        # git still works via the helper, which retries on every invocation.
+        try:
+            token = get_installation_token(home_dir, force=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            token = None
+            print(f"git-credentials: gh token mint failed ({exc})")
+        if token:
+            gh_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_file(gh_hosts_path, build_gh_hosts_content(token), mode=0o600)
+            wrote.append("gh")
+
+    if not wrote:
+        return ProvisionResult(
+            home_dir,
+            False,
+            reason="git+gh already present (pass force to overwrite)",
+            source="GITHUB_APP",
+        )
+    return ProvisionResult(
+        home_dir, True, reason="wrote " + "+".join(wrote), source="GITHUB_APP"
+    )
 
 
 def _write_file(path: Path, content: str, *, mode: int) -> None:
