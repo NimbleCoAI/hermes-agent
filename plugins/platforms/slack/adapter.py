@@ -3379,19 +3379,30 @@ class SlackAdapter(BasePlatformAdapter):
             # (whitelist).  "*" is a wildcard meaning no channel restriction,
             # matching the Signal group allowlist and the documented contract.
             allowed_channels = self._slack_allowed_channels()
-            if (
-                allowed_channels
-                and "*" not in allowed_channels
-                and channel_id not in allowed_channels
-            ):
-                # INFO, not debug: a silent drop here is undiagnosable at the
-                # default log level (issue #69 — cost an hour of live debugging).
-                logger.info(
-                    "[Slack] Ignoring message in non-allowed channel: %s "
-                    "(SLACK_ALLOWED_CHANNELS whitelist active)",
-                    channel_id,
-                )
-                return
+            channel_policy = self._slack_channel_policy()
+            if "*" not in allowed_channels:
+                if allowed_channels and channel_id not in allowed_channels:
+                    # INFO, not debug: a silent drop here is undiagnosable at the
+                    # default log level (issue #69 — cost an hour of live debugging).
+                    logger.info(
+                        "[Slack] Ignoring message in non-allowed channel: %s "
+                        "(SLACK_ALLOWED_CHANNELS whitelist active)",
+                        channel_id,
+                    )
+                    return
+                if not allowed_channels and channel_policy == "approved-only":
+                    # Distinct from the whitelist-active drop above: here the
+                    # allowed list is EMPTY and the policy is approved-only, so
+                    # NO channels are approved. A prior regression (empty list
+                    # meant "respond everywhere") went unnoticed for days — this
+                    # message names the exact cause so it is diagnosable at INFO.
+                    logger.info(
+                        "[Slack] Ignoring message in channel %s: no channels "
+                        "approved (SLACK_CHANNEL_POLICY=approved-only with empty "
+                        "SLACK_ALLOWED_CHANNELS)",
+                        channel_id,
+                    )
+                    return
 
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
@@ -4860,6 +4871,32 @@ class SlackAdapter(BasePlatformAdapter):
         if isinstance(raw, str) and raw.strip():
             return {part.strip() for part in raw.split(",") if part.strip()}
         return set()
+
+    def _slack_channel_policy(self) -> str:
+        """Return the channel gating policy: ``"approved-only"`` or ``"allow-all"``.
+
+        This knob inverts the meaning of an EMPTY ``SLACK_ALLOWED_CHANNELS`` set:
+
+        * ``allow-all`` (DEFAULT) — an empty allowed set means NO restriction
+          (respond everywhere, subject to mention-gating). This preserves the
+          historical upstream behavior and is fully backward compatible.
+        * ``approved-only`` — an empty allowed set means NO channels are approved
+          (respond in NONE); a non-empty list gates to exactly those channels; a
+          literal ``*`` still means all channels. This is the secure default the
+          management UI (HSM) writes when an operator has an approved-channels
+          policy but no channels selected yet.
+
+        Fails OPEN on the knob itself: anything that isn't exactly
+        ``approved-only`` (case-insensitive) falls back to ``allow-all``, so a
+        misconfigured/garbage value can never silently lock the bot out of every
+        channel. Note the channel LIST still gates as before regardless.
+        """
+        configured = self.config.extra.get("channel_policy")
+        if configured is None:
+            configured = os.getenv("SLACK_CHANNEL_POLICY", "")
+        if isinstance(configured, str) and configured.strip().lower() == "approved-only":
+            return "approved-only"
+        return "allow-all"
 
     def _slack_mention_patterns(self) -> List["re.Pattern"]:
         """Compile optional regex wake-word patterns for channel triggers.
