@@ -16289,10 +16289,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
+        # B1.5 door-context: a shared Letta brain sees only the message text, so
+        # tag it with who is speaking and (for multiplayer) which group. DMs get
+        # only the sender; group/channel/thread contexts also get a group label
+        # (prefer the human-readable chat_name, fall back to type:id). NOT a full
+        # transcript — just current-turn identity (spec B1.5).
+        _sender = source.user_name or None
+        _group = None
+        if source.chat_type and source.chat_type != "dm":
+            _group = source.chat_name or f"{source.chat_type}:{source.chat_id}"
+
         _start = time.time()
         try:
             reply = await asyncio.to_thread(
-                _letta_send, brain["base_url"], brain["agent_id"], message
+                _letta_send,
+                brain["base_url"],
+                brain["agent_id"],
+                message,
+                sender=_sender,
+                group=_group,
             )
         except LettaBrainError as e:
             logger.warning("Letta brain turn failed: %s", e)
