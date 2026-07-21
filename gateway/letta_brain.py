@@ -39,6 +39,41 @@ class LettaBrainError(Exception):
     """Raised when the Letta round-trip fails. Message is user-displayable."""
 
 
+def build_sender_tag(
+    sender: Optional[str] = None, group: Optional[str] = None
+) -> str:
+    """Build the compact door-context tag for a shared Letta brain (B1.5).
+
+    A shared Letta agent serves many senders across many groups but, over REST,
+    sees only the message text — Letta owns its own server-side history, so the
+    rich per-turn context the native loop builds never reaches it. Without a tag
+    the brain can't tell WHO is speaking or WHICH group it's in, and multiplayer
+    is broken. We prepend a one-line structured tag; Letta's history then
+    accumulates identity naturally, turn over turn.
+
+    Current sender + group label ONLY — deliberately NOT group transcripts
+    (spec B1.5). Returns "" when neither is known (so tagging is a no-op).
+
+    Validated live 2026-07-21: given ``[from Alice in #family] ...``, a
+    self-hosted Letta agent replied "Alice is messaging me from the group
+    #family." — the brain extracts both facts from the inline tag.
+    """
+    parts = []
+    if sender:
+        parts.append(f"from {sender}")
+    if group:
+        parts.append(f"in {group}")
+    return f"[{' '.join(parts)}]" if parts else ""
+
+
+def apply_sender_tag(
+    text: str, sender: Optional[str] = None, group: Optional[str] = None
+) -> str:
+    """Prepend the door-context tag to a message (no-op when no identity known)."""
+    tag = build_sender_tag(sender, group)
+    return f"{tag}\n{text}" if tag else text
+
+
 def _extract_assistant_text(payload: dict) -> Optional[str]:
     """Pull assistant_message content out of a Letta turn response.
 
@@ -69,16 +104,24 @@ def send_message(
     agent_id: str,
     text: str,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    sender: Optional[str] = None,
+    group: Optional[str] = None,
 ) -> str:
     """Send one user message to a Letta agent; return the assistant reply text.
 
     Blocking (urllib). Raises LettaBrainError with a clear, user-displayable
     message on any failure. Letta keeps its own conversation state server-side,
     so only the new message is sent — no history replay.
+
+    ``sender``/``group`` add the B1.5 door-context tag so a shared brain knows
+    who is speaking and where (see build_sender_tag). The URL has NO trailing
+    slash: ``/messages/`` 307-redirects and the POST body is dropped on the
+    redirect (confirmed live 2026-07-21).
     """
     url = f"{base_url.rstrip('/')}/v1/agents/{agent_id}/messages"
+    content = apply_sender_tag(text, sender, group)
     body = json.dumps(
-        {"messages": [{"role": "user", "content": text}]}
+        {"messages": [{"role": "user", "content": content}]}
     ).encode("utf-8")
     req = urllib.request.Request(
         url,
