@@ -237,9 +237,15 @@ def main(argv: Optional[list] = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     gc = sub.add_parser("get-credential", help="emit git credential-helper output")
     gc.add_argument("--home", type=Path, default=None)
+    # git invokes a credential helper as ``<helper> <operation>`` where operation
+    # is get/store/erase. Accept and ignore that trailing arg — without it argparse
+    # errors ("unrecognized arguments: get") and git can never read the credential.
+    gc.add_argument("op", nargs="?", default="get")
     args = parser.parse_args(argv)
 
     if args.cmd == "get-credential":
+        if args.op not in (None, "get"):
+            return 0  # store/erase are no-ops for a mint-on-demand helper
         home = args.home or _default_home()
         token = get_installation_token(home)
         if not token:

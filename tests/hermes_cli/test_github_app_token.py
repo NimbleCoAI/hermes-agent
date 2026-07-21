@@ -243,3 +243,24 @@ def test_get_credential_stdout_format(app_env, monkeypatch, capsys):
     assert "username=x-access-token\n" in out
     assert "password=ghs_helper\n" in out
     assert out.endswith("\n\n")
+
+
+def test_get_credential_accepts_git_get_operation(app_env, monkeypatch, capsys):
+    # git invokes the helper as `<helper> get` — the trailing operation must not
+    # crash argparse (regression: "unrecognized arguments: get").
+    monkeypatch.setattr(gat, "get_installation_token", lambda home, force=False: "ghs_helper")
+    rc = gat.main(["get-credential", "--home", str(app_env), "get"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "password=ghs_helper\n" in out
+
+
+def test_get_credential_store_and_erase_are_noops(app_env, monkeypatch, capsys):
+    # store/erase carry no output and must never mint.
+    def boom(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("mint attempted on store/erase")
+
+    monkeypatch.setattr(gat, "get_installation_token", boom)
+    for op in ("store", "erase"):
+        assert gat.main(["get-credential", "--home", str(app_env), op]) == 0
+        assert capsys.readouterr().out == ""
