@@ -17690,29 +17690,140 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
     # ------------------------------------------------------------------
-    # Letta brain mode: delegate turns to a bound Letta agent (PROTOTYPE)
+    # Letta brain mode: delegate turns to a bound Letta agent (Swarm Map v1 B1)
     # ------------------------------------------------------------------
 
     def _get_letta_brain(self) -> Optional[Dict[str, str]]:
-        """Return {"base_url", "agent_id"} if Letta-brain mode is configured.
+        """Return {"base_url", "agent_id", "api_key"} if Letta-brain mode is
+        configured (api_key may be "" for unsecured self-hosted servers).
 
-        SLICE-0 PROTOTYPE (Swarm Map v1 B1). Mirrors _get_proxy_url's
-        convention: env vars first (LETTA_BRAIN_URL + LETTA_BRAIN_AGENT_ID —
-        convenient for Docker; Swarm Map's deploy path injects these), then
-        ``gateway.letta_brain.{base_url, agent_id}`` in config.yaml.
+        Mirrors _get_proxy_url's convention: env vars first (LETTA_BRAIN_URL +
+        LETTA_BRAIN_AGENT_ID + optional LETTA_BRAIN_API_KEY — convenient for
+        Docker; Swarm Map's deploy path injects these), then
+        ``gateway.letta_brain.{base_url, agent_id, api_key}`` in config.yaml.
         """
+        env_key = os.getenv("LETTA_BRAIN_API_KEY", "").strip()
         base_url = os.getenv("LETTA_BRAIN_URL", "").strip()
         agent_id = os.getenv("LETTA_BRAIN_AGENT_ID", "").strip()
         if base_url and agent_id:
-            return {"base_url": base_url.rstrip("/"), "agent_id": agent_id}
+            return {
+                "base_url": base_url.rstrip("/"),
+                "agent_id": agent_id,
+                "api_key": env_key,
+            }
         cfg = _load_gateway_config()
         brain = (cfg.get("gateway") or {}).get("letta_brain") or {}
         if isinstance(brain, dict):
             base_url = str(brain.get("base_url") or "").strip()
             agent_id = str(brain.get("agent_id") or "").strip()
             if base_url and agent_id:
-                return {"base_url": base_url.rstrip("/"), "agent_id": agent_id}
+                return {
+                    "base_url": base_url.rstrip("/"),
+                    "agent_id": agent_id,
+                    "api_key": str(brain.get("api_key") or "").strip() or env_key,
+                }
         return None
+
+    def _letta_agent_lock(self, agent_key: str) -> "asyncio.Lock":
+        """Per-Letta-agent serialization lock (spec B3).
+
+        Letta processes an agent's messages sequentially — concurrent group
+        messages must queue, never overlap in flight. One lock per bound
+        agent (keyed base_url|agent_id), created lazily.
+        """
+        locks = getattr(self, "_letta_brain_locks", None)
+        if locks is None:
+            locks = {}
+            self._letta_brain_locks = locks
+        lock = locks.get(agent_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[agent_key] = lock
+        return lock
+
+    def _setup_platform_stream_consumer(
+        self,
+        source: "SessionSource",
+        event_message_id: Optional[str],
+        run_still_current,
+    ):
+        """Build the platform stream consumer the remote-brain modes share.
+
+        Extracted verbatim from proxy mode so Letta-brain mode reuses the same
+        platform nuances (Telegram typing-pause + fresh-final, Matrix
+        buffer-only, edit-capability detection). Returns
+        ``(consumer_or_None, thread_metadata)`` — consumer is None when
+        streaming is disabled for the platform or setup fails (callers fall
+        back to non-streamed delivery).
+        """
+        _stream_consumer = None
+        _scfg = getattr(getattr(self, "config", None), "streaming", None)
+        if _scfg is None:
+            from gateway.config import StreamingConfig
+            _scfg = StreamingConfig()
+
+        platform_key = _platform_config_key(source.platform)
+        user_config = _load_gateway_config()
+        from gateway.display_config import resolve_display_setting
+        _plat_streaming = resolve_display_setting(
+            user_config, platform_key, "streaming"
+        )
+        _streaming_enabled = (
+            _scfg.enabled and _scfg.transport != "off"
+            if _plat_streaming is None
+            else bool(_plat_streaming)
+        )
+
+        _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
+
+        if _streaming_enabled:
+            try:
+                from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                _adapter = self._adapter_for_source(source)
+                if _adapter:
+                    _pause_typing_before_finalize = None
+                    if source.platform == Platform.TELEGRAM and hasattr(_adapter, "pause_typing_for_chat"):
+                        def _pause_typing_before_finalize(
+                            _adapter=_adapter,
+                            _chat_id=source.chat_id,
+                        ) -> None:
+                            _adapter.pause_typing_for_chat(_chat_id)
+                    _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
+                    _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
+                    _buffer_only = False
+                    if source.platform == Platform.MATRIX:
+                        _effective_cursor = ""
+                        _buffer_only = True
+                    # Fresh-final applies to Telegram only — other
+                    # platforms either edit in place cheaply (Discord,
+                    # Slack) or don't have the timestamp-on-edit
+                    # problem.  (Ported from openclaw/openclaw#72038.)
+                    _fresh_final_secs = (
+                        float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
+                        if source.platform == Platform.TELEGRAM
+                        else 0.0
+                    )
+                    _consumer_cfg = StreamConsumerConfig(
+                        edit_interval=_scfg.edit_interval,
+                        buffer_threshold=_scfg.buffer_threshold,
+                        cursor=_effective_cursor,
+                        buffer_only=_buffer_only,
+                        fresh_final_after_seconds=_fresh_final_secs,
+                        transport=_scfg.transport or "edit",
+                        chat_type=getattr(source, "chat_type", "") or "",
+                    )
+                    _stream_consumer = GatewayStreamConsumer(
+                        adapter=_adapter,
+                        chat_id=source.chat_id,
+                        config=_consumer_cfg,
+                        metadata=_thread_metadata,
+                        on_before_finalize=_pause_typing_before_finalize,
+                        initial_reply_to_id=event_message_id,
+                        run_still_current=run_still_current,
+                    )
+            except Exception as _sc_err:
+                logger.debug("Remote-brain: could not set up stream consumer: %s", _sc_err)
+        return _stream_consumer, _thread_metadata
 
     async def _run_agent_via_letta(
         self,
@@ -17722,22 +17833,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         history: List[Dict[str, Any]],
         session_key: str = None,
         run_generation: Optional[int] = None,
+        event_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward one turn to the bound Letta agent and return its reply.
 
-        SLICE-0 PROTOTYPE. The Hermes gateway remains the messaging door —
-        everything upstream of _run_agent (pairing, group approval, budget,
-        audit) already ran; everything downstream (reply delivery, session
-        persistence) consumes the same result-dict shape as proxy mode.
+        Swarm Map v1 B1 — the Hermes-front bridge. The Hermes gateway remains
+        the messaging door — everything upstream of _run_agent (pairing, group
+        approval, budget, audit) already ran; everything downstream (reply
+        delivery, session persistence) consumes the same result-dict shape as
+        proxy mode.
 
         Unlike proxy mode we send ONLY the new message: Letta keeps its own
         conversation state server-side (agents are Postgres rows), so history
         replay would duplicate context.
 
-        TODO(slice-4): per-agent serialization queue (spec B3), streaming,
-        interrupt handling, media/attachment forwarding.
+        Turns are serialized per bound Letta agent (spec B3): Letta processes
+        an agent's messages sequentially, so concurrent group messages queue
+        on a per-agent lock rather than overlapping in flight. When the
+        platform supports it the reply streams from Letta's SSE endpoint
+        through the same GatewayStreamConsumer proxy mode uses; the
+        live-validated blocking client is the fallback, taken only when the
+        stream provably failed pre-delivery (LettaBrainError.retryable — a
+        blind retry would make the brain process the turn twice).
+        LETTA_BRAIN_STREAMING=off forces the blocking path.
         """
-        from gateway.letta_brain import LettaBrainError, send_message as _letta_send
+        from gateway.letta_brain import (
+            LettaBrainError,
+            send_message as _letta_send,
+            stream_message as _letta_stream,
+        )
 
         brain = self._get_letta_brain()
         if not brain:
@@ -17747,14 +17871,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "api_calls": 0,
                 "tools": [],
             }
+        _api_key = brain.get("api_key") or None
 
-        # Typing indicator — best-effort, same as proxy mode.
-        _adapter = self.adapters.get(source.platform)
-        if _adapter:
-            try:
-                await _adapter.send_typing(source.chat_id)
-            except Exception:
-                pass
+        def _run_still_current() -> bool:
+            if run_generation is None or not session_key:
+                return True
+            return self._is_session_run_current(session_key, run_generation)
+
+        def _stale_result(where: str) -> Dict[str, Any]:
+            logger.info(
+                "Discarding stale Letta brain turn (%s) for %s — generation %d is no longer current",
+                where, session_key or "?", run_generation or 0,
+            )
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+                "history_offset": len(history),
+                "session_id": session_id,
+                "response_previewed": False,
+            }
 
         # B1.5 door-context: a shared Letta brain sees only the message text, so
         # tag it with who is speaking and (for multiplayer) which group. DMs get
@@ -17767,51 +17904,118 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _group = source.chat_name or f"{source.chat_type}:{source.chat_id}"
 
         _start = time.time()
-        try:
-            reply = await asyncio.to_thread(
-                _letta_send,
-                brain["base_url"],
-                brain["agent_id"],
-                message,
-                sender=_sender,
-                group=_group,
-            )
-        except LettaBrainError as e:
-            logger.warning("Letta brain turn failed: %s", e)
-            return {
-                "final_response": f"⚠️ {e}",
-                "messages": [],
-                "api_calls": 0,
-                "tools": [],
-            }
+        _lock = self._letta_agent_lock(f"{brain['base_url']}|{brain['agent_id']}")
+        async with _lock:
+            # B3: a newer message for this session may have superseded this
+            # run while it queued behind another turn for the same agent.
+            if not _run_still_current():
+                return _stale_result("queued")
+
+            # Platform stream consumer — same machinery as proxy mode. Fully
+            # defensive: any setup failure just means no streaming this turn.
+            _stream_consumer = None
+            _thread_metadata = None
+            _streaming_pref = os.getenv("LETTA_BRAIN_STREAMING", "").strip().lower()
+            if _streaming_pref not in {"off", "0", "false", "no"}:
+                try:
+                    _stream_consumer, _thread_metadata = (
+                        self._setup_platform_stream_consumer(
+                            source, event_message_id, _run_still_current
+                        )
+                    )
+                except Exception as _sc_err:
+                    logger.debug("Letta brain: stream consumer unavailable: %s", _sc_err)
+
+            # Typing indicator — best-effort, same as proxy mode.
+            _adapter = self.adapters.get(source.platform)
+            if _adapter:
+                try:
+                    await _adapter.send_typing(source.chat_id)
+                except Exception:
+                    pass
+
+            reply: Optional[str] = None
+            streamed = False
+            if _stream_consumer is not None:
+                stream_task = asyncio.create_task(_stream_consumer.run())
+                _partial = ""
+                try:
+                    async for _delta in _letta_stream(
+                        brain["base_url"],
+                        brain["agent_id"],
+                        message,
+                        sender=_sender,
+                        group=_group,
+                        api_key=_api_key,
+                    ):
+                        if not _run_still_current():
+                            return _stale_result("mid-stream")
+                        _partial += _delta
+                        _stream_consumer.on_delta(_delta)
+                    reply = _partial
+                    streamed = bool(_partial)
+                except LettaBrainError as e:
+                    if _partial:
+                        # Text already reached the platform — deliver the
+                        # partial rather than retrying (double-turn risk).
+                        logger.warning(
+                            "Letta brain stream broke mid-turn (%s); delivering partial", e
+                        )
+                        reply = _partial
+                        streamed = True
+                    elif e.retryable:
+                        logger.info(
+                            "Letta brain streaming unavailable (%s); falling back to blocking client", e
+                        )
+                    else:
+                        logger.warning("Letta brain stream turn failed: %s", e)
+                        return {
+                            "final_response": f"⚠️ {e}",
+                            "messages": [],
+                            "api_calls": 0,
+                            "tools": [],
+                        }
+                finally:
+                    _stream_consumer.finish()
+                    try:
+                        await asyncio.wait_for(stream_task, timeout=5.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        stream_task.cancel()
+
+            if reply is None:
+                try:
+                    reply = await asyncio.to_thread(
+                        _letta_send,
+                        brain["base_url"],
+                        brain["agent_id"],
+                        message,
+                        sender=_sender,
+                        group=_group,
+                        api_key=_api_key,
+                    )
+                except LettaBrainError as e:
+                    logger.warning("Letta brain turn failed: %s", e)
+                    return {
+                        "final_response": f"⚠️ {e}",
+                        "messages": [],
+                        "api_calls": 0,
+                        "tools": [],
+                    }
 
         # Staleness guard (same contract as proxy mode): a newer message for
         # this session may have superseded this run while we were blocked.
-        if run_generation is not None and session_key and not self._is_session_run_current(
-            session_key, run_generation
-        ):
-            logger.info(
-                "Discarding stale Letta brain result for %s — generation %d is no longer current",
-                session_key or "?",
-                run_generation or 0,
-            )
-            return {
-                "final_response": "",
-                "messages": [],
-                "api_calls": 0,
-                "tools": [],
-                "history_offset": len(history),
-                "session_id": session_id,
-                "response_previewed": False,
-            }
+        if not _run_still_current():
+            return _stale_result("post-turn")
 
         logger.info(
-            "letta brain response: url=%s agent=%s session=%s time=%.1fs response=%d chars",
+            "letta brain response: url=%s agent=%s session=%s time=%.1fs response=%d chars streamed=%s",
             brain["base_url"], brain["agent_id"][:16],
-            (session_id or "")[:20], time.time() - _start, len(reply),
+            (session_id or "")[:20], time.time() - _start, len(reply), streamed,
         )
+        # An empty reply is a legitimate tool-only turn (the brain acted but
+        # chose not to speak) — deliver nothing rather than an error string.
         return {
-            "final_response": reply or "(No response from Letta brain)",
+            "final_response": reply,
             "messages": [
                 {"role": "user", "content": message},
                 {"role": "assistant", "content": reply},
@@ -17820,7 +18024,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "tools": [],
             "history_offset": len(history),
             "session_id": session_id,
-            "response_previewed": False,
+            "response_previewed": streamed,
         }
 
     async def _run_agent_via_proxy(
@@ -17909,74 +18113,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "stream": True,
         }
 
-        # Set up platform streaming if available -------------------------
-        _stream_consumer = None
-        _scfg = getattr(getattr(self, "config", None), "streaming", None)
-        if _scfg is None:
-            from gateway.config import StreamingConfig
-            _scfg = StreamingConfig()
-
-        platform_key = _platform_config_key(source.platform)
-        user_config = _load_gateway_config()
-        from gateway.display_config import resolve_display_setting
-        _plat_streaming = resolve_display_setting(
-            user_config, platform_key, "streaming"
+        # Set up platform streaming if available (shared with Letta-brain mode)
+        _stream_consumer, _thread_metadata = self._setup_platform_stream_consumer(
+            source, event_message_id, _run_still_current
         )
-        _streaming_enabled = (
-            _scfg.enabled and _scfg.transport != "off"
-            if _plat_streaming is None
-            else bool(_plat_streaming)
-        )
-
-        _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
-
-        if _streaming_enabled:
-            try:
-                from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-                _adapter = self._adapter_for_source(source)
-                if _adapter:
-                    _pause_typing_before_finalize = None
-                    if source.platform == Platform.TELEGRAM and hasattr(_adapter, "pause_typing_for_chat"):
-                        def _pause_typing_before_finalize(
-                            _adapter=_adapter,
-                            _chat_id=source.chat_id,
-                        ) -> None:
-                            _adapter.pause_typing_for_chat(_chat_id)
-                    _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                    _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
-                    _buffer_only = False
-                    if source.platform == Platform.MATRIX:
-                        _effective_cursor = ""
-                        _buffer_only = True
-                    # Fresh-final applies to Telegram only — other
-                    # platforms either edit in place cheaply (Discord,
-                    # Slack) or don't have the timestamp-on-edit
-                    # problem.  (Ported from openclaw/openclaw#72038.)
-                    _fresh_final_secs = (
-                        float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
-                        if source.platform == Platform.TELEGRAM
-                        else 0.0
-                    )
-                    _consumer_cfg = StreamConsumerConfig(
-                        edit_interval=_scfg.edit_interval,
-                        buffer_threshold=_scfg.buffer_threshold,
-                        cursor=_effective_cursor,
-                        buffer_only=_buffer_only,
-                        fresh_final_after_seconds=_fresh_final_secs,
-                        transport=_scfg.transport or "edit",
-                        chat_type=getattr(source, "chat_type", "") or "",
-                    )
-                    _stream_consumer = GatewayStreamConsumer(
-                        adapter=_adapter,
-                        chat_id=source.chat_id,
-                        config=_consumer_cfg,
-                        metadata=_thread_metadata,
-                        on_before_finalize=_pause_typing_before_finalize,
-                        initial_reply_to_id=event_message_id,
-                        run_still_current=_run_still_current,
-                    )
-            except Exception as _sc_err:
-                logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
 
         # Run the stream consumer task in the background
         stream_task = None
@@ -18300,7 +18440,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
-        # ---- Letta brain mode (SLICE-0 PROTOTYPE): delegate the turn to a
+        # ---- Letta brain mode (Swarm Map v1 B1): delegate the turn to a
         # bound Letta agent over REST. Checked before proxy mode — if both are
         # configured, the more specific brain binding wins. ----
         if self._get_letta_brain():
@@ -18311,6 +18451,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 history=history,
                 session_key=session_key,
                 run_generation=run_generation,
+                event_message_id=event_message_id,
             )
 
         # ---- Proxy mode: delegate to remote API server ----
