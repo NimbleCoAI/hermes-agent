@@ -62,6 +62,7 @@ def _install_fake_urlopen(monkeypatch, reply: str, seen: dict):
         seen["url"] = req.full_url
         seen["body"] = json.loads(req.data.decode("utf-8"))
         seen["timeout"] = timeout
+        seen["headers"] = dict(req.header_items())
         return _FakeUrlopenResponse(
             json.dumps(_letta_turn_response(reply)).encode("utf-8")
         )
@@ -270,3 +271,144 @@ async def test_letta_failure_returns_clear_error_not_crash(monkeypatch):
     assert result["final_response"].startswith("⚠️")
     assert "unreachable" in result["final_response"]
     assert result["api_calls"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Production hardening (real B1 — Swarm Map v1 slice 4)
+# ---------------------------------------------------------------------------
+
+
+def test_send_message_sends_bearer_auth_when_key_given(monkeypatch):
+    """Letta Cloud / secured servers need an Authorization header."""
+    seen: dict = {}
+    _install_fake_urlopen(monkeypatch, "ok", seen)
+    send_message("http://localhost:8283", "agent-1", "hi", api_key="sk-letta-xyz")
+    assert seen["headers"].get("Authorization") == "Bearer sk-letta-xyz"
+
+
+def test_send_message_no_auth_header_by_default(monkeypatch):
+    seen: dict = {}
+    _install_fake_urlopen(monkeypatch, "ok", seen)
+    send_message("http://localhost:8283", "agent-1", "hi")
+    assert "Authorization" not in seen["headers"]
+
+
+def test_tool_only_turn_returns_empty_reply_not_error(monkeypatch):
+    """A turn can legitimately end without an assistant_message (the agent only
+    ran tools). Production semantics: quiet empty reply, NOT an error the user
+    sees (resolves the prototype's TODO)."""
+
+    def _fake_urlopen(req, timeout=None):
+        return _FakeUrlopenResponse(
+            json.dumps(
+                {
+                    "messages": [
+                        {"message_type": "tool_call_message", "tool_call": {}},
+                        {"message_type": "tool_return_message", "tool_return": "..."},
+                    ]
+                }
+            ).encode("utf-8")
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    assert send_message("http://localhost:8283", "agent-1", "do the thing") == ""
+
+
+def test_parse_stream_line_assistant_delta():
+    from gateway.letta_brain import parse_stream_line
+
+    line = 'data: ' + json.dumps(
+        {"message_type": "assistant_message", "content": "Hel"}
+    )
+    assert parse_stream_line(line) == "Hel"
+
+
+def test_parse_stream_line_content_parts():
+    from gateway.letta_brain import parse_stream_line
+
+    line = 'data: ' + json.dumps(
+        {
+            "message_type": "assistant_message",
+            "content": [{"type": "text", "text": "lo"}],
+        }
+    )
+    assert parse_stream_line(line) == "lo"
+
+
+def test_parse_stream_line_ignores_non_assistant_and_noise():
+    from gateway.letta_brain import parse_stream_line
+
+    assert parse_stream_line("data: [DONE]") is None
+    assert (
+        parse_stream_line(
+            'data: {"message_type": "reasoning_message", "reasoning": "hmm"}'
+        )
+        is None
+    )
+    assert parse_stream_line("data: {not json") is None
+    assert parse_stream_line(": keepalive comment") is None
+    assert parse_stream_line("") is None
+
+
+def test_get_letta_brain_picks_up_api_key(monkeypatch):
+    monkeypatch.setenv("LETTA_BRAIN_URL", "http://localhost:8283")
+    monkeypatch.setenv("LETTA_BRAIN_AGENT_ID", "agent-abc")
+    monkeypatch.setenv("LETTA_BRAIN_API_KEY", "sk-letta-xyz")
+    runner, _ = _make_runner()
+    brain = runner._get_letta_brain()
+    assert brain["api_key"] == "sk-letta-xyz"
+
+
+def test_letta_agent_lock_identity():
+    """B3: one lock per bound Letta agent — same key, same lock."""
+    runner, _ = _make_runner()
+    a = runner._letta_agent_lock("http://h:8283|agent-1")
+    b = runner._letta_agent_lock("http://h:8283|agent-1")
+    c = runner._letta_agent_lock("http://h:8283|agent-2")
+    assert a is b
+    assert a is not c
+
+
+@pytest.mark.asyncio
+async def test_concurrent_group_turns_serialize_per_agent(monkeypatch):
+    """B3: Letta processes an agent's messages sequentially — concurrent group
+    messages must queue, never overlapping in flight."""
+    import asyncio
+    import threading
+
+    monkeypatch.setenv("LETTA_BRAIN_URL", "http://localhost:8283")
+    monkeypatch.setenv("LETTA_BRAIN_AGENT_ID", "agent-abc")
+    monkeypatch.delenv("GATEWAY_PROXY_URL", raising=False)
+    # Force the blocking client path so in-flight tracking is deterministic.
+    monkeypatch.setenv("LETTA_BRAIN_STREAMING", "off")
+
+    state = {"in_flight": 0, "max_in_flight": 0}
+    gate = threading.Lock()
+
+    def _slow_urlopen(req, timeout=None):
+        with gate:
+            state["in_flight"] += 1
+            state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+        import time as _t
+
+        _t.sleep(0.05)
+        with gate:
+            state["in_flight"] -= 1
+        return _FakeUrlopenResponse(
+            json.dumps(_letta_turn_response("ok")).encode("utf-8")
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", _slow_urlopen)
+    runner, _adapter = _make_runner()
+
+    src = _make_source()
+    results = await asyncio.gather(
+        runner._run_agent_inner(
+            message="one", context_prompt="", history=[], source=src, session_id="s1"
+        ),
+        runner._run_agent_inner(
+            message="two", context_prompt="", history=[], source=src, session_id="s2"
+        ),
+    )
+    assert [r["final_response"] for r in results] == ["ok", "ok"]
+    assert state["max_in_flight"] == 1, "turns for one Letta agent overlapped"
