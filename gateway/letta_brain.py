@@ -29,11 +29,44 @@ import json
 import logging
 import urllib.error
 import urllib.request
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 120.0
+
+
+class LettaTurn(NamedTuple):
+    """One completed Letta turn: the assistant text plus the payload's usage.
+
+    Token counts come from the blocking endpoint's ``usage`` block
+    (LettaUsageStatistics: prompt_tokens / completion_tokens / total_tokens)
+    and default to 0 when the server omits them. The streaming path does not
+    surface usage — streamed turns report 0 (see stream_message).
+    """
+
+    text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+def _extract_usage_tokens(payload: dict) -> "tuple[int, int]":
+    """Pull (prompt_tokens, completion_tokens) from a turn payload's usage.
+
+    Defensive: any missing/malformed usage block degrades to (0, 0) — audit
+    accounting must never fail a turn that otherwise succeeded.
+    """
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return 0, 0
+
+    def _count(key: str) -> int:
+        try:
+            return max(0, int(usage.get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    return _count("prompt_tokens"), _count("completion_tokens")
 
 
 class LettaBrainError(Exception):
@@ -128,12 +161,15 @@ def send_message(
     sender: Optional[str] = None,
     group: Optional[str] = None,
     api_key: Optional[str] = None,
-) -> str:
-    """Send one user message to a Letta agent; return the assistant reply text.
+) -> LettaTurn:
+    """Send one user message to a Letta agent; return the completed turn.
 
-    Blocking (urllib). Raises LettaBrainError with a clear, user-displayable
-    message on any failure. Letta keeps its own conversation state server-side,
-    so only the new message is sent — no history replay.
+    Returns a :class:`LettaTurn` — the assistant reply text plus the usage
+    token counts the payload reports (B4 audit parity: the gateway records
+    ``last_prompt_tokens`` from these instead of 0). Blocking (urllib). Raises
+    LettaBrainError with a clear, user-displayable message on any failure.
+    Letta keeps its own conversation state server-side, so only the new
+    message is sent — no history replay.
 
     ``sender``/``group`` add the B1.5 door-context tag so a shared brain knows
     who is speaking and where (see build_sender_tag). The URL has NO trailing
@@ -174,6 +210,7 @@ def send_message(
     except Exception as e:
         raise LettaBrainError(f"Letta brain returned non-JSON response: {e}") from e
 
+    prompt_tokens, completion_tokens = _extract_usage_tokens(payload)
     reply = _extract_assistant_text(payload)
     if reply is None:
         # A turn can legitimately end without an assistant_message — the agent
@@ -189,8 +226,8 @@ def send_message(
                 if isinstance(m, dict)
             ],
         )
-        return ""
-    return reply
+        return LettaTurn("", prompt_tokens, completion_tokens)
+    return LettaTurn(reply, prompt_tokens, completion_tokens)
 
 
 def parse_stream_line(line: str) -> Optional[str]:
@@ -244,6 +281,11 @@ async def stream_message(
     delta arrives — callers fall back to the validated blocking send_message.
     A mid-stream error after deltas have been yielded also raises; the caller
     decides whether the partial text is deliverable.
+
+    Usage note (B4): only assistant-text deltas are parsed off the SSE feed —
+    the terminal usage_statistics event is not captured, so streamed turns
+    report 0 prompt/completion tokens. The blocking client (send_message)
+    returns real counts via LettaTurn.
     """
     try:
         from aiohttp import ClientConnectorError, ClientSession, ClientTimeout

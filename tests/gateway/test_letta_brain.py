@@ -79,9 +79,9 @@ def test_send_message_extracts_assistant_content(monkeypatch):
     seen: dict = {}
     _install_fake_urlopen(monkeypatch, "hello from letta", seen)
 
-    reply = send_message("http://localhost:8283", "agent-123", "hi there")
+    turn = send_message("http://localhost:8283", "agent-123", "hi there")
 
-    assert reply == "hello from letta"
+    assert turn.text == "hello from letta"
     assert seen["url"] == "http://localhost:8283/v1/agents/agent-123/messages"
     assert seen["body"] == {"messages": [{"role": "user", "content": "hi there"}]}
 
@@ -311,7 +311,7 @@ def test_tool_only_turn_returns_empty_reply_not_error(monkeypatch):
         )
 
     monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
-    assert send_message("http://localhost:8283", "agent-1", "do the thing") == ""
+    assert send_message("http://localhost:8283", "agent-1", "do the thing").text == ""
 
 
 def test_parse_stream_line_assistant_delta():

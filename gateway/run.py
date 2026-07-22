@@ -17870,6 +17870,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "messages": [],
                 "api_calls": 0,
                 "tools": [],
+                "agent_persisted": False,
             }
         _api_key = brain.get("api_key") or None
 
@@ -17891,6 +17892,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "history_offset": len(history),
                 "session_id": session_id,
                 "response_previewed": False,
+                "agent_persisted": False,
             }
 
         # B1.5 door-context: a shared Letta brain sees only the message text, so
@@ -17936,6 +17938,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             reply: Optional[str] = None
             streamed = False
+            # Usage from the blocking client's payload (B4). Streamed turns
+            # keep 0 — the SSE path doesn't surface usage_statistics (see
+            # gateway/letta_brain.py stream_message).
+            _prompt_tokens = 0
             if _stream_consumer is not None:
                 stream_task = asyncio.create_task(_stream_consumer.run())
                 _partial = ""
@@ -17974,6 +17980,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "messages": [],
                             "api_calls": 0,
                             "tools": [],
+                            "agent_persisted": False,
                         }
                 finally:
                     _stream_consumer.finish()
@@ -17984,7 +17991,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if reply is None:
                 try:
-                    reply = await asyncio.to_thread(
+                    _turn = await asyncio.to_thread(
                         _letta_send,
                         brain["base_url"],
                         brain["agent_id"],
@@ -17993,6 +18000,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         group=_group,
                         api_key=_api_key,
                     )
+                    reply = _turn.text
+                    _prompt_tokens = _turn.prompt_tokens
                 except LettaBrainError as e:
                     logger.warning("Letta brain turn failed: %s", e)
                     return {
@@ -18000,6 +18009,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "messages": [],
                         "api_calls": 0,
                         "tools": [],
+                        "agent_persisted": False,
                     }
 
         # Staleness guard (same contract as proxy mode): a newer message for
@@ -18014,6 +18024,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         # An empty reply is a legitimate tool-only turn (the brain acted but
         # chose not to speak) — deliver nothing rather than an error string.
+        #
+        # agent_persisted=False (B4): unlike the native loop, the Letta bridge
+        # never writes to the agent SessionDB, so the gateway's persistence
+        # block must NOT skip_db these rows — this is the documented opt-in
+        # for non-persisting runtimes (see the agent_persisted read in
+        # _handle_message_with_agent). last_prompt_tokens carries the Letta
+        # payload's real usage so update_session records actual context size.
         return {
             "final_response": reply,
             "messages": [
@@ -18025,6 +18042,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": streamed,
+            "agent_persisted": False,
+            "last_prompt_tokens": _prompt_tokens,
         }
 
     async def _run_agent_via_proxy(
