@@ -283,3 +283,55 @@ def test_unknown_subcommand_names_valid_choices(capsys):
         gat.main(["mint"])
     err = capsys.readouterr().err
     assert "get-credential" in err
+
+
+# ---------------------------------------------------------------------------
+# get-credential host allowlist — never answer for a host we don't recognize
+# ---------------------------------------------------------------------------
+
+
+def _pipe_stdin(monkeypatch, text: str) -> None:
+    import io
+
+    monkeypatch.setattr(gat.sys, "stdin", io.StringIO(text))
+
+
+def test_get_credential_refuses_foreign_host(app_env, monkeypatch, capsys):
+    def boom(home, force=False):
+        raise AssertionError("must not mint for a non-GitHub host")
+
+    monkeypatch.setattr(gat, "get_installation_token", boom)
+    _pipe_stdin(monkeypatch, "protocol=https\nhost=evil.example.com\n")
+    rc = gat.main(["get-credential", "--home", str(app_env)])
+    assert rc == 0  # silent fall-through, git tries the next helper
+    assert capsys.readouterr().out == ""
+
+
+def test_get_credential_refuses_non_https(app_env, monkeypatch, capsys):
+    def boom(home, force=False):
+        raise AssertionError("must not mint for a non-https request")
+
+    monkeypatch.setattr(gat, "get_installation_token", boom)
+    _pipe_stdin(monkeypatch, "protocol=http\nhost=github.com\n")
+    rc = gat.main(["get-credential", "--home", str(app_env)])
+    assert rc == 0
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("host", ["github.com", "gist.github.com"])
+def test_get_credential_answers_for_allowed_hosts(app_env, monkeypatch, capsys, host):
+    monkeypatch.setattr(gat, "get_installation_token", lambda home, force=False: "ghs_ok")
+    _pipe_stdin(monkeypatch, f"protocol=https\nhost={host}\n")
+    rc = gat.main(["get-credential", "--home", str(app_env)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "password=ghs_ok\n" in out
+
+
+def test_get_credential_answers_on_empty_request(app_env, monkeypatch, capsys):
+    """No stdin description (manual smoke test / boot-style call) still answers."""
+    monkeypatch.setattr(gat, "get_installation_token", lambda home, force=False: "ghs_ok")
+    _pipe_stdin(monkeypatch, "")
+    rc = gat.main(["get-credential", "--home", str(app_env)])
+    assert rc == 0
+    assert "password=ghs_ok\n" in capsys.readouterr().out
