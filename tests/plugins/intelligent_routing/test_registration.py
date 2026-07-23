@@ -327,3 +327,82 @@ def test_no_directive_falls_through_to_classifier():
         )
     assert isinstance(result, dict)
     assert result.get("route") == {"model": "deepseek/deepseek-v3.2", "provider": "openrouter"}
+
+
+# ---- kimi / glm directives (three-tier fleet hierarchy) ----------------------
+#
+# Fleet cost restructure: PRIMARY = z-ai/glm-5.2 (chat default), CHEAP =
+# deepseek/deepseek-v3.2 (mechanical tier), ON-DEMAND PREMIUM =
+# moonshotai/kimi-k3 ("use kimi" runs that turn on Kimi K3). Same directive
+# mechanism as fable/opus/deepseek — intercepted before the classifier.
+
+
+def test_user_directive_kimi_routes_to_kimi_k3():
+    """'use kimi' overrides the classifier and routes to moonshotai/kimi-k3."""
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="use kimi for this — it needs the premium tier",
+            model="z-ai/glm-5.2", platform="signal",
+        )
+    assert isinstance(result, dict)
+    assert result["route"] == {"model": "moonshotai/kimi-k3", "provider": "openrouter"}
+    assert "user-requested" in result["context"]
+
+
+def test_user_directive_kimi_aliases_kimi3_and_k3():
+    """'use kimi3' and 'use k3' are aliases for moonshotai/kimi-k3."""
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        for phrase in ("please use kimi3 here", "use k3 — max reasoning"):
+            result = registration.on_pre_llm_call(
+                user_message=phrase, model="z-ai/glm-5.2", platform="cli",
+            )
+            assert isinstance(result, dict), phrase
+            assert result["route"] == {
+                "model": "moonshotai/kimi-k3", "provider": "openrouter",
+            }, phrase
+
+
+def test_user_directive_kimi_wins_over_mechanical_classifier():
+    """Bare 'use kimi' routes to kimi-k3, NOT deepseek.
+
+    'use' is in _IMPERATIVE_VERBS, so without the directive intercept a bare
+    'use kimi' would be classified mechanical → cheap → deepseek. The
+    directive must short-circuit the classifier (same trap as 'use fable').
+    """
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="use kimi",
+            model="z-ai/glm-5.2", platform="cli",
+        )
+    assert isinstance(result, dict)
+    route = result.get("route", {})
+    assert route.get("model") == "moonshotai/kimi-k3", (
+        f"'use kimi' must route to kimi-k3, not deepseek; got route={route}"
+    )
+
+
+def test_user_directive_glm_routes_to_glm():
+    """'use glm' routes to z-ai/glm-5.2 / openrouter (the fleet primary)."""
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="use glm for this one",
+            model="claude-sonnet-5", platform="cli",
+        )
+    assert isinstance(result, dict)
+    assert result["route"] == {"model": "z-ai/glm-5.2", "provider": "openrouter"}
+
+
+def test_user_directive_group_prefix_plus_kimi():
+    """Kimi directive still fires when a group [sender] prefix is present."""
+    with patch("plugins.intelligent_routing.registration.is_intelligent_routing_enabled",
+               return_value=True):
+        result = registration.on_pre_llm_call(
+            user_message="[mare] use kimi for this please",
+            model="z-ai/glm-5.2", platform="signal",
+        )
+    assert isinstance(result, dict)
+    assert result["route"] == {"model": "moonshotai/kimi-k3", "provider": "openrouter"}
