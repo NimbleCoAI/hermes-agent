@@ -255,6 +255,17 @@ def test_get_credential_accepts_git_get_operation(app_env, monkeypatch, capsys):
     assert "password=ghs_helper\n" in out
 
 
+def test_get_alias_matches_get_credential(app_env, monkeypatch, capsys):
+    """`get` is an alias for `get-credential` — agents reach for it first
+    (observed live 2026-07-21: a fleet agent fumbled the subcommand and gave
+    up on the helper entirely)."""
+    monkeypatch.setattr(gat, "get_installation_token", lambda home, force=False: "ghs_helper")
+    rc = gat.main(["get", "--home", str(app_env)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "password=ghs_helper\n" in out
+
+
 def test_get_credential_store_and_erase_are_noops(app_env, monkeypatch, capsys):
     # store/erase carry no output and must never mint.
     def boom(*a, **k):  # pragma: no cover - must not be called
@@ -264,3 +275,11 @@ def test_get_credential_store_and_erase_are_noops(app_env, monkeypatch, capsys):
     for op in ("store", "erase"):
         assert gat.main(["get-credential", "--home", str(app_env), op]) == 0
         assert capsys.readouterr().out == ""
+
+
+def test_unknown_subcommand_names_valid_choices(capsys):
+    """argparse error must surface the valid choices, not just 'invalid'."""
+    with pytest.raises(SystemExit):
+        gat.main(["mint"])
+    err = capsys.readouterr().err
+    assert "get-credential" in err
