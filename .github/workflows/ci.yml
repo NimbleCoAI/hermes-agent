@@ -226,7 +226,7 @@ jobs:
 
       - name: Collect timings and generate report
         env:
-          GITHUB_TOKEN: ${{ secrets.AUTOFIX_BOT_PAT }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 scripts/ci/timings_report.py \
             --baseline ci-timings-baseline.json \
