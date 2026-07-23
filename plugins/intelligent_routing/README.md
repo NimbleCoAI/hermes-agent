@@ -133,6 +133,36 @@ in #43534's data (DeepSeek coding throughput directionally lower → keep code-g
 on Claude; DeepSeek only competitive AND cheap at CLI/tool orchestration). See
 `references/prior-art.md`.
 
+## Fleet tiers & user model directives
+
+The fleet runs a three-tier hierarchy. PRIMARY is whatever the agent's
+configured primary model is — premium/fail-open turns emit **no** route
+override, so they land on the primary automatically (no plugin change needed
+when the fleet primary flips).
+
+| Tier | Model | How a turn gets there |
+|---|---|---|
+| PRIMARY (chat default) | `z-ai/glm-5.2` / openrouter (configured primary) | classifier: judgment / uncertain / public-facing (fail-open — no override emitted) |
+| CHEAP (mechanical) | `deepseek/deepseek-v3.2` / openrouter | classifier: confident MECHANICAL (`routing.cheap_model` / `cheap_provider`) |
+| ON-DEMAND PREMIUM | `moonshotai/kimi-k3` / openrouter | user says `use kimi` (or `kimi3` / `k3`) in the message |
+
+A user can request a specific model mid-message — the directive short-circuits
+the classifier entirely (fires BEFORE the mechanical/judgment split, so a bare
+`use kimi` isn't misread as an imperative → mechanical → deepseek):
+
+| Directive | Routes to |
+|---|---|
+| `use kimi` / `use kimi3` / `use k3` | `moonshotai/kimi-k3` / openrouter |
+| `use glm` | `z-ai/glm-5.2` / openrouter |
+| `use deepseek` | `deepseek/deepseek-v3.2` / openrouter |
+| `use fable` | `claude-fable-5` / anthropic |
+| `use opus` | `claude-opus-4-8` / anthropic |
+| `use sonnet` | `claude-sonnet-4-6` / anthropic |
+| `use haiku` | `claude-haiku-4-5-20251001` / anthropic |
+| `use claude` | no override — stay on configured primary |
+
+Directives are turn-scoped (same `routing_override` path — reverted next turn).
+
 ## Scope — DONE vs DEFERRED
 
 **Done (Stage 1, our fork):**
