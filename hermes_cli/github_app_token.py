@@ -232,6 +232,30 @@ def _default_home() -> Path:
     return Path(os.environ.get("HOME", "/opt/data/home")).parent
 
 
+# Hosts this helper will answer for. Git invokes credential helpers for EVERY
+# https remote, so an unscoped helper that ignored the request's host would
+# hand the installation token to any URL a repo (or a malicious submodule/
+# redirect) points at. The boot-written gitconfig already scopes the helper to
+# https://github.com; this allowlist enforces the same boundary inside the
+# helper itself, so a mis-scoped or globally-wired config can't leak the token.
+ALLOWED_HOSTS = frozenset({"github.com", "gist.github.com"})
+
+
+def _read_credential_request() -> dict:
+    """Parse git's credential description block (key=value lines) from stdin."""
+    request: dict = {}
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return request
+        for line in sys.stdin.read().splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                request[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return request
+
+
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(prog="hermes_cli.github_app_token")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -253,6 +277,17 @@ def main(argv: Optional[list] = None) -> int:
     if args.cmd in ("get-credential", "get"):
         if args.op not in (None, "get"):
             return 0  # store/erase are no-ops for a mint-on-demand helper
+        # Only answer for GitHub over https. For anything else, emit nothing
+        # and exit 0 so git falls through to other helpers / prompts — never
+        # send the token toward a host we don't recognize. An empty request
+        # (no stdin, e.g. a manual smoke-test invocation) still answers.
+        request = _read_credential_request()
+        host = request.get("host", "")
+        protocol = request.get("protocol", "")
+        if host and host not in ALLOWED_HOSTS:
+            return 0
+        if protocol and protocol != "https":
+            return 0
         home = args.home or _default_home()
         token = get_installation_token(home)
         if not token:
