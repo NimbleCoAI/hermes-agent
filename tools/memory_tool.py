@@ -175,6 +175,34 @@ class MemoryStore:
             ),
         }
 
+    def _global_entry_guard_response(self, target: str) -> Dict[str, Any]:
+        """Response for an attempt to modify a global entry from a scoped context.
+
+        Global entries are read-only from a scoped context: writes land in the
+        scoped file only, so the edit would silently vanish on the next reload.
+        The memory tool has no ``scope`` parameter, so the previous message
+        ("use scope='global' to modify global entries") coached the model
+        toward an action it could never take. At capacity the model was already
+        being told to consolidate — it would pick a global entry, hit this
+        guard, retry the same forbidden edit, and loop the turn to budget
+        exhaustion while the user's real request waited (issue #39).
+
+        Fix: give scope-honest, actionable guidance (consolidate a *scoped*
+        entry, or proceed without saving) AND route it through the per-turn
+        consolidation-failure cap so repeated attempts degrade to a terminal
+        result and the turn can proceed — sharing the #42405 loop-breaker.
+        """
+        return self._consolidation_failure({
+            "success": False,
+            "error": (
+                "That entry belongs to global memory and can't be edited from "
+                "this scoped context. To free space, consolidate one of your "
+                "context-scoped entries instead (replace or remove an entry you "
+                "added in this context), or continue without saving — the fact "
+                "can be recorded in a later turn."
+            ),
+        })
+
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
 
@@ -430,6 +458,17 @@ class MemoryStore:
 
             if new_total > limit:
                 current = self._char_count(target)
+                # In a scoped context, global entries can't be edited here.
+                # Flag it so the model consolidates its scoped entries instead
+                # of reaching for a global one and looping on the guard (#39).
+                scope_hint = ""
+                if (self.context_id is not None and target == "memory"
+                        and self._global_entry_count):
+                    scope_hint = (
+                        " Note: entries from global memory can't be edited from "
+                        "this context — consolidate only your context-scoped "
+                        "entries (or continue without saving)."
+                    )
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
@@ -438,6 +477,7 @@ class MemoryStore:
                         f"Consolidate now: use 'replace' to merge overlapping entries into "
                         f"shorter ones or 'remove' stale or less important entries (see "
                         f"current_entries below), then retry this add — all in this turn."
+                        f"{scope_hint}"
                     ),
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",
@@ -497,13 +537,7 @@ class MemoryStore:
             # the merged list. Saving goes to the scoped file only, so any
             # modification would be lost on the next reload.
             if self.context_id is not None and idx < self._global_entry_count:
-                return {
-                    "success": False,
-                    "error": (
-                        "Cannot modify a global entry from a scoped context. "
-                        "Use scope='global' to modify global entries."
-                    ),
-                }
+                return self._global_entry_guard_response(target)
 
             limit = self._char_limit(target)
 
@@ -569,13 +603,7 @@ class MemoryStore:
 
             # Guard: refuse to remove a global entry from a scoped context.
             if self.context_id is not None and idx < self._global_entry_count:
-                return {
-                    "success": False,
-                    "error": (
-                        "Cannot modify a global entry from a scoped context. "
-                        "Use scope='global' to modify global entries."
-                    ),
-                }
+                return self._global_entry_guard_response(target)
 
             entries.pop(idx)
             self._set_entries(target, entries)

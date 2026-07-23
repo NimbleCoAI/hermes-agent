@@ -248,6 +248,80 @@ class TestPathTraversalAndEdgeCases:
         assert "global" in result["error"].lower()
 
 
+class TestGlobalEntryGuardLoopBreak:
+    """Modifying a global entry from a scoped context must fail without coaching
+    the model toward an impossible action, and must degrade to a terminal result
+    so the turn can proceed instead of looping (issue #39)."""
+
+    def test_guard_message_has_no_phantom_scope_param(self, mem_dir):
+        """The old guard said 'use scope=global' — a parameter that does not
+        exist on the memory tool — so the model could never comply and looped."""
+        (mem_dir / "MEMORY.md").write_text("The sky is blue")
+        store = MemoryStore(context_id="group-x")
+        store.load_from_disk()
+
+        result = store.replace("memory", "sky is blue", "sky is green")
+        assert result["success"] is False
+        # still explains it's a global-entry problem
+        assert "global" in result["error"].lower()
+        # but must NOT reference a nonexistent parameter
+        assert "scope=" not in result["error"]
+        assert "scope='global'" not in result["error"]
+
+    def test_guard_terminates_after_cap_on_replace(self, mem_dir):
+        (mem_dir / "MEMORY.md").write_text("The sky is blue")
+        store = MemoryStore(context_id="group-y")
+        store.load_from_disk()
+
+        n = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        results = [store.replace("memory", "sky is blue", "sky is green")
+                   for _ in range(n + 1)]
+
+        assert all(r["success"] is False for r in results)
+        # early attempts are recoverable (model may still self-correct)
+        assert not results[0].get("done")
+        # once the per-turn cap is exceeded the result is terminal, so the
+        # model stops retrying and answers the user
+        assert results[-1].get("done") is True
+
+    def test_guard_terminates_after_cap_on_remove(self, mem_dir):
+        (mem_dir / "MEMORY.md").write_text("global truth")
+        store = MemoryStore(context_id="group-z")
+        store.load_from_disk()
+
+        n = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        results = [store.remove("memory", "global truth") for _ in range(n + 1)]
+        assert results[-1].get("done") is True
+
+    def test_turn_reset_clears_guard_failures(self, mem_dir):
+        """A new turn resets the per-turn counter so guidance is offered afresh."""
+        (mem_dir / "MEMORY.md").write_text("The sky is blue")
+        store = MemoryStore(context_id="group-reset")
+        store.load_from_disk()
+
+        n = store._MAX_CONSOLIDATION_FAILURES_PER_TURN
+        for _ in range(n + 1):
+            store.replace("memory", "sky is blue", "sky is green")
+
+        store.reset_consolidation_failures()
+        result = store.replace("memory", "sky is blue", "sky is green")
+        # first attempt of the new turn is recoverable again, not terminal
+        assert result["success"] is False
+        assert not result.get("done")
+
+    def test_scoped_add_overflow_flags_global_readonly(self, mem_dir):
+        """When a scoped add overflows because global entries fill the budget,
+        the coaching should tell the model global entries are read-only here so
+        it doesn't reach for an entry it can't edit."""
+        (mem_dir / "MEMORY.md").write_text("x" * 2100)  # near the 2200 cap
+        store = MemoryStore(context_id="ctx-hint")
+        store.load_from_disk()
+
+        result = store.add("memory", "y" * 300)
+        assert result["success"] is False
+        assert "global memory" in result["error"].lower()
+
+
 class TestConcurrentContextWrites:
     """Different contexts use different lock files, so they don't block each other."""
 
