@@ -449,6 +449,65 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+# Mint-failure cooldown for GH_TOKEN injection: a failed mint must not retry
+# on every spawn while GitHub is unreachable — each retry would add a live
+# HTTP timeout to the terminal hot path. One failure quiets the mint for the
+# cooldown window; a None result (agent simply has no App creds) is a cheap
+# .env read and never cools down.
+_GH_TOKEN_MINT_FAILURE_TS: float = 0.0
+_GH_TOKEN_MINT_COOLDOWN_SECONDS: float = 60.0
+
+
+def _inject_github_app_gh_token(env: dict) -> None:
+    """Inject a short-lived GitHub App installation token as ``GH_TOKEN``.
+
+    Tier-1 stripping removes every ambient GitHub credential from tool
+    subprocesses — deliberately: they are long-lived. But that leaves ``gh``
+    with no auth at all. git is covered by the ``github_app_token`` credential
+    helper, which mints per operation; ``gh`` has no credential-helper concept
+    and falls back to a ``hosts.yml`` written once at container boot, whose
+    App token dies within the hour. Mirror the git path at the env boundary:
+    mint (cache-first — at most one live mint per ~50 min) and hand the token
+    to the subprocess as ``GH_TOKEN``, which ``gh`` prefers over ``hosts.yml``.
+
+    Exposure is not widened: the helper already caches this same token under
+    the subprocess HOME (``github_app_token.cache_path``), readable by any
+    tool. A short-lived, App-scoped, revocable token replaces a fossilized
+    one — the long-lived PAT and the App private key stay stripped.
+
+    Ordering contract: call AFTER ``apply_subprocess_home_env`` (HOME is final
+    then; the mint layer derives the ``.env`` dir as ``HOME``'s parent, the
+    same contract as ``github_app_token._default_home``) and after the strip
+    passes (an explicit force-passed ``GH_TOKEN`` must win — presence in
+    ``env`` here means the operator asked for that exact token).
+
+    Fail-soft: no App creds → no injection (App-less installs see the old
+    behavior exactly); mint failure → cooldown, no retry storm. Opt out with
+    ``HERMES_GH_TOKEN_INJECT=off``.
+    """
+    global _GH_TOKEN_MINT_FAILURE_TS
+    if env.get("GH_TOKEN"):
+        return
+    if os.environ.get("HERMES_GH_TOKEN_INJECT", "").strip().lower() in (
+        "0", "off", "false", "no",
+    ):
+        return
+    if time.time() - _GH_TOKEN_MINT_FAILURE_TS < _GH_TOKEN_MINT_COOLDOWN_SECONDS:
+        return
+    home = env.get("HOME")
+    if not home:
+        return
+    try:
+        from hermes_cli.github_app_token import get_installation_token
+
+        token = get_installation_token(Path(home).parent)
+    except Exception:
+        _GH_TOKEN_MINT_FAILURE_TS = time.time()
+        return
+    if token:
+        env["GH_TOKEN"] = token
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -481,6 +540,10 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(sanitized)
+
+    # After HOME is final and the strips have run: hand `gh` a short-lived
+    # App installation token in place of the stripped long-lived credentials.
+    _inject_github_app_gh_token(sanitized)
 
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
@@ -1167,6 +1230,10 @@ def _make_run_env(env: dict) -> dict:
 
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(run_env)
+
+    # After HOME is final and the strips have run: hand `gh` a short-lived
+    # App installation token in place of the stripped long-lived credentials.
+    _inject_github_app_gh_token(run_env)
 
     # Bridge ContextVar-based session vars into the subprocess env (with the
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
