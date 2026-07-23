@@ -61,6 +61,10 @@ _USER_MODEL_MAP = {
     "sonnet": ("claude-sonnet-4-6", "anthropic"),
     "haiku": ("claude-haiku-4-5-20251001", "anthropic"),
     "deepseek": ("deepseek/deepseek-v3.2", "openrouter"),
+    "kimi": ("moonshotai/kimi-k3", "openrouter"),
+    "kimi3": ("moonshotai/kimi-k3", "openrouter"),
+    "k3": ("moonshotai/kimi-k3", "openrouter"),
+    "glm": ("z-ai/glm-5.2", "openrouter"),
     "claude": None,  # "use claude" = stay on configured primary
 }
 _DIRECTIVE_RE = re.compile(
