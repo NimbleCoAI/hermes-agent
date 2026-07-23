@@ -235,7 +235,14 @@ def _default_home() -> Path:
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(prog="hermes_cli.github_app_token")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    gc = sub.add_parser("get-credential", help="emit git credential-helper output")
+    # `get` alias: agents reach for the short form first (observed live
+    # 2026-07-21 — a fleet agent fumbled the subcommand, got an argparse
+    # error, and abandoned the helper for a broken workaround instead).
+    gc = sub.add_parser(
+        "get-credential",
+        aliases=["get"],
+        help="emit git credential-helper output (username/password lines)",
+    )
     gc.add_argument("--home", type=Path, default=None)
     # git invokes a credential helper as ``<helper> <operation>`` where operation
     # is get/store/erase. Accept and ignore that trailing arg — without it argparse
@@ -243,7 +250,7 @@ def main(argv: Optional[list] = None) -> int:
     gc.add_argument("op", nargs="?", default="get")
     args = parser.parse_args(argv)
 
-    if args.cmd == "get-credential":
+    if args.cmd in ("get-credential", "get"):
         if args.op not in (None, "get"):
             return 0  # store/erase are no-ops for a mint-on-demand helper
         home = args.home or _default_home()
