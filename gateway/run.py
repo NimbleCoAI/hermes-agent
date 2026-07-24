@@ -6944,7 +6944,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Returns True when the transcript tail is a legitimately interrupted
         addressed turn (or on any read error — fail toward existing
-        behavior for sessions this check cannot classify).
+        behavior for sessions this check cannot classify). A genuinely
+        interrupted turn BURIED under later observed chatter still resumes:
+        the walk skips observed rows and looks at what sits beneath them —
+        an unanswered user row, a tool row, or an assistant row with
+        pending tool_calls means real interrupted work; a completed
+        assistant reply (or nothing at all) under a purely-observed tail
+        means the resume marker came from third-party activity recency,
+        not from anything this agent was doing.
         """
         try:
             entry = self.session_store._entries.get(session_key)  # noqa: SLF001
@@ -6960,14 +6967,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, exc,
             )
             return True
+        saw_observed = False
         for msg in reversed(transcript or []):
             role = msg.get("role")
             if role in {"system", "session_meta"}:
                 continue
             if role == "user" and msg.get("observed"):
-                return False
-            return True
-        return True
+                saw_observed = True
+                continue
+            if not saw_observed:
+                # Tail is not observed traffic — legacy behavior: resume.
+                return True
+            # Observed rows sit on top of this row. A completed assistant
+            # reply means nothing of this agent's was in flight; anything
+            # else is an interrupted addressed turn buried under chatter.
+            return not (role == "assistant" and not msg.get("tool_calls"))
+        # Exhausted: empty transcript keeps legacy resume behavior; a
+        # transcript of NOTHING but observed third-party rows is the
+        # incident shape — never resume it.
+        return not saw_observed
 
     async def _run_startup_resume_event(
         self,
@@ -7200,11 +7218,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Empty-text internal event — the _is_resume_pending branch in
             # _handle_message_with_agent prepends the proper reason-aware
             # system note before the turn runs.
+            #
+            # Group sessions need the observed-context channel prompt on the
+            # synthetic event too (#112): _build_gateway_agent_history keys
+            # its observed-row separation on the CURRENT event's channel
+            # prompt, and the resume path is exactly where another agent's
+            # observed narration must not replay as this agent's history.
+            _resume_channel_prompt = None
+            if getattr(source, "chat_type", None) == "group":
+                _prompt_fn = getattr(adapter, "_group_observe_channel_prompt", None)
+                if callable(_prompt_fn):
+                    try:
+                        _resume_channel_prompt = _prompt_fn()
+                    except Exception:
+                        _resume_channel_prompt = None
             event = MessageEvent(
                 text="",
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
+                channel_prompt=_resume_channel_prompt,
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
@@ -20477,14 +20510,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cancel_notes.discard(session_key)
                 if _persist_user_message_override is None:
                     _persist_user_message_override = message
-                message = (
-                    "[System note: The auto-resumed task visible in the "
-                    "conversation history was CANCELLED by the user's "
-                    "interrupt. Do NOT continue, complete, or verify it — "
-                    "treat it as abandoned unless the user explicitly asks "
-                    "for it again. Address ONLY the user's message below.]\n\n"
-                    + message
-                )
+                if isinstance(message, str) and message.strip():
+                    message = (
+                        "[System note: The auto-resumed task visible in the "
+                        "conversation history was CANCELLED by the user's "
+                        "interrupt. Do NOT continue, complete, or verify it — "
+                        "treat it as abandoned unless the user explicitly asks "
+                        "for it again. Address ONLY the user's message below.]\n\n"
+                        + message
+                    )
+                else:
+                    # Sentinel race: the user's interrupt arrived before the
+                    # synthetic resume turn started, so the resume marker was
+                    # already cleared and THIS empty-text turn is the resume
+                    # itself. It must neither run the cancelled task nor
+                    # reach the model as a blank user turn.
+                    message = (
+                        "[System note: The auto-resumed task visible in the "
+                        "conversation history was CANCELLED by the user's "
+                        "interrupt before it restarted. Do NOT continue, "
+                        "complete, or verify it. Acknowledge the cancellation "
+                        "in one short sentence and stop — the user's own "
+                        "message will arrive as the next turn.]"
+                    )
 
             # Consume one-shot /reload-skills note (if the user ran
             # /reload-skills since their last turn in this session). Same

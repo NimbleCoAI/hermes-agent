@@ -144,6 +144,76 @@ class TestResumeAddressingRecheck:
         adapter.handle_message.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_interrupted_turn_buried_under_observed_chatter_still_resumes(self):
+        """Observed rows on TOP of genuinely interrupted work (an assistant
+        row with pending tool_calls) must not swallow the recovery."""
+        runner, adapter = make_restart_runner()
+        source = make_restart_source(chat_id="resume-chat", chat_type="group")
+        entry = _pending_entry(source)
+        runner.session_store._entries = {entry.session_key: entry}
+        runner.session_store.load_transcript = MagicMock(
+            return_value=[
+                ADDRESSED_ROW,
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "t1"}]},
+                {"role": "tool", "content": "partial", "tool_call_id": "t1"},
+                OBSERVED_ROW,
+                OBSERVED_ROW,
+            ]
+        )
+        adapter.handle_message = AsyncMock()
+
+        runner._schedule_resume_pending_sessions()
+        await _drain(runner)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_all_observed_session_never_resumes(self):
+        """The incident shape: a per-user session holding NOTHING but another
+        agent's observed narration."""
+        runner, adapter = make_restart_runner()
+        source = make_restart_source(chat_id="resume-chat", chat_type="group")
+        entry = _pending_entry(source)
+        runner.session_store._entries = {entry.session_key: entry}
+        runner.session_store.load_transcript = MagicMock(
+            return_value=[OBSERVED_ROW, OBSERVED_ROW, OBSERVED_ROW]
+        )
+        runner.session_store.clear_resume_pending = MagicMock(return_value=True)
+        adapter.handle_message = AsyncMock()
+
+        runner._schedule_resume_pending_sessions()
+        await _drain(runner)
+
+        adapter.handle_message.assert_not_awaited()
+        runner.session_store.clear_resume_pending.assert_called_once_with(
+            entry.session_key
+        )
+
+    @pytest.mark.asyncio
+    async def test_group_resume_event_carries_observed_context_prompt(self):
+        """The synthetic resume event must carry the adapter's observed-group
+        channel prompt so observed rows separate on replay (#112)."""
+        runner, adapter = make_restart_runner()
+        source = make_restart_source(chat_id="resume-chat", chat_type="group")
+        entry = _pending_entry(source)
+        runner.session_store._entries = {entry.session_key: entry}
+        runner.session_store.load_transcript = MagicMock(
+            return_value=[ADDRESSED_ROW]
+        )
+        adapter._group_observe_channel_prompt = (
+            lambda: "identity block… observed group context rules…"
+        )
+        adapter.handle_message = AsyncMock()
+
+        runner._schedule_resume_pending_sessions()
+        await _drain(runner)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.channel_prompt is not None
+        assert "observed group context" in event.channel_prompt
+
+    @pytest.mark.asyncio
     async def test_transcript_read_error_fails_toward_resume(self):
         """The re-check must not break recovery for sessions it can't read."""
         runner, adapter = make_restart_runner()
