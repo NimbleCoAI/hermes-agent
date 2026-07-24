@@ -55,6 +55,20 @@ from tests.gateway.restart_test_helpers import (
 # ---------------------------------------------------------------------------
 
 
+async def _drain_startup_resume_tasks(runner) -> None:
+    """Await spawned startup-resume tasks to completion.
+
+    ``_run_startup_resume_event`` now performs an ``asyncio.to_thread``
+    addressing re-check (#112) before dispatching, so a single event-loop
+    tick is no longer enough for ``adapter.handle_message`` to be awaited.
+    """
+    for _ in range(200):
+        tasks = list(runner._background_tasks)
+        if not tasks:
+            break
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def test_resume_pending_is_cleared_only_after_successful_turn():
     """Interrupted/failed drain results must keep the restart recovery marker.
 
@@ -1052,7 +1066,7 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     adapter.handle_message = AsyncMock()
 
     scheduled = runner._schedule_resume_pending_sessions()
-    await asyncio.sleep(0)
+    await _drain_startup_resume_tasks(runner)
 
     assert scheduled == 1
     adapter.handle_message.assert_awaited_once()
@@ -1094,7 +1108,7 @@ async def test_startup_auto_resume_includes_crash_recovery():
     adapter.handle_message = AsyncMock()
 
     scheduled = runner._schedule_resume_pending_sessions()
-    await asyncio.sleep(0)
+    await _drain_startup_resume_tasks(runner)
 
     assert scheduled == 1
     adapter.handle_message.assert_awaited_once()
@@ -1342,7 +1356,7 @@ async def test_reconnect_reschedules_pending_after_late_platform_connect():
     # Platform reconnects → its pending session is retried.
     runner.adapters = {Platform.TELEGRAM: adapter}
     scheduled = runner._schedule_resume_pending_sessions(platform=Platform.TELEGRAM)
-    await asyncio.sleep(0)
+    await _drain_startup_resume_tasks(runner)
 
     assert scheduled == 1
     adapter.handle_message.assert_awaited_once()
@@ -1395,7 +1409,7 @@ async def test_reconnect_reschedule_is_platform_scoped():
     runner.adapters = {Platform.TELEGRAM: adapter}
 
     scheduled = runner._schedule_resume_pending_sessions(platform=Platform.TELEGRAM)
-    await asyncio.sleep(0)
+    await _drain_startup_resume_tasks(runner)
 
     # Only the telegram session is resumed; the discord session waits for its
     # own reconnect.
@@ -1490,7 +1504,12 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
     adapter.handle_message = fake_handle_message
 
     scheduled = runner._schedule_resume_pending_sessions()
-    await asyncio.sleep(0)
+    # The addressing re-check (#112) hops through asyncio.to_thread before
+    # dispatch — wait for the resume turn to actually start.
+    for _ in range(200):
+        if seen:
+            break
+        await asyncio.sleep(0.005)
 
     inbound = MessageEvent(
         text="hello",
