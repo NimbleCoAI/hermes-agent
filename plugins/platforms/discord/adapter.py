@@ -4868,18 +4868,48 @@ class DiscordAdapter(BasePlatformAdapter):
         content = getattr(message, "content", "") or ""
         return {match.group(1) for match in re.finditer(r"<@!?(\d+)>", content)}
 
+    def _self_managed_role_id(self, message: Any) -> Optional[str]:
+        """Return this bot's managed integration role id in the message's guild.
+
+        Discord's mention picker often resolves a bot's name to its managed
+        integration role (``<@&ROLE_ID>``) instead of the bot user. That role
+        is created by the integration, carries ``tags.bot_id`` equal to our
+        user id, and can only ever refer to this one bot — so mentioning it is
+        an unambiguous, explicit address of this bot. discord.py exposes it as
+        ``guild.self_role``. Returns None in DMs or when the role is absent.
+        """
+        guild = getattr(message, "guild", None)
+        if guild is None:
+            return None
+        self_role = getattr(guild, "self_role", None)
+        if self_role is None:
+            return None
+        return str(self_role.id)
+
     def _self_is_explicitly_mentioned(self, message: Any) -> bool:
         """Return True when this bot is explicitly @mentioned in the message.
 
-        Treats the bot as mentioned if it is either present in the resolved
-        ``message.mentions`` list OR referenced by its raw ``<@ID>`` / ``<@!ID>``
-        form in the message content.
+        Treats the bot as mentioned if it is present in the resolved
+        ``message.mentions`` list, referenced by its raw ``<@ID>`` / ``<@!ID>``
+        form in the message content, or addressed via its managed integration
+        role (``guild.self_role``) — either in ``message.role_mentions`` or as
+        a raw ``<@&ID>`` token. Mentions of other roles the bot merely holds
+        (e.g. a shared "bots" role) do NOT count: only the managed self-role
+        uniquely identifies this bot.
         """
         if not self._client or not self._client.user:
             return False
         if self._client.user in getattr(message, "mentions", []):
             return True
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+        if str(self._client.user.id) in self._raw_mentioned_user_ids(message):
+            return True
+        role_id = self._self_managed_role_id(message)
+        if role_id is None:
+            return False
+        for role in getattr(message, "role_mentions", None) or []:
+            if str(getattr(role, "id", "")) == role_id:
+                return True
+        return f"<@&{role_id}>" in (getattr(message, "content", "") or "")
 
     def _self_is_raw_mentioned(self, message: Any) -> bool:
         """Return True only when this bot has an inline mention token.
@@ -4888,10 +4918,17 @@ class DiscordAdapter(BasePlatformAdapter):
         without a literal ``<@bot>`` token in ``message.content``. This helper
         intentionally ignores the resolved mentions list so the bot admission
         gate can distinguish an explicit cross-bot address from a reply chip.
+        A raw ``<@&self_role>`` token counts: it is an inline, deliberate
+        address of this bot (reply chips never produce role-mention tokens).
         """
         if not self._client or not self._client.user:
             return False
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+        if str(self._client.user.id) in self._raw_mentioned_user_ids(message):
+            return True
+        role_id = self._self_managed_role_id(message)
+        return role_id is not None and f"<@&{role_id}>" in (
+            getattr(message, "content", "") or ""
+        )
 
     def _discord_bots_require_inline_mention(self) -> bool:
         """Whether another bot must type an inline @mention to trigger us.
@@ -6235,6 +6272,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._client.user:
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
+            _self_role_id = self._self_managed_role_id(message)
+            if _self_role_id:
+                normalized_content = normalized_content.replace(f"<@&{_self_role_id}>", "").strip()
             message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}

@@ -1486,3 +1486,92 @@ async def test_discord_non_reply_free_channel_skips_backfill(adapter, monkeypatc
 
     adapter._fetch_channel_context.assert_not_awaited()
 
+
+
+@pytest.mark.asyncio
+async def test_discord_accepts_managed_role_mentions_when_required(adapter, monkeypatch):
+    """Mention-picker often yields the bot's managed role (<@&ID>), not the user.
+
+    A resolved role_mentions entry matching guild.self_role must count as an
+    explicit mention and be stripped from the delivered text (#67869 upstream).
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    self_role = SimpleNamespace(id=5555)
+    message = make_message(
+        channel=FakeTextChannel(channel_id=323),
+        content="<@&5555> hey girl you up?",
+        mentions=[],
+    )
+    message.guild = SimpleNamespace(id=99, self_role=self_role)
+    message.role_mentions = [self_role]
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hey girl you up?"
+
+
+@pytest.mark.asyncio
+async def test_discord_accepts_raw_managed_role_mention_token(adapter, monkeypatch):
+    """Raw <@&self_role> token counts even when role_mentions is empty."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=324),
+        content="<@&5555> hello from raw role mention",
+        mentions=[],
+    )
+    message.guild = SimpleNamespace(id=99, self_role=SimpleNamespace(id=5555))
+    message.role_mentions = []
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello from raw role mention"
+
+
+@pytest.mark.asyncio
+async def test_discord_ignores_unrelated_role_mentions(adapter, monkeypatch):
+    """Roles the bot merely holds (shared @bots role) must NOT wake it."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=325),
+        content="<@&7777> everyone in bots-role, sound off",
+        mentions=[],
+    )
+    message.guild = SimpleNamespace(id=99, self_role=SimpleNamespace(id=5555))
+    message.role_mentions = [SimpleNamespace(id=7777)]
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_role_mention_without_self_role_still_gated(adapter, monkeypatch):
+    """No managed self-role in the guild -> role mentions change nothing."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=326),
+        content="<@&5555> anyone home?",
+        mentions=[],
+    )
+    message.guild = SimpleNamespace(id=99, self_role=None)
+    message.role_mentions = [SimpleNamespace(id=5555)]
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
