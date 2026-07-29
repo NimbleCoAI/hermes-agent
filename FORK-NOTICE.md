@@ -1,10 +1,11 @@
 # Multi-Tenant Fork Notice
 
-> **⚠️ This repository was renamed: `NimbleCoAI/hermes-agent` → `NimbleCoAI/hermes-agent-mt`.**
+> **⚠️ This repository moved orgs: `NimbleCoAI/hermes-agent-mt` → `NimbleCoOrg/hermes-agent-mt`.**
+> (Earlier history: it was also renamed from `hermes-agent` to `hermes-agent-mt`.)
 > - **Git URLs:** clone/remote URLs **auto-redirect** — existing checkouts keep working, no action needed.
-> - **Container image:** moved to **`ghcr.io/nimblecoai/hermes-agent-mt`**. The old path `ghcr.io/nimblecoai/hermes-agent` is a **deprecated alias**, still updated during a transition window but **frozen after 2026-07-15** — repoint to the new path before then.
+> - **Container image — action required.** CI now publishes to **`ghcr.io/nimblecoorg/hermes-agent-mt`** (the workflow derives the namespace from the repo owner, so it repointed itself on transfer). The old **`ghcr.io/nimblecoai/hermes-agent-mt`** package is **retained read-only and frozen at 2026-07-21**. It is still public and `docker pull` against it still **succeeds** — it just returns code from before the move, with no error. Repoint any compose file, deploy script, or pinned digest to the `nimblecoorg` path.
 
-This is **hermes-agent-mt** — a thin fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) patched for multi-tenant deployments managed by [Hermes Swarm Map](https://github.com/NimbleCoAI/hermes-swarm-map).
+This is **hermes-agent-mt** — a thin fork of [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) patched for multi-tenant deployments managed by [Swarm Map](https://github.com/NimbleCoOrg/swarm-map).
 
 ## What's Different
 
@@ -35,15 +36,15 @@ This fork adds **2 core patches** and **~8 adapter improvements** on top of upst
 
 ```bash
 # Docker (recommended)
-docker pull ghcr.io/nimblecoai/hermes-agent-mt:latest
+docker pull ghcr.io/nimblecoorg/hermes-agent-mt:latest
 
 # Or build from source
-git clone https://github.com/NimbleCoAI/hermes-agent-mt.git
+git clone https://github.com/NimbleCoOrg/hermes-agent-mt.git
 cd hermes-agent-mt
 pip install -e ".[all]"
 ```
 
-For multi-tenant management, use [Hermes Swarm Map](https://github.com/NimbleCoAI/hermes-swarm-map).
+For multi-tenant management, use [Swarm Map](https://github.com/NimbleCoOrg/swarm-map).
 
 ## License
 
