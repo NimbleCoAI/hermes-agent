@@ -328,17 +328,61 @@ def _get_extract_backend() -> str:
     return _get_capability_backend("extract")
 
 
+# Every backend name ``_is_backend_available`` knows how to probe. Used only to
+# tell "you typed a name that does not exist" apart from "the backend exists but
+# its credential is missing" — two different operator mistakes that otherwise
+# produce byte-identical (silent) behavior. Keep in sync with
+# ``_is_backend_available``; the test suite pins that.
+_KNOWN_BACKENDS: frozenset[str] = frozenset({
+    "exa", "parallel", "firecrawl", "tavily", "searxng",
+    "brave-free", "ddgs", "xai",
+})
+
+# (capability, configured_value) pairs already reported. _get_capability_backend
+# runs on EVERY web_search/web_extract dispatch and on every `hermes tools`
+# repaint, so an un-deduped warning here would itself become log spam.
+_backend_fallback_warned: set = set()
+
+
 def _get_capability_backend(capability: str) -> str:
     """Shared helper for per-capability backend selection.
 
     Reads ``web.{capability}_backend`` from config; if set and available,
     uses it. Otherwise falls through to the shared ``_get_backend()``.
+
+    When an explicitly configured backend is discarded, log it once. Silently
+    ignoring the operator's choice means a one-character typo
+    (``brave`` for ``brave-free``) reroutes every search to a completely
+    different provider, indefinitely, with nothing in the logs at any level —
+    the config file and the actual behavior disagree and nothing says so.
     """
     cfg = _load_web_config()
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
     if specific and _is_backend_available(specific):
         return specific
-    return _get_backend()
+
+    resolved = _get_backend()
+    if specific and specific != resolved:
+        key = (capability, specific)
+        if key not in _backend_fallback_warned:
+            _backend_fallback_warned.add(key)
+            if specific in _KNOWN_BACKENDS:
+                logger.warning(
+                    "web.%s_backend=%r is a known backend but is not available "
+                    "(its API key or URL is unset) — falling back to %r. Set "
+                    "the required credential, or change the config to match "
+                    "what you intend to use.",
+                    capability, specific, resolved or "auto-detect",
+                )
+            else:
+                logger.warning(
+                    "web.%s_backend=%r is not a recognised backend — falling "
+                    "back to %r. Valid values: %s. (This is a config typo: "
+                    "your configured provider is NOT being used.)",
+                    capability, specific, resolved or "auto-detect",
+                    ", ".join(sorted(_KNOWN_BACKENDS)),
+                )
+    return resolved
 
 
 def _is_backend_available(backend: str) -> bool:
@@ -723,6 +767,20 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             # configured backend isn't a registered search provider (typo,
             # uninstalled plugin, or capability mismatch).
             provider = get_active_search_provider()
+            # Say so, once. A resolved-but-unregistered backend silently
+            # rerouting every search is indistinguishable from working
+            # correctly, which turns a config typo into an unfalsifiable
+            # "search returns nothing" report.
+            if backend:
+                key = ("search-dispatch", backend)
+                if key not in _backend_fallback_warned:
+                    _backend_fallback_warned.add(key)
+                    logger.warning(
+                        "Configured search backend %r is not a registered "
+                        "search provider — using %r instead. Check for a typo "
+                        "or a disabled/uninstalled web plugin.",
+                        backend, getattr(provider, "name", None) or "none",
+                    )
 
         if provider is None:
             # A bundled web plugin the user explicitly disabled looks
