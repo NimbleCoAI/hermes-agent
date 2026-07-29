@@ -636,6 +636,14 @@ def run_conversation(
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
     messages = _ctx.messages
+    # Publish the live turn transcript on the agent so an *external* observer
+    # can read it mid-turn. Delegation needs this: when a subagent hits
+    # delegation.child_timeout_seconds the parent thread abandons the child's
+    # future and never receives its return value, so without a live handle the
+    # entire run — often many minutes of completed tool work — is unrecoverable
+    # and the parent sees only "timed out". `messages` is mutated in place for
+    # the rest of the turn; the single rebind site below re-publishes.
+    agent._session_messages = messages
     conversation_history = _ctx.conversation_history
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
