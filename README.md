@@ -6,7 +6,7 @@
 
 > **🔀 Multi-Tenant Fork** — This is `hermes-agent-mt`, patched for multi-tenant deployments with per-context memory isolation, group policy enforcement, and [Swarm Map](https://github.com/NimbleCoOrg/swarm-map) integration. See [FORK-NOTICE.md](FORK-NOTICE.md) for details.
 >
-> **⚠️ Repo moved orgs:** `NimbleCoAI/hermes-agent-mt` → `NimbleCoOrg/hermes-agent-mt` (and earlier, `hermes-agent` → `hermes-agent-mt`). Git clone/remote URLs auto-redirect — no action needed. **The image path did change:** CI now publishes to **`ghcr.io/nimblecoorg/hermes-agent-mt`**. The old `ghcr.io/nimblecoai/hermes-agent-mt` package is kept read-only, **frozen at 2026-07-21** — pulls against it still succeed and silently return pre-move code, so repoint anything pinned to it.
+> **⚠️ Repo moved orgs:** `NimbleCoAI/hermes-agent-mt` → `NimbleCoOrg/hermes-agent-mt` (and earlier, `hermes-agent` → `hermes-agent-mt`). Git clone/remote URLs auto-redirect — no action needed. **The image path did change:** CI now publishes to **`ghcr.io/nimblecoorg/hermes-agent-mt`**. The old `ghcr.io/nimblecoai/hermes-agent-mt` package is kept read-only, **frozen at 2026-07-21** — pulls against it still succeed and silently return pre-move code, so repoint anything pinned to it. The pre-rename `ghcr.io/nimblecoai/hermes-agent` package is frozen the same way and also still pulls successfully — repoint anything pinned to it too.
 >
 > Upstream: [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) · Image: `ghcr.io/nimblecoorg/hermes-agent-mt:latest`
 
