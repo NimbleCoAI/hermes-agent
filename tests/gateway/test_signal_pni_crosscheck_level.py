@@ -13,8 +13,10 @@ restart. That is the lifecycle spam home_log_router's own module docstring
 forbids, and it made a correct code path read as a recurring failure.
 
 These tests pin:
-- the cross-check mismatch does NOT emit a WARNING (or worse)
-- it IS still recorded at DEBUG, so the diagnostic is not lost
+- the cross-check mismatch does NOT emit a WARNING (or worse), which is
+  what home_log_router's floor relays
+- it IS still recorded at INFO, so it survives in gateway.log (whose
+  handler is INFO+); DEBUG would have dropped it from the component log
 - the ACI from listIdentities wins regardless of what getUserStatus returns
 """
 from __future__ import annotations
@@ -72,17 +74,21 @@ class TestPniCrossCheckLevel:
         )
 
     @pytest.mark.asyncio
-    async def test_mismatch_is_still_recorded_at_debug(self, adapter, caplog):
+    async def test_mismatch_is_still_recorded_at_info(self, adapter, caplog):
         caplog.set_level(logging.DEBUG, logger="gateway.platforms.signal")
         await _resolve(adapter)
 
-        debug_msgs = [
+        info_msgs = [
             r.getMessage() for r in caplog.records
-            if r.levelno == logging.DEBUG and "getUserStatus" in r.getMessage()
+            if r.levelno == logging.INFO and "getUserStatus" in r.getMessage()
         ]
-        assert debug_msgs, "the cross-check diagnostic must survive at DEBUG"
-        assert any(PNI[:12] in m and ACI[:12] in m for m in debug_msgs), (
-            "the DEBUG line should still carry both identifiers"
+        assert info_msgs, (
+            "the cross-check must survive at INFO — gateway.log's handler is "
+            "INFO+, so DEBUG would remove it from the component log entirely "
+            "while INFO already clears home_log_router's WARNING floor"
+        )
+        assert any(PNI[:12] in m and ACI[:12] in m for m in info_msgs), (
+            "the INFO line should still carry both identifiers"
         )
 
     @pytest.mark.asyncio

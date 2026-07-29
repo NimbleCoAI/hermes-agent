@@ -1540,23 +1540,17 @@ class SignalAdapter(BasePlatformAdapter):
                         status_sid = status.get("uuid") or status.get("serviceId")
                         break
             if candidate and status_sid and status_sid != candidate:
-                # DEBUG, not WARNING: per the docstring above, signal-cli
-                # ALWAYS returns the account PNI for a self getUserStatus, so
-                # this branch is the expected steady state on every startup,
-                # not an anomaly — and the ACI from listIdentities is already
-                # the value used below. Logging it at WARNING made a correct
-                # code path look like a fault, and because
-                # `gateway.platforms.signal` is in home_log_router's
-                # DEFAULT_LOGGERS at WARNING level, every agent relayed it to
-                # the operator's home channel on each restart — exactly the
-                # lifecycle spam that module's "no-lifecycle-spam rule"
-                # forbids. The cross-check is still worth keeping: at DEBUG it
-                # remains available when actually diagnosing identity issues.
-                logger.debug(
-                    "Signal: getUserStatus self-lookup returned %s (the "
-                    "account PNI, as expected) but listIdentities returned "
-                    "ACI %s — using the ACI. getUserStatus is never trusted "
-                    "for self-identity.",
+                # INFO, not WARNING: per the docstring above this mismatch is
+                # the expected steady state on every connect, so at WARNING it
+                # was a 100%-false-positive "fault" that home_log_router
+                # relayed to the operator on every restart. INFO clears that
+                # floor while keeping the line in gateway.log — DEBUG would
+                # drop it from the component log entirely.
+                logger.info(
+                    "Signal: getUserStatus self-lookup returned %s (presumed "
+                    "the account PNI) but listIdentities returned ACI %s — "
+                    "using the ACI. getUserStatus is never trusted for "
+                    "self-identity.",
                     str(status_sid)[:12], candidate[:12],
                 )
         except Exception:
