@@ -3,9 +3,7 @@
 When a child exceeds ``delegation.child_timeout_seconds`` the parent abandons
 its future, so ``run_conversation`` never returns and its ``final_response``
 is lost. Previously the parent received ``summary: None`` — an entire run's
-worth of completed tool work was discarded, and because no summary file was
-spilled, the parent's follow-up ``read_file`` on the expected
-``cache/delegation/subagent-summary-<idx>-<ts>.txt`` path failed outright.
+worth of completed tool work was discarded, with no artifact written anywhere.
 
 ``_salvage_partial_summary`` reconstructs the child's last assistant prose and
 a tool trace from the live transcript that ``run_conversation`` publishes as

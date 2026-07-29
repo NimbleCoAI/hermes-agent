@@ -636,13 +636,19 @@ def run_conversation(
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
     messages = _ctx.messages
-    # Publish the live turn transcript on the agent so an *external* observer
-    # can read it mid-turn. Delegation needs this: when a subagent hits
-    # delegation.child_timeout_seconds the parent thread abandons the child's
-    # future and never receives its return value, so without a live handle the
-    # entire run — often many minutes of completed tool work — is unrecoverable
-    # and the parent sees only "timed out". `messages` is mutated in place for
-    # the rest of the turn; the single rebind site below re-publishes.
+    # Keep the live turn transcript reachable from the agent object so an
+    # *external* observer can read it mid-turn. Delegation needs this: when a
+    # subagent hits delegation.child_timeout_seconds the parent abandons the
+    # child's future and never receives its return value, so the salvage in
+    # tools.delegate_tool reads this list instead.
+    #
+    # build_turn_context already sets this via _persist_session, so this line
+    # is mostly belt-and-braces for the paths that skip persistence. The part
+    # that actually matters is that `messages` is REBOUND (not just appended
+    # to) by every _compress_context call — 5 sites in this function alone —
+    # and each rebind abandons the list this reference points at. That
+    # re-publish lives in _compress_context itself (run_agent.py) so it cannot
+    # be missed by a new call site; test_delegate_partial_summary asserts it.
     agent._session_messages = messages
     conversation_history = _ctx.conversation_history
     active_system_prompt = _ctx.active_system_prompt

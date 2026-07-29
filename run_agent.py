@@ -5962,11 +5962,25 @@ class AIAgent:
         ``force=False``.
         """
         from agent.conversation_compression import compress_context
-        return compress_context(
+        result = compress_context(
             self, messages, system_message,
             approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic,
             force=force,
         )
+        # Compression returns a NEW list (conversation_compression checks
+        # `compressed is messages` to detect the no-progress case), and every
+        # caller rebinds its local `messages` to it. Re-publish here rather
+        # than at each call site: this forwarder is the single choke point, so
+        # a future call site is covered automatically. Without this, an
+        # external observer holding `_session_messages` — the delegation
+        # timeout salvage — keeps a reference to the abandoned
+        # pre-compression list and silently reports stale, truncated work.
+        try:
+            if isinstance(result, tuple) and result and isinstance(result[0], list):
+                self._session_messages = result[0]
+        except Exception:  # pragma: no cover - never break compression
+            pass
+        return result
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""

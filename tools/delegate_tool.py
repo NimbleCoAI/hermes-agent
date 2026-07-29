@@ -602,6 +602,14 @@ _MIN_SUMMARY_CHARS = 2000
 # wrote a wrap-up, so its last turns stand in for one; the normal per-summary
 # budget still trims the result afterwards.
 _PARTIAL_SUMMARY_TURNS = 3
+# Ceiling on the salvaged body. Applied inside the salvage, before the progress
+# relay copies the string to the gateway websocket — _apply_summary_budget only
+# protects the parent's model context, and it runs later.
+_PARTIAL_SUMMARY_MAX_CHARS = 12000
+# The literal the child emits when it gives up after repeated empty-LLM-response
+# retries (see run_agent/conversation_loop empty-response recovery). The success
+# path treats it as failure; the salvage must not mistake it for reasoning.
+_EMPTY_RESPONSE_SENTINEL = "(empty)"
 # No default wall-clock cap on child agents: legitimate heavy subagent work
 # (deep reviews, research fan-outs, slow reasoning models) was being killed
 # mid-task. Errors should come from what the child actually does; stuck-child
@@ -1606,13 +1614,33 @@ def _salvage_partial_summary(child: Any, task_index: int) -> tuple[str, list[Dic
             role = msg.get("role")
             if role == "assistant":
                 content = msg.get("content")
-                if isinstance(content, str) and content.strip():
+                # Skip the empty-response recovery scaffolding. Those turns
+                # carry the literal "(empty)" sentinel, which the success path
+                # treats as failure (see _empty_sentinel below). A child stuck
+                # in the empty-response retry loop is a prime timeout
+                # candidate, so without this the salvage would return
+                # "(empty)" as "the child's last reasoning" and push the real
+                # findings out of the tail window.
+                if (
+                    isinstance(content, str)
+                    and content.strip()
+                    and content.strip() != _EMPTY_RESPONSE_SENTINEL
+                    and not msg.get("_empty_recovery_synthetic")
+                    and not msg.get("_empty_terminal_sentinel")
+                ):
                     assistant_texts.append(content.strip())
                 for tc in msg.get("tool_calls") or []:
-                    fn = tc.get("function", {})
+                    # Per-call guard: one malformed entry must not abort the
+                    # whole salvage via the function-level except and throw
+                    # away every recovered turn.
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function")
+                    fn = fn if isinstance(fn, dict) else {}
+                    args = fn.get("arguments")
                     entry_t = {
-                        "tool": fn.get("name", "unknown"),
-                        "args_bytes": len(fn.get("arguments", "")),
+                        "tool": fn.get("name") or "unknown",
+                        "args_bytes": len(args) if isinstance(args, str) else 0,
                     }
                     tool_trace.append(entry_t)
                     tc_id = tc.get("id")
@@ -1638,6 +1666,18 @@ def _salvage_partial_summary(child: Any, task_index: int) -> tuple[str, list[Dic
         # are the best available stand-in. Keep the tail: later reasoning
         # supersedes earlier, and the parent's context budget is finite.
         body = "\n\n".join(assistant_texts[-_PARTIAL_SUMMARY_TURNS:])
+        # Hard cap before anything else sees this. _apply_summary_budget trims
+        # for the MODEL's context later, but the progress relay copies the
+        # string onto the websocket first (tui_gateway re-emits it as
+        # message.complete), so three half-megabyte turns would put ~1.5 MB on
+        # the wire. The success path never has this problem because a model
+        # writes its own summary.
+        if len(body) > _PARTIAL_SUMMARY_MAX_CHARS:
+            kept = len(body) - _PARTIAL_SUMMARY_MAX_CHARS
+            body = (
+                body[:_PARTIAL_SUMMARY_MAX_CHARS]
+                + f"\n\n[... {kept:,} further chars of salvaged text omitted]"
+            )
         ok = sum(1 for t in tool_trace if t.get("status") == "ok")
         errored = sum(1 for t in tool_trace if t.get("status") == "error")
         header = (
@@ -2124,7 +2164,10 @@ def _run_single_child(
                         ),
                         status="timeout" if is_timeout else "error",
                         duration_seconds=duration,
-                        summary=partial_summary,
+                        # [:500] matches the success path's relay payload
+                        # (see complete_kwargs below) — the full text is in
+                        # the spill file, not on the websocket.
+                        summary=partial_summary[:500],
                     )
                 except Exception:
                     pass
