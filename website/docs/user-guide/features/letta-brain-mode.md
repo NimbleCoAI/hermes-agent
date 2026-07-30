@@ -61,7 +61,13 @@ Environment variables are checked first (convenient for Docker), then `config.ya
 | `LETTA_BRAIN_API_KEY` | no | Sent as `Authorization: Bearer …`. Needed for Letta Cloud or a secured self-hosted server; leave unset for an unsecured local server. Also `gateway.letta_brain.api_key`. |
 | `LETTA_BRAIN_STREAMING` | no | Set to `off`, `0`, `false`, or `no` to force the non-streaming (blocking) path. **Anything else — including unset — leaves streaming enabled.** See the caveat below. |
 
-If the URL and agent ID are missing when a turn arrives, the gateway replies with `⚠️ Letta brain not configured (LETTA_BRAIN_URL + LETTA_BRAIN_AGENT_ID)` rather than silently falling back to the native loop.
+:::warning Partial configuration fails silently to the native loop
+Both the URL and the agent ID are required. If **either** is missing or misspelled, `_get_letta_brain()` returns `None`, the dispatch branch in `_run_agent_inner` is skipped entirely, and the turn proceeds to proxy mode or the **native Hermes loop** — with no warning, no log line, and a perfectly normal-looking reply.
+
+So a typo in `LETTA_BRAIN_AGENT_ID` does not surface an error; it surfaces native Hermes wearing the same door. That is the more dangerous failure mode, because none of the caveats on this page apply to that turn while the native toolset — which you may not have intended to expose — does. Confirm the binding is live (check the `letta brain response: url=… agent=…` log line on the first turn) before assuming traffic reaches Letta.
+
+The string `⚠️ Letta brain not configured (LETTA_BRAIN_URL + LETTA_BRAIN_AGENT_ID)` does exist as a defensive guard at the top of `_run_agent_via_letta`, but because dispatch is gated on the *same* `_get_letta_brain()` check, it is effectively unreachable through the normal gateway path.
+:::
 
 ---
 
@@ -229,6 +235,7 @@ A candid list of what this mode does not do yet:
 - Streamed turns report zero token usage (see [above](#budget-and-usage-accounting-the-important-caveat)).
 - No credits/spend accounting and no tool-call audit for brain turns.
 - One gateway binds to exactly **one** Letta agent. There is no per-platform, per-group, or per-profile agent routing.
+- Partial configuration (only one of URL / agent ID) silently falls through to the native loop instead of erroring — see [above](#environment-variable-reference).
 - Hermes personality, memory, context files, skills, and toolset do not reach the brain.
 - The brain is identified to Letta only by an inline sender tag — there is no per-sender isolation on the Letta side. Everyone in a bound group shares one agent and one history.
 - The SSE path has unit coverage for line parsing only; there is no end-to-end streaming test. The blocking path is the live-validated one.

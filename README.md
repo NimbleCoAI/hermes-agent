@@ -214,6 +214,8 @@ LETTA_BRAIN_API_KEY="..."        # optional; Letta Cloud / secured servers
 LETTA_BRAIN_STREAMING="off"      # optional; see the caveat below
 ```
 
+Both the URL and the agent ID are required, and there is no separate on/off flag. If **either** is missing or misspelled the binding simply doesn't activate: the turn falls through to the **native Hermes loop** with no warning, so confirm the binding is live before assuming traffic reaches Letta.
+
 Authorization, pairing, group approval, and transcript audit all run **upstream** of the bridge, so they apply unchanged — a Letta-brained gateway is not an authorization bypass. Hermes' personality, memory, context files, skills, and toolset are **not** forwarded; configure those on the Letta agent itself.
 
 > [!WARNING]
