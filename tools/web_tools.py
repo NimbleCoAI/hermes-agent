@@ -253,7 +253,100 @@ def _list_registered_web_providers():
         return []
 
 
-def _get_backend() -> str:
+# (config_key, configured_value) pairs already reported by
+# _warn_discarded_backend. These paths run on EVERY web_search / web_extract
+# dispatch and on every `hermes tools` repaint, so an un-deduped warning would
+# itself become the log spam it exists to surface.
+_backend_discard_warned: set = set()
+
+
+def _valid_backend_names(capability: str = "") -> list:
+    """Backend names a user may legitimately configure, for messages.
+
+    Union of the built-in probes and whatever the plugin registry currently
+    holds — a third-party provider must appear here, or telling the operator
+    their name is invalid would be worse than saying nothing.
+
+    ``capability`` ("search" / "extract") filters to providers that actually
+    offer it. Without that filter an ``extract_backend`` typo was answered with
+    a list including ``brave-free``, ``ddgs``, ``searxng`` and ``xai`` — none of
+    which can extract — so following the advice swapped one broken config for
+    another, and it contradicted the precise list the extract dispatcher already
+    prints ("firecrawl, tavily, exa, or parallel").
+    """
+    names = set()
+    supports = f"supports_{capability}" if capability else ""
+    try:
+        for provider in _list_registered_web_providers():
+            name = getattr(provider, "name", None)
+            if not name:
+                continue
+            if supports:
+                probe = getattr(provider, supports, None)
+                try:
+                    if callable(probe) and not probe():
+                        continue
+                except Exception:  # noqa: BLE001 — a broken provider is skipped
+                    continue
+            names.add(str(name))
+    except Exception:  # noqa: BLE001 — a broken registry must not break logging
+        pass
+    # Legacy names have no registry entry to interrogate. Only xai/ddgs/searxng/
+    # brave-free are search-only among them; the rest do both.
+    _LEGACY_SEARCH_ONLY = {"brave-free", "ddgs", "searxng", "xai"}
+    for name in _LEGACY_WEB_BACKENDS:
+        if capability == "extract" and name in _LEGACY_SEARCH_ONLY:
+            continue
+        names.add(name)
+    return sorted(names)
+
+
+def _warn_discarded_backend(
+    config_key: str, configured: str, resolved: str, capability: str = ""
+) -> None:
+    """Report, once, that an explicitly configured backend was discarded.
+
+    Silently ignoring the operator's choice means a one-character typo
+    (``brave`` for ``brave-free``) reroutes every request to a different
+    provider indefinitely, with nothing at any log level — the config file and
+    the runtime disagree and nothing says so. The only symptom is "web search
+    returns empty", indistinguishable from a provider outage.
+
+    Distinguishes the two operator mistakes, which are otherwise identical:
+    a name that exists but lacks its credential, versus a name that does not
+    exist. Classification uses the same test as ``_get_backend`` —
+    ``_LEGACY_WEB_BACKENDS`` or the plugin registry — so a registered
+    third-party provider is never mislabelled a typo.
+    """
+    if not configured or configured == resolved:
+        return
+    key = (config_key, configured)
+    if key in _backend_discard_warned:
+        return
+    _backend_discard_warned.add(key)
+
+    recognised = (
+        configured in _LEGACY_WEB_BACKENDS
+        or _registered_web_provider(configured) is not None
+    )
+    if recognised:
+        logger.warning(
+            "web.%s=%r is a recognised backend but is not available (its API "
+            "key, URL or plugin is missing) — falling back to %r. Set the "
+            "required credential, or change the config to match what you "
+            "intend to use.",
+            config_key, configured, resolved,
+        )
+    else:
+        logger.warning(
+            "web.%s=%r is not a known backend — falling back to %r, so your "
+            "configured provider is NOT being used. Valid values: %s.",
+            config_key, configured, resolved,
+            ", ".join(_valid_backend_names(capability)),
+        )
+
+
+def _resolve_backend() -> str:
     """Determine which web backend to use (shared fallback).
 
     Reads ``web.backend`` from config.yaml (set by ``hermes tools``).
@@ -303,6 +396,41 @@ def _get_backend() -> str:
     return "firecrawl"  # default (backward compat)
 
 
+# NOTE: there is deliberately no dispatch-layer warning here.
+#
+# An earlier revision added one, and it was wrong in the only case it could
+# actually fire. It keyed on the value `_get_*_backend()` returned rather than
+# the key the operator set, so it named `web.{capability}_backend` even when the
+# value came from `web.backend` — the key `hermes tools` actually writes. It
+# also asserted "the credential is set", inferred from configured == resolved,
+# which `_resolve_backend` does not establish: that function returns any
+# legacy-or-registered NAME without probing availability at all. And it was
+# near-dead regardless — every bundled provider supports search, and the extract
+# dispatcher already returns a precise typed error for a real capability
+# mismatch a few lines below. A warning that misstates the key, invents a
+# credential fact, and duplicates a better error is worse than silence.
+#
+# Misconfiguration is reported at the config layer instead, by
+# _warn_discarded_backend, which knows which key it read.
+
+
+def _get_backend() -> str:
+    """``_resolve_backend`` plus a one-time report if ``web.backend`` was dropped.
+
+    ``web.backend`` is the key ``hermes tools`` actually writes (it never
+    writes the per-capability keys), so it is where most misconfigurations
+    live — and ``_resolve_backend`` discards an unrecognised value silently.
+    """
+    resolved = _resolve_backend()
+    try:
+        configured = (_load_web_config().get("backend") or "").lower().strip()
+        # No capability: web.backend is the shared key, used for both.
+        _warn_discarded_backend("backend", configured, resolved)
+    except Exception:  # pragma: no cover — logging must never break resolution
+        pass
+    return resolved
+
+
 def _get_search_backend() -> str:
     """Determine which backend to use for web_search specifically.
 
@@ -338,7 +466,14 @@ def _get_capability_backend(capability: str) -> str:
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
     if specific and _is_backend_available(specific):
         return specific
-    return _get_backend()
+    resolved = _get_backend()
+    try:
+        _warn_discarded_backend(
+            f"{capability}_backend", specific, resolved, capability=capability
+        )
+    except Exception:  # pragma: no cover — logging must never break resolution
+        pass
+    return resolved
 
 
 def _is_backend_available(backend: str) -> bool:
