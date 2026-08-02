@@ -21,6 +21,7 @@ Two independent defects, both found in a Discord control-surface audit:
   WIDENED access instead of denying.
 """
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -359,3 +360,140 @@ def test_missing_configured_attrs_fall_back_to_parsed_truthiness(monkeypatch):
     _no_pairing(adapter, monkeypatch)
     assert adapter._is_allowed_user("999", guild=object()) is True
     assert adapter._is_allowed_user("111", guild=object()) is False
+
+
+# ---------------------------------------------------------------------------
+# R3 — union semantics: the flag admits channel members even when a user
+# allowlist is configured (adapter side; without this the flag silently does
+# nothing on any agent that also lists users, which is every deployed agent)
+# ---------------------------------------------------------------------------
+
+
+def _union_adapter(monkeypatch):
+    adapter = _make_bare_adapter(
+        _user_allowlist_configured=True,
+        _allowed_user_ids={"111"},
+        _role_allowlist_configured=False,
+    )
+    _no_pairing(adapter, monkeypatch)
+    return adapter
+
+
+def test_adapter_union_admits_stranger_in_allowed_channel(monkeypatch):
+    monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555")
+    adapter = _union_adapter(monkeypatch)
+    assert adapter._is_allowed_user("999", guild=object(), channel_ids={"555"}) is True
+
+
+def test_adapter_union_keeps_allowlisted_user_everywhere(monkeypatch):
+    """The user allowlist is not narrowed by the flag — union, not replacement."""
+    monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555")
+    adapter = _union_adapter(monkeypatch)
+    assert adapter._is_allowed_user("111", guild=object(), channel_ids={"777"}) is True
+
+
+def test_adapter_union_thread_channel_ids_carry_parent(monkeypatch):
+    """on_message passes {thread id, parent id}; the parent match must admit."""
+    monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555")
+    adapter = _union_adapter(monkeypatch)
+    assert (
+        adapter._is_allowed_user("999", guild=object(), channel_ids={"888", "555"})
+        is True
+    )
+
+
+def test_adapter_union_requires_the_flag(monkeypatch):
+    """Flag off → configured user allowlist stays a strict gate (no widening)."""
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555")
+    adapter = _union_adapter(monkeypatch)
+    assert adapter._is_allowed_user("999", guild=object(), channel_ids={"555"}) is False
+
+
+def test_adapter_union_denies_unlisted_channel(monkeypatch):
+    monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "111,222")
+    adapter = _union_adapter(monkeypatch)
+    assert adapter._is_allowed_user("999", guild=object(), channel_ids={"555"}) is False
+
+
+def test_adapter_union_ignores_wildcard(monkeypatch):
+    """DISCORD_ALLOWED_CHANNELS=* is a scope statement, not a grant (cyborg)."""
+    monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "*")
+    adapter = _union_adapter(monkeypatch)
+    assert adapter._is_allowed_user("999", guild=object(), channel_ids={"555"}) is False
+
+
+def test_adapter_union_gives_no_dm_grant(monkeypatch):
+    monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555")
+    adapter = _union_adapter(monkeypatch)
+    assert (
+        adapter._is_allowed_user("999", guild=None, is_dm=True, channel_ids=None)
+        is False
+    )
+
+
+def test_end_to_end_stranger_passes_both_gates_with_user_allowlist_present(
+    monkeypatch,
+):
+    """The incident shape, fixed end to end: a user allowlist exists, the flag is
+    on, and a stranger in an approved channel passes BOTH the adapter gate and
+    the gateway gate (previously the adapter dropped them and the flag was
+    unreachable)."""
+    monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555")
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "111")
+    adapter = _union_adapter(monkeypatch)
+    assert adapter._is_allowed_user("999", guild=object(), channel_ids={"555"}) is True
+    runner = _make_bare_runner()
+    assert runner._is_user_authorized(_discord_channel_msg(user_id="999")) is True
+    assert (
+        runner._is_user_authorized(_discord_thread_msg(user_id="999", parent_chat_id="555"))
+        is True
+    )
+
+
+# ---------------------------------------------------------------------------
+# R4 — reconnect must not fail open after the on_ready username rewrite
+# ---------------------------------------------------------------------------
+
+
+def test_resolver_zero_resolution_does_not_clear_env(monkeypatch):
+    """If NO username resolves, DISCORD_ALLOWED_USERS must not be rewritten to ''.
+
+    An emptied var reads as 'no allowlist configured' on the next
+    connect(is_reconnect=True) parse, clearing _user_allowlist_configured and
+    widening access — the reconnect fail-open found in review.
+    """
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "ghostname")
+    adapter = _make_bare_adapter(
+        _allowed_user_ids={"ghostname"},
+        _client=NS(guilds=[]),
+        platform=Platform.DISCORD,  # self.name derives from this in the print path
+    )
+    asyncio.run(adapter._resolve_allowed_usernames())
+    assert os.environ["DISCORD_ALLOWED_USERS"] == "ghostname"
+    assert adapter._allowed_user_ids == {"ghostname"}
+
+
+def test_resolver_partial_resolution_still_rewrites(monkeypatch):
+    """Numeric entries (and resolved ids) keep flowing into the env var."""
+    import asyncio
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "12345,ghostname")
+    adapter = _make_bare_adapter(
+        _allowed_user_ids={"12345", "ghostname"},
+        _client=NS(guilds=[]),
+        platform=Platform.DISCORD,  # self.name derives from this in the print path
+    )
+    asyncio.run(adapter._resolve_allowed_usernames())
+    assert os.environ["DISCORD_ALLOWED_USERS"] == "12345"
+    assert adapter._allowed_user_ids == {"12345"}
