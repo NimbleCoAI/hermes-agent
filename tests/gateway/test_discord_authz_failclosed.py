@@ -119,6 +119,78 @@ def test_channel_scoped_access_denies_unlisted_channel(monkeypatch):
     assert runner._is_user_authorized(_discord_channel_msg(chat_id="555")) is False
 
 
+def _discord_thread_msg(user_id="999", chat_id="888", parent_chat_id="555"):
+    """A human posting in a thread under a guild channel (chat_type 'thread').
+
+    With DISCORD_AUTO_THREAD on (the default) most conversation happens in
+    threads, so the channel-scoped grant must cover them — this was the exact
+    shape of the original incident: an approved parent channel, a stranger in
+    one of its threads, silence.
+    """
+    return SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=chat_id,
+        chat_type="thread",
+        user_id=user_id,
+        user_name="SomeHuman",
+        is_bot=False,
+        parent_chat_id=parent_chat_id,
+    )
+
+
+def test_channel_scoped_access_covers_thread_under_allowed_parent(monkeypatch):
+    """A thread authorizes iff its parent channel would."""
+    monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "111,555,222")
+    runner = _make_bare_runner()
+    assert (
+        runner._is_user_authorized(_discord_thread_msg(parent_chat_id="555")) is True
+    )
+
+
+def test_channel_scoped_access_denies_thread_under_unlisted_parent(monkeypatch):
+    monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "111,222")
+    runner = _make_bare_runner()
+    assert (
+        runner._is_user_authorized(_discord_thread_msg(parent_chat_id="555")) is False
+    )
+
+
+def test_channel_scoped_access_denies_thread_without_parent_id(monkeypatch):
+    """A thread source missing parent_chat_id must not match on its own id."""
+    monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "111,222")
+    runner = _make_bare_runner()
+    assert (
+        runner._is_user_authorized(_discord_thread_msg(parent_chat_id=None)) is False
+    )
+
+
+def test_channel_scoped_access_thread_off_without_opt_in(monkeypatch):
+    """Threads get no wider default than channels: flag off → deny."""
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555")
+    runner = _make_bare_runner()
+    assert (
+        runner._is_user_authorized(_discord_thread_msg(parent_chat_id="555")) is False
+    )
+
+
+def test_channel_scoped_access_thread_directly_allowlisted(monkeypatch):
+    """A thread id listed directly in DISCORD_ALLOWED_CHANNELS also matches —
+    HSM's group-register writes thread ids into the var for thread-scoped
+    agents, and those must keep working."""
+    monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "888")
+    runner = _make_bare_runner()
+    assert (
+        runner._is_user_authorized(
+            _discord_thread_msg(chat_id="888", parent_chat_id="555")
+        )
+        is True
+    )
+
+
 def test_channel_scoped_access_does_not_apply_to_dms(monkeypatch):
     """DMs have no channel scope to stand on — the flag must not authorize them."""
     monkeypatch.setenv("DISCORD_CHANNEL_SCOPED_ACCESS", "true")
