@@ -13011,13 +13011,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # ledger. The agent result (agent/turn_finalizer.py) is the ONLY
             # live source of estimated_cost_usd — the SessionStore cost
             # columns have no writer and must not be used for budgeting.
+            # NOTE: estimated_cost_usd is the agent's CUMULATIVE session
+            # total, so record_session_spend charges only this turn's delta.
             # Unknown/zero cost still consumes a fallback amount inside
             # record_spend (fail-closed spend accounting).
             try:
                 from gateway.inbound_throttle import get_throttle
 
                 await asyncio.to_thread(
-                    get_throttle().record_spend,
+                    get_throttle().record_session_spend,
+                    session_entry.session_key,
                     agent_result.get("estimated_cost_usd"),
                     agent_result.get("cost_status"),
                 )

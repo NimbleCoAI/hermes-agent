@@ -120,6 +120,9 @@ class InboundThrottle:
         self._notify_last: Dict[str, float] = {}
         self._last_ledger_error_log = 0.0
         self._warned_env_vars: Set[str] = set()
+        # Last cumulative session total recorded per session key — see
+        # record_session_spend. Process-local, like the sliding windows.
+        self._session_spend_baseline: Dict[str, float] = {}
 
     # ── Config (read at check time, malformed → default + one WARNING) ──
 
@@ -318,6 +321,32 @@ class InboundThrottle:
                 # the same error, so this does not open the gate.
                 self._log_ledger_error(err)
 
+    def record_session_spend(
+        self, session_key: str, session_total_usd, cost_status: Optional[str]
+    ) -> None:
+        """Record one turn's spend given the agent's CUMULATIVE session total.
+
+        ``agent_result["estimated_cost_usd"]`` (agent/turn_finalizer.py) is a
+        running total for the whole session — agent_init zeroes it once and
+        conversation_loop does ``+=`` per API call. Charging it directly every
+        turn sums running totals (quadratic overcount) and trips the daily
+        spend ceiling on ordinary single-operator use. This converts the
+        total to a per-turn delta against the last total seen for
+        ``session_key``; a rebuilt/reset agent restarts its total from zero,
+        in which case the fresh total is charged whole. Non-numeric totals
+        fall through to :meth:`record_spend`'s fallback pricing."""
+        if isinstance(session_total_usd, bool) or not isinstance(
+            session_total_usd, (int, float)
+        ):
+            self.record_spend(None, cost_status)
+            return
+        total = float(session_total_usd)
+        with self._lock:
+            prev = self._session_spend_baseline.get(session_key, 0.0)
+            delta = total - prev if total >= prev else total
+            self._session_spend_baseline[session_key] = total
+        self.record_spend(delta, cost_status)
+
     def should_notify(self, user_key: str) -> bool:
         """True at most once per NOTIFY_COOLDOWN_SECONDS per user key —
         denial notices must not amplify the flood they suppress."""
@@ -335,6 +364,7 @@ class InboundThrottle:
             self._user_windows.clear()
             self._scope_windows.clear()
             self._notify_last.clear()
+            self._session_spend_baseline.clear()
             self._warned_env_vars.clear()
             self._last_ledger_error_log = 0.0
 

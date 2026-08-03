@@ -257,6 +257,46 @@ class TestSpend:
         t.record_spend(1.23, "unknown")
         assert _read_ledger()["spend_usd"] == pytest.approx(0.25)
 
+    def test_session_spend_charges_delta_not_cumulative(self, monkeypatch):
+        """estimated_cost_usd is the agent's CUMULATIVE session total.
+
+        Regression: charging the running total every turn sums 0.10 + 0.30 +
+        0.60 = 1.00 instead of the real 0.60, overcounting quadratically and
+        tripping the daily ceiling on ordinary single-operator sessions."""
+        t = InboundThrottle()
+        t.record_session_spend("discord:c1", 0.10, "estimated")
+        t.record_session_spend("discord:c1", 0.30, "estimated")
+        t.record_session_spend("discord:c1", 0.60, "estimated")
+        assert _read_ledger()["spend_usd"] == pytest.approx(0.60)
+
+    def test_session_spend_baselines_are_per_session(self, monkeypatch):
+        t = InboundThrottle()
+        t.record_session_spend("discord:c1", 0.10, "estimated")
+        t.record_session_spend("discord:c2", 0.10, "estimated")
+        assert _read_ledger()["spend_usd"] == pytest.approx(0.20)
+
+    def test_session_spend_reset_agent_charges_fresh_total(self, monkeypatch):
+        """A rebuilt/reset agent restarts its cumulative total from zero —
+        the smaller fresh total must be charged whole, not skipped."""
+        t = InboundThrottle()
+        t.record_session_spend("discord:c1", 0.50, "estimated")
+        t.record_session_spend("discord:c1", 0.20, "estimated")  # agent reset
+        assert _read_ledger()["spend_usd"] == pytest.approx(0.70)
+
+    def test_session_spend_non_numeric_falls_back(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_THROTTLE_FALLBACK_TURN_COST_USD", "0.25")
+        t = InboundThrottle()
+        t.record_session_spend("discord:c1", None, None)
+        assert _read_ledger()["spend_usd"] == pytest.approx(0.25)
+
+    def test_session_spend_unchanged_total_charges_fallback(self, monkeypatch):
+        """A turn whose priced delta is zero is still not free."""
+        monkeypatch.setenv("GATEWAY_THROTTLE_FALLBACK_TURN_COST_USD", "0.25")
+        t = InboundThrottle()
+        t.record_session_spend("discord:c1", 0.10, "estimated")
+        t.record_session_spend("discord:c1", 0.10, "estimated")
+        assert _read_ledger()["spend_usd"] == pytest.approx(0.35)
+
     def test_spend_persists_across_restart(self, monkeypatch):
         monkeypatch.setenv("GATEWAY_THROTTLE_DAILY_SPEND_USD", "0.10")
         t1 = InboundThrottle()
