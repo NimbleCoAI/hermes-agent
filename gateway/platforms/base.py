@@ -498,6 +498,7 @@ from enum import Enum
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
+from gateway import inbound_throttle
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
@@ -506,6 +507,14 @@ from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes
 GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
     "Secure secret entry is not supported over messaging. "
     "Load this skill in the local CLI to be prompted, or add the key to ~/.hermes/.env manually."
+)
+
+# R6: control commands that must survive a raid — they never spawn LLM work
+# and operators need them precisely when the throttle is biting (/stop an
+# in-flight turn, /approve or /deny a pending gate). Everything else —
+# including /retry and /steer, which DO spawn LLM turns — is throttled.
+_THROTTLE_EXEMPT_COMMANDS = frozenset(
+    {"stop", "new", "reset", "approve", "deny", "status", "help"}
 )
 
 
@@ -4678,10 +4687,42 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    async def _maybe_notify_throttled(self, event: "MessageEvent", verdict) -> None:
+        """Log every throttled turn; notify the user at most once per minute.
+
+        The log line makes denials observable (a silent drop is
+        indistinguishable from a broken bot); the per-user notice cooldown
+        ensures the denial path cannot amplify the flood it suppresses.
+        """
+        logger.warning(
+            "[%s] Inbound turn throttled (%s): user=%s chat=%s scope=%s",
+            self.name,
+            verdict.reason,
+            event.source.user_id,
+            event.source.chat_id,
+            event.source.scope_id or event.source.guild_id,
+        )
+        throttle = inbound_throttle.get_throttle()
+        user_key = f"{self.platform.value}:{event.source.user_id}"
+        if not throttle.should_notify(user_key):
+            return
+        if verdict.reason in {"daily_turn_ceiling", "daily_spend_ceiling", "ledger_error"}:
+            notice = "Daily usage limit reached — the agent is paused until tomorrow (UTC)."
+        else:
+            notice = "Rate limit reached — please wait a moment before sending more messages."
+        try:
+            await self._send_with_retry(
+                chat_id=event.source.chat_id,
+                content=notice,
+                reply_to=_reply_anchor_for_event(event),
+            )
+        except Exception as e:
+            logger.debug("[%s] Failed to send throttle notice: %s", self.name, e)
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
-        
+
         This method returns quickly by spawning background tasks.
         This allows new messages to be processed even while an agent is running,
         enabling interruption support.
@@ -4700,6 +4741,31 @@ class BasePlatformAdapter(ABC):
             return
 
         coerce_plaintext_gateway_command(event)
+
+        # R6 inbound throttle: this is the single choke point where an inbound
+        # message becomes (or queues toward) an LLM turn on EVERY platform —
+        # direct text, batched-text flush, slash dispatch, and thread sessions
+        # all converge on handle_message. Control commands (/stop, /approve,
+        # ...) are exempt so operators can still steer during a flood;
+        # anything that spawns LLM work (/retry, /steer, plain text) is gated.
+        # Observe-only events returned above and never spawn turns.
+        _throttle_cmd = event.get_command()
+        if _throttle_cmd not in _THROTTLE_EXEMPT_COMMANDS:
+            _throttle_user = str(event.source.user_id) if event.source.user_id else ""
+            _throttle_scope = (
+                event.source.scope_id or event.source.guild_id or event.source.chat_id
+            )
+            _throttle_scope = str(_throttle_scope) if _throttle_scope else None
+            # Ledger IO happens off the event loop.
+            _verdict = await asyncio.to_thread(
+                inbound_throttle.get_throttle().check_and_consume,
+                self.platform.value,
+                _throttle_user,
+                _throttle_scope,
+            )
+            if not _verdict.allowed:
+                await self._maybe_notify_throttled(event, _verdict)
+                return
 
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
         # (Telegram DM topic mode) so the session key, guard checks, and

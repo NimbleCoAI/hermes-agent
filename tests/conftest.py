@@ -390,6 +390,12 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # should never perform that implicit network/bootstrap path; Tirith-specific
     # tests opt back in by patching the security config directly.
     monkeypatch.setenv("TIRITH_ENABLED", "false")
+    # R6 inbound throttle: default-on in production, default-off in the
+    # hermetic suite — hundreds of existing tests drive handle_message far
+    # faster than any human and would trip the per-user window. Throttle
+    # tests opt back in with monkeypatch.setenv("GATEWAY_THROTTLE_ENABLED",
+    # "true") and a fresh InboundThrottle/reset singleton.
+    monkeypatch.setenv("GATEWAY_THROTTLE_ENABLED", "false")
 
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the

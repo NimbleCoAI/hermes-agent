@@ -127,6 +127,13 @@ from gateway.platforms.base import (
 )
 from tools.url_safety import is_safe_url
 
+# Sibling plugin module (same dual-context import pattern as voice_mixer:
+# bare when the plugin dir is on sys.path, package-relative under tests).
+try:
+    import moderation_sync as _moderation_sync
+except ImportError:  # package context (tests import plugins.platforms.discord.*)
+    from . import moderation_sync as _moderation_sync
+
 
 def _truncate_discord_component_text(text: str, limit: int) -> str:
     """Return text within Discord's UTF-16 component field budget."""
@@ -1109,6 +1116,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 # online when Members Intent isn't enabled in the Developer Portal.
                 any(entry != "*" and not entry.isdigit() for entry in self._allowed_user_ids)
                 or bool(self._allowed_role_ids)  # Need members intent for role lookup
+                # R7: GUILD_MEMBER_REMOVE (kick/leave propagation) requires the
+                # privileged Server Members intent. Only "remove" mode requests
+                # it — the default "ban" mode works with default intents and
+                # carries zero boot risk. Same portal caveat as above: enable
+                # Server Members in the Developer Portal BEFORE setting
+                # DISCORD_MODERATION_SYNC=remove or the bot may not come online.
+                or _moderation_sync.moderation_sync_mode() == "remove"
             )
             intents.voice_states = True
 
@@ -1303,6 +1317,47 @@ class DiscordAdapter(BasePlatformAdapter):
                         else f"moved {before.channel.name} -> {after.channel.name}",
                         guild_id,
                     )
+
+            # R7: moderation → authorization propagation. A guild ban (and,
+            # in "remove" mode, any member removal) revokes the user's Hermes
+            # authorization everywhere: pairing grant, DISCORD_ALLOWED_USERS
+            # (in-memory + persisted .env), GATEWAY_ALLOWED_USERS, plus the
+            # adapter-owned deny store that survives HSM console re-writes.
+            _mod_sync_mode = _moderation_sync.moderation_sync_mode()
+            if _mod_sync_mode != "off":
+
+                async def _moderation_sync_revoke(uid: str, gid: str, reason: str) -> None:
+                    if uid in _moderation_sync.exempt_user_ids():
+                        logger.info(
+                            "[%s] Moderation sync: uid=%s is exempt — not revoking (%s)",
+                            adapter_self.name, uid, reason,
+                        )
+                        return
+                    sync_guilds = _moderation_sync.sync_guild_ids()
+                    if sync_guilds and gid not in sync_guilds:
+                        return
+                    # Blocking file IO (deny store, .env persistence) off-loop.
+                    await asyncio.to_thread(
+                        _moderation_sync.revoke_user_authorization,
+                        adapter_self, uid, reason, gid,
+                    )
+
+                @self._client.event
+                async def on_member_ban(guild, user):
+                    # Non-privileged moderation intent — part of Intents.default().
+                    await _moderation_sync_revoke(str(user.id), str(guild.id), "ban")
+
+                if _mod_sync_mode == "remove":
+
+                    @self._client.event
+                    async def on_raw_member_remove(payload):
+                        # Fires for kick AND voluntary leave (indistinguishable
+                        # without audit-log permissions), and also after a ban
+                        # (double-fire with on_member_ban — revocation is
+                        # idempotent). Requires the privileged members intent.
+                        await _moderation_sync_revoke(
+                            str(payload.user.id), str(payload.guild_id), "remove"
+                        )
 
             # Register slash commands
             if self._slash_commands:
@@ -3340,6 +3395,14 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_ids: Resolved text-channel ids for guild traffic when an
                 upstream gate has already scoped the message to a channel.
         """
+        # R7: the moderation deny store beats EVERY allow branch below —
+        # pairing, user/role allowlists, ALLOW_ALL flags, and the channel
+        # bypass. This is the backstop against the HSM console's stale
+        # whole-document save re-writing DISCORD_ALLOWED_USERS and silently
+        # re-granting a banned user.
+        if _moderation_sync.deny_store().is_denied(user_id):
+            return False
+
         # ``getattr`` fallbacks here guard against test fixtures that build
         # an adapter via ``object.__new__(DiscordAdapter)`` and skip __init__
         # (see AGENTS.md pitfall #17 — same pattern as gateway.run).
@@ -6979,6 +7042,16 @@ def _component_check_auth(
     """
     user = getattr(interaction, "user", None)
     if user is None or getattr(user, "id", None) is None:
+        return False
+
+    # R7: the moderation deny store beats every allow branch below —
+    # including the ALLOW_ALL flags and the GATEWAY_ALLOWED_USERS union.
+    # A banned user must not be able to click approval buttons.
+    try:
+        _denied_uid = str(user.id)
+    except AttributeError:
+        _denied_uid = ""
+    if _denied_uid and _moderation_sync.deny_store().is_denied(_denied_uid):
         return False
 
     if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
