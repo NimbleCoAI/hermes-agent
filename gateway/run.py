@@ -13007,6 +13007,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
 
+            # R6: feed the authoritative per-turn cost into the daily spend
+            # ledger. The agent result (agent/turn_finalizer.py) is the ONLY
+            # live source of estimated_cost_usd — the SessionStore cost
+            # columns have no writer and must not be used for budgeting.
+            # Unknown/zero cost still consumes a fallback amount inside
+            # record_spend (fail-closed spend accounting).
+            try:
+                from gateway.inbound_throttle import get_throttle
+
+                await asyncio.to_thread(
+                    get_throttle().record_spend,
+                    agent_result.get("estimated_cost_usd"),
+                    agent_result.get("cost_status"),
+                )
+            except Exception as _spend_err:
+                logger.warning("Throttle spend recording failed: %s", _spend_err)
+
             # Re-baseline the cached agent's message_count snapshot now that
             # ALL of this turn's transcript writes are done — the agent's
             # flushed user/assistant/tool rows AND the first-turn `session_meta`
