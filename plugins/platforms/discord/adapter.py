@@ -4987,6 +4987,24 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
+    def _discord_observe_unmentioned(self) -> bool:
+        """Return whether unmentioned channel messages are ingested as context.
+
+        When true, a message failing the mention gate is recorded into the
+        session transcript (observe_only) for situational awareness rather than
+        dropped — but the agent still does not respond, and no auto-thread is
+        created. Orthogonal to require_mention. Defaults False (opt-in) so
+        existing deployments are unchanged, matching Telegram; operators (e.g.
+        HSM harness settings) opt in per surface via DISCORD_OBSERVE_UNMENTIONED
+        / config extra.observe_unmentioned.
+        """
+        configured = self.config.extra.get("observe_unmentioned")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("DISCORD_OBSERVE_UNMENTIONED", "false").lower() in {"true", "1", "yes", "on"}
+
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
 
@@ -6484,6 +6502,11 @@ class DiscordAdapter(BasePlatformAdapter):
             if _self_role_id:
                 normalized_content = normalized_content.replace(f"<@&{_self_role_id}>", "").strip()
             message.content = normalized_content
+        # Observe-unmentioned: when enabled, a message that fails the mention
+        # gate is ingested into session context (observe_only) instead of
+        # dropped, while the agent still does not respond. Orthogonal to the
+        # mention gate; observe-only messages never spawn an auto-thread.
+        observe_only = False
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -6532,13 +6555,16 @@ class DiscordAdapter(BasePlatformAdapter):
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
-                    return
+                    if self._discord_observe_unmentioned():
+                        observe_only = True  # ingest as context; still no response
+                    else:
+                        return
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
-        if not is_thread and not isinstance(message.channel, discord.DMChannel):
+        if not is_thread and not observe_only and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
@@ -6908,6 +6934,7 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            observe_only=observe_only,
         )
 
         # Track thread participation so the bot won't require @mention for

@@ -1196,3 +1196,67 @@ def test_mention_patterns_trigger_in_channel_without_literal_mention():
     assert _would_process(adapter, text="hey hermes what's the status") is True
     # Unrelated channel chatter is still ignored.
     assert _would_process(adapter, text="lunch anyone?") is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: observe-unmentioned (_slack_observe_unmentioned + real flow)
+# Observe (input/context) is orthogonal to the mention gate (response): when
+# enabled, an unmentioned channel message is ingested as observe_only context
+# but the bot still does not respond. Defaults OFF (opt-in) so existing
+# deployments are unchanged; HSM opts in per surface.
+# ---------------------------------------------------------------------------
+
+def test_observe_unmentioned_defaults_to_false(monkeypatch):
+    monkeypatch.delenv("SLACK_OBSERVE_UNMENTIONED", raising=False)
+    adapter = _make_adapter()
+    assert adapter._slack_observe_unmentioned() is False
+
+
+def test_observe_unmentioned_config_true():
+    adapter = _make_adapter()
+    adapter.config.extra["observe_unmentioned"] = "true"
+    assert adapter._slack_observe_unmentioned() is True
+
+
+def test_observe_unmentioned_env_true(monkeypatch):
+    monkeypatch.setenv("SLACK_OBSERVE_UNMENTIONED", "true")
+    adapter = _make_adapter()
+    assert adapter._slack_observe_unmentioned() is True
+
+
+def test_observe_unmentioned_malformed_stays_false():
+    """Explicit-true parser: unrecognised values keep observe OFF (opt-in)."""
+    adapter = _make_adapter()
+    adapter.config.extra["observe_unmentioned"] = "maybe"
+    assert adapter._slack_observe_unmentioned() is False
+
+
+@pytest.mark.asyncio
+async def test_unmentioned_message_observed_when_enabled(monkeypatch):
+    """observe on + unmentioned channel msg → dispatched as observe_only."""
+    monkeypatch.setenv("SLACK_OBSERVE_UNMENTIONED", "true")
+    adapter = _make_real_adapter(allowed_channels="*")
+    await adapter._handle_slack_message(_channel_event(CHANNEL_ID, mentioned=False))
+    adapter.handle_message.assert_called_once()
+    msg_event = adapter.handle_message.call_args.args[0]
+    assert msg_event.observe_only is True
+
+
+@pytest.mark.asyncio
+async def test_unmentioned_message_dropped_by_default(monkeypatch):
+    """observe default off → unmentioned channel msg is hard-dropped."""
+    monkeypatch.delenv("SLACK_OBSERVE_UNMENTIONED", raising=False)
+    adapter = _make_real_adapter(allowed_channels="*")
+    await adapter._handle_slack_message(_channel_event(CHANNEL_ID, mentioned=False))
+    adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mentioned_message_is_not_observe_only(monkeypatch):
+    """A mentioned message is a normal (responded) turn, not observe_only."""
+    monkeypatch.setenv("SLACK_OBSERVE_UNMENTIONED", "true")
+    adapter = _make_real_adapter(allowed_channels="*")
+    await adapter._handle_slack_message(_channel_event(CHANNEL_ID, mentioned=True))
+    adapter.handle_message.assert_called_once()
+    msg_event = adapter.handle_message.call_args.args[0]
+    assert msg_event.observe_only is False
