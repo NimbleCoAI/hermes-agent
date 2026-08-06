@@ -3373,6 +3373,11 @@ class SlackAdapter(BasePlatformAdapter):
         )
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+        # Observe-unmentioned: when enabled, an unmentioned channel message is
+        # ingested into session context (observe_only) instead of dropped, while
+        # the agent still does not respond. Orthogonal to the mention gate —
+        # REQUIRE/STRICT_MENTION control the response, this controls the input.
+        observe_only = False
 
         if not is_one_to_one_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels
@@ -3409,7 +3414,10 @@ class SlackAdapter(BasePlatformAdapter):
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
             elif self._slack_strict_mention() and not is_mentioned:
-                return  # Strict mode: ignore until @-mentioned again
+                if self._slack_observe_unmentioned():
+                    observe_only = True  # ingest as context; still no response
+                else:
+                    return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
                 reply_to_bot_thread = (
                     is_thread_reply and event_thread_ts in self._bot_message_ts
@@ -3429,7 +3437,10 @@ class SlackAdapter(BasePlatformAdapter):
                     and not in_mentioned_thread
                     and not has_session
                 ):
-                    return
+                    if self._slack_observe_unmentioned():
+                        observe_only = True  # ingest as context; still no response
+                    else:
+                        return
 
         if is_mentioned:
             # Strip the bot mention from the text
@@ -3802,6 +3813,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
+            observe_only=observe_only,
             metadata={
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
@@ -4817,6 +4829,29 @@ class SlackAdapter(BasePlatformAdapter):
             "0",
             "no",
             "off",
+        }
+
+    def _slack_observe_unmentioned(self) -> bool:
+        """Return whether unmentioned channel messages are ingested as context.
+
+        When true, a message that fails the mention gate is recorded into the
+        session transcript (observe_only) instead of dropped, so the agent has
+        situational awareness — but it still does not respond (the mention gate
+        governs the response). Orthogonal to require_mention/strict_mention.
+        Defaults False (opt-in) so existing deployments are unchanged, matching
+        Telegram; operators (e.g. HSM harness settings) opt in per surface via
+        SLACK_OBSERVE_UNMENTIONED / config extra.observe_unmentioned.
+        """
+        configured = self.config.extra.get("observe_unmentioned")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("SLACK_OBSERVE_UNMENTIONED", "false").lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
         }
 
     def _slack_strict_mention(self) -> bool:
