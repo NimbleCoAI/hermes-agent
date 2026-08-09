@@ -2588,6 +2588,206 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
 
 
 
+# Upper bound on a rewritten tool_call_id.  Several OpenAI-compatible
+# providers validate the field's length; keep renamed ids comfortably short.
+_TOOL_CALL_ID_MAX_LEN = 64
+
+
+def _rewrite_tool_call_id(tc: Any, old_id: str, new_id: str) -> Any:
+    """Return a COPY of ``tc`` whose id fields read ``new_id``.
+
+    Copying matters: ``sanitize_api_messages`` operates on a per-request view
+    of the conversation, and the message dicts it receives are the same
+    objects the session DB and the live trajectory hold.  Mutating them in
+    place would persist a synthetic id into the transcript.
+    """
+    if isinstance(tc, dict):
+        clone = dict(tc)
+        for key in ("id", "call_id"):
+            value = clone.get(key)
+            if isinstance(value, str) and value.strip() == old_id:
+                clone[key] = new_id
+        return clone
+    try:
+        clone = copy.copy(tc)
+    except Exception:
+        return tc
+    for key in ("id", "call_id"):
+        value = getattr(clone, key, None)
+        if isinstance(value, str) and value.strip() == old_id:
+            try:
+                setattr(clone, key, new_id)
+            except Exception:
+                return tc
+    return clone
+
+
+def _mint_unique_tool_call_id(base_id: str, used: set, counters: Dict[str, int]) -> str:
+    """Derive a stable, unused id from ``base_id``.
+
+    Deterministic by construction — the suffix is the round ordinal, so the
+    same conversation prefix always produces the same ids and the provider's
+    prompt cache still hits.  The suffix charset is a subset of the base id's
+    (``[A-Za-z0-9_]``), so a provider that accepted the original accepts this.
+
+    ``counters`` carries the next ordinal to try per stem so a session with
+    thousands of colliding ids stays linear instead of rescanning from 2.
+    """
+    stem = base_id
+    if len(stem) > _TOOL_CALL_ID_MAX_LEN - 8:
+        stem = stem[: _TOOL_CALL_ID_MAX_LEN - 8]
+    n = counters.get(stem, 2)
+    while True:
+        candidate = f"{stem}_r{n}"
+        n += 1
+        if candidate not in used:
+            counters[stem] = n
+            return candidate
+
+
+def uniquify_cross_round_tool_call_ids(
+    messages: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], int]:
+    """Rename tool_call ids that a provider reuses across assistant rounds.
+
+    Some upstream providers mint ids scoped to the assistant message that
+    issued them rather than to the conversation — Moonshot ``kimi-k3`` via
+    OpenRouter returns ``read_file:0``, ``read_file:1``, ``terminal:0``,
+    ``skill_view:0`` and restarts the numbering on EVERY round.  The ids are
+    a valid pairing key locally (each result still follows its own call) but
+    they are NOT unique across the payload, which strict providers reject.
+
+    The de-duplication pass below used to resolve that by dropping the later
+    occurrences.  With a round-scoped provider that deletes almost every tool
+    result in the session: in the incident that motivated this function
+    (session ``20260809_040444_3aca1c0f``) 185 tool results collapsed onto 10
+    distinct ids, so the model saw the first ``read_file`` output and nothing
+    afterwards — it re-read files it could not see until the turn burned its
+    whole api_call budget and returned an empty response.
+
+    Renaming keeps both invariants: every result reaches the model AND every
+    ``tool_call_id`` in the payload is unique.  Pairing is positional (the
+    results of a round immediately follow the assistant message that opened
+    it), which is the same adjacency ``repair_message_sequence`` enforces.
+
+    Duplicate ids WITHIN one assistant message are deliberately left alone —
+    their results are indistinguishable, so inventing a pairing would be a
+    guess.  Those still collapse in the de-duplication pass.
+
+    Returns ``(messages, renamed_count)``.  ``messages`` is the original list
+    object when nothing was renamed.
+    """
+    get_id = _ra().AIAgent._get_tool_call_id_static
+
+    used: set = set()
+    counters: Dict[str, int] = {}
+    renamed = 0
+    out: List[Dict[str, Any]] = []
+    # Maps an original id to the queue of new ids minted for it in the round
+    # currently being walked.  Reset by every assistant/user/system boundary.
+    round_map: Dict[str, List[str]] = {}
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        role = msg.get("role")
+        if role == "assistant":
+            round_map = {}
+            tcs = msg.get("tool_calls") or []
+            if not tcs:
+                out.append(msg)
+                continue
+            new_tcs: List[Any] = []
+            within: set = set()
+            changed = False
+            for tc in tcs:
+                cid = get_id(tc)
+                if not cid or cid in within:
+                    # No id to key on, or a within-message duplicate: leave it
+                    # for the de-duplication pass.
+                    new_tcs.append(tc)
+                    continue
+                within.add(cid)
+                if cid in used:
+                    new_id = _mint_unique_tool_call_id(cid, used, counters)
+                    new_tcs.append(_rewrite_tool_call_id(tc, cid, new_id))
+                    round_map.setdefault(cid, []).append(new_id)
+                    used.add(new_id)
+                    renamed += 1
+                    changed = True
+                else:
+                    new_tcs.append(tc)
+                    used.add(cid)
+            out.append({**msg, "tool_calls": new_tcs} if changed else msg)
+        elif role == "tool":
+            cid = (msg.get("tool_call_id") or "").strip()
+            queue = round_map.get(cid)
+            if queue:
+                out.append({**msg, "tool_call_id": queue.pop(0)})
+            else:
+                out.append(msg)
+        else:
+            # A user/system turn closes the round.
+            round_map = {}
+            out.append(msg)
+
+    if not renamed:
+        return messages, 0
+    _ra().logger.info(
+        "Pre-call sanitizer: uniquified %d tool_call id(s) reused across "
+        "rounds (provider mints round-scoped ids)",
+        renamed,
+    )
+    return out, renamed
+
+
+def _tool_result_loss_record(msg: Dict[str, Any]) -> tuple:
+    """(tool_call_id, tool name, content chars) for a tool message."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        chars = len(content)
+    elif content is None:
+        chars = 0
+    else:
+        try:
+            chars = len(json.dumps(content, default=str))
+        except Exception:
+            chars = len(str(content))
+    return (
+        (msg.get("tool_call_id") or "").strip() or "?",
+        msg.get("name") or msg.get("tool_name") or "?",
+        chars,
+    )
+
+
+def _report_dropped_tool_results(dropped: List[tuple]) -> None:
+    """Log an ERROR naming every tool result that never reached the model.
+
+    A dropped tool result is invisible from the model's side: it asks for a
+    file, receives nothing, and asks again.  That failure used to be a
+    ``logger.debug`` line, which is why the incident presented as "the model
+    is stuck in a read loop" rather than "the harness deleted the answer".
+    """
+    with_content = [d for d in dropped if d[2] > 0]
+    if not with_content:
+        return
+    lost_chars = sum(d[2] for d in with_content)
+    detail = ", ".join(
+        f"{name}(id={cid}, {chars:,} chars)" for cid, name, chars in with_content[:10]
+    )
+    if len(with_content) > 10:
+        detail += f", +{len(with_content) - 10} more"
+    _ra().logger.error(
+        "Pre-call sanitizer DROPPED %d tool result(s) carrying %d characters "
+        "of context — the model will not see this output and is likely to "
+        "re-request it: %s",
+        len(with_content),
+        lost_chars,
+        detail,
+    )
+
+
 def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
@@ -2595,6 +2795,10 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     is present — so orphans from session loading or manual message
     manipulation are always caught.
     """
+    # Every tool result removed below is context the model asked for and will
+    # never see.  Collect the losses so the function can end with one loud
+    # ERROR instead of a scatter of debug lines.
+    dropped_tool_results: List[tuple] = []
     # --- Role allowlist: drop messages with roles the API won't accept ---
     filtered = []
     for msg in messages:
@@ -2691,6 +2895,15 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             elif isinstance(tc, dict):
                 tc["function"] = {"name": _EMPTY_NAME_SENTINEL, "arguments": "{}"}
 
+    # --- Uniquify tool_call ids a provider reuses across rounds ---
+    # MUST run before the orphan/stub/de-duplication passes below: those key
+    # on tool_call_id, and a provider that restarts its numbering every round
+    # (kimi-k3 via OpenRouter: "read_file:0", "terminal:0", ...) makes every
+    # later round look like a duplicate of the first.  Renaming here keeps the
+    # payload's ids unique — what the de-duplication pass is actually for —
+    # without deleting the results themselves.
+    messages, _ = uniquify_cross_round_tool_call_ids(messages)
+
     surviving_call_ids: set = set()
     for msg in messages:
         if msg.get("role") == "assistant":
@@ -2709,10 +2922,16 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     # 1. Drop tool results with no matching assistant call
     orphaned_results = result_call_ids - surviving_call_ids
     if orphaned_results:
-        messages = [
-            m for m in messages
-            if not (m.get("role") == "tool" and (m.get("tool_call_id") or "").strip() in orphaned_results)
-        ]
+        kept: List[Dict[str, Any]] = []
+        for m in messages:
+            if (
+                m.get("role") == "tool"
+                and (m.get("tool_call_id") or "").strip() in orphaned_results
+            ):
+                dropped_tool_results.append(_tool_result_loss_record(m))
+                continue
+            kept.append(m)
+        messages = kept
         _ra().logger.debug(
             "Pre-call sanitizer: removed %d orphaned tool result(s)",
             len(orphaned_results),
@@ -2771,6 +2990,7 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             cid = (msg.get("tool_call_id") or "").strip()
             if cid and cid in seen_result_call_ids:
                 removed_dupes += 1
+                dropped_tool_results.append(_tool_result_loss_record(msg))
                 continue
             if cid:
                 seen_result_call_ids.add(cid)
@@ -2783,6 +3003,10 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
         )
+
+    # Cross-round id reuse is handled above, so anything still being dropped
+    # here is a real loss of model-visible context.  Say so at ERROR level.
+    _report_dropped_tool_results(dropped_tool_results)
     return messages
 
 
