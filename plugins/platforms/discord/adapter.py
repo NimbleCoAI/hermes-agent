@@ -140,6 +140,11 @@ def _truncate_discord_component_text(text: str, limit: int) -> str:
     return _prefix_within_utf16_limit(str(text or ""), max(0, limit))
 
 
+def _truncate_discord_component_text(text: str, limit: int) -> str:
+    """Return text within Discord's UTF-16 component field budget."""
+    return _prefix_within_utf16_limit(str(text or ""), max(0, limit))
+
+
 async def _wait_for_ready_or_bot_exit(
     ready_event: asyncio.Event,
     bot_task: asyncio.Task,
