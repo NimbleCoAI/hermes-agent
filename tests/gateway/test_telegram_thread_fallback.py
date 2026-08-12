@@ -102,6 +102,26 @@ _fake_telegram_ext.MessageHandler = object
 _fake_telegram_ext.TypeHandler = object
 _fake_telegram_ext.ContextTypes = SimpleNamespace(DEFAULT_TYPE=object)
 _fake_telegram_ext.filters = object
+
+
+class _FakeChatMemberHandler:
+    """Mirror the real ``telegram.ext.ChatMemberHandler`` surface.
+
+    The adapter treats this symbol as OPTIONAL — it imports it separately from
+    the mandatory ``telegram.ext`` tuple so an SDK build without it loses only
+    the group auto-approval gate. This fake carries it so the fake looks like
+    the SDK the adapter actually runs against; the absent case has its own
+    coverage in tests/gateway/test_telegram_optional_chatmemberhandler.py.
+    """
+
+    MY_CHAT_MEMBER = "my_chat_member"
+
+    def __init__(self, callback, chat_member_types=None):
+        self.callback = callback
+        self.chat_member_types = chat_member_types
+
+
+_fake_telegram_ext.ChatMemberHandler = _FakeChatMemberHandler
 _fake_telegram_request = types.ModuleType("telegram.request")
 _fake_telegram_request.HTTPXRequest = object
 

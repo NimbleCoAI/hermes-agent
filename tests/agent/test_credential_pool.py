@@ -3047,21 +3047,6 @@ def test_xai_oauth_concurrent_pool_instances_refresh_single_use_token_once(
 # ---------------------------------------------------------------------------
 
 
-def _codex_auth_store(access_token: str, refresh_token: str) -> dict:
-    return {
-        "version": 1,
-        "active_provider": "openai-codex",
-        "providers": {
-            "openai-codex": {
-                "tokens": {
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                },
-            }
-        },
-    }
-
-
 def test_is_terminal_codex_oauth_refresh_error():
     from hermes_cli.auth import AuthError, _is_terminal_codex_oauth_refresh_error
 

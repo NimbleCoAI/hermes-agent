@@ -1258,7 +1258,6 @@ class TestVisionCpuBurstCap:
         encodes ever run at once — even though all N calls are in flight
         simultaneously (proving the analyses themselves are NOT serialized).
         """
-        import asyncio
         import importlib
         from concurrent.futures import ThreadPoolExecutor
 

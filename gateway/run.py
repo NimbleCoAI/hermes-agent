@@ -2572,6 +2572,26 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     return ""
 
 
+def _context_id_for_source(source) -> Optional[str]:
+    """Derive the per-context memory id for a ``SessionSource``, or None.
+
+    Scopes EVERY chat type (DMs included) and platform-qualifies the id so the
+    same chat_id can't leak memory across platforms or between a DM and a
+    group. Returns None when there is no chat_id (routes to unscoped/global
+    memory). Delegates to the single-sourced ``derive_context_id`` so the
+    gateway and ``agent_init`` compute identical ids.
+    """
+    from tools.memory_tool import derive_context_id
+
+    platform = getattr(source, "platform", None)
+    platform_str = getattr(platform, "value", None) or (str(platform) if platform else None)
+    return derive_context_id(
+        platform_str,
+        getattr(source, "chat_type", None),
+        getattr(source, "chat_id", None),
+    )
+
+
 def _channel_override_lookup_keys(
     chat_id: str,
     *,
@@ -3328,12 +3348,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _context_id_for_source(source) -> Optional[str]:
         """Derive memory context_id from message source.
 
-        Group/forum/channel chats get per-chat scoped memory; DMs get global
-        memory (None).  MemoryStore sanitizes the returned value before use.
+        Delegates to the module-level ``_context_id_for_source`` so the gateway
+        and ``agent_init`` compute identical ids.
+
+        This previously scoped only group/forum/channel and returned None for
+        everything else — which filed DM (and thread, and unknown-chat_type)
+        memory into the GLOBAL layer, where it was merged into every scoped
+        read. Every chat type with a chat_id is now scoped and
+        platform-qualified.
         """
-        if source.chat_type in ("group", "forum", "channel") and source.chat_id:
-            return str(source.chat_id)
-        return None
+        return _context_id_for_source(source)
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
@@ -10654,8 +10678,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
-        if canonical == "credits":
-            return await self._handle_credits_command(event)
+        if canonical == "topup":
+            return await self._handle_topup_command(event)
 
         if canonical == "insights":
             return await self._handle_insights_command(event)
@@ -11215,7 +11239,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 # Decide routing: native (attach pixels) vs text (vision_analyze
                 # pre-run + prepend description).  See agent/image_routing.py.
-                _img_mode = self._decide_image_input_mode(
+                # Offload to a worker thread: the decision does blocking network
+                # I/O — a models.dev fetch on cache miss, and the Ollama
+                # ``/api/show`` capability probe for local servers — whose
+                # request timeout would otherwise stall the whole gateway event
+                # loop (every session) while a single image is routed.
+                _img_mode = await asyncio.to_thread(
+                    self._decide_image_input_mode,
                     source=source,
                     session_key=session_key,
                 )
