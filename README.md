@@ -4,11 +4,11 @@
 
 # Hermes Agent ☤
 
-> **🔀 Multi-Tenant Fork** — This is `hermes-agent-mt`, patched for multi-tenant deployments with per-context memory isolation, group policy enforcement, and [Swarm Map](https://github.com/NimbleCoOrg/swarm-map) integration. See [FORK-NOTICE.md](FORK-NOTICE.md) for details.
+> **🔀 Multi-Tenant Fork** — This is `hermes-agent-mt`, patched for multi-tenant deployments with per-context memory isolation, group policy enforcement, and [Swarm Map](https://github.com/cyborg-garden/swarm-map) integration. See [FORK-NOTICE.md](FORK-NOTICE.md) for details.
 >
-> **⚠️ Repo moved orgs:** `NimbleCoAI/hermes-agent-mt` → `NimbleCoOrg/hermes-agent-mt` (and earlier, `hermes-agent` → `hermes-agent-mt`). Git clone/remote URLs auto-redirect — no action needed. **The image path did change:** CI now publishes to **`ghcr.io/nimblecoorg/hermes-agent-mt`**. The old `ghcr.io/nimblecoai/hermes-agent-mt` package is kept read-only, **frozen at 2026-07-21** — pulls against it still succeed and silently return pre-move code, so repoint anything pinned to it. The pre-rename `ghcr.io/nimblecoai/hermes-agent` package is frozen the same way and also still pulls successfully — repoint anything pinned to it too.
+> **⚠️ Org renamed:** `NimbleCoOrg` → `cyborg-garden` (earlier history: `NimbleCoAI/hermes-agent-mt` → `NimbleCoOrg/hermes-agent-mt`, and before that `hermes-agent` → `hermes-agent-mt`). Git clone/remote URLs auto-redirect — no action needed. **The image path did change:** CI now publishes to **`ghcr.io/cyborg-garden/hermes-agent-mt`**. Unlike Git, **GHCR does not redirect across an org rename** — `ghcr.io/nimblecoorg/hermes-agent-mt` no longer resolves at all, and anything still pinned to it now **fails to pull**. The older `ghcr.io/nimblecoai/hermes-agent-mt` package (separate `NimbleCoAI` user account, not renamed) is still public and **frozen at its last build, 2026-08-06** — pulls against it still *succeed* and silently return pre-move code, which is the more dangerous failure. Repoint anything on either old path. The pre-rename `ghcr.io/nimblecoai/hermes-agent` package is frozen the same way (last build 2026-07-21) and also still pulls successfully — repoint anything pinned to it too.
 >
-> Upstream: [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) · Image: `ghcr.io/nimblecoorg/hermes-agent-mt:latest`
+> Upstream: [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) · Image: `ghcr.io/cyborg-garden/hermes-agent-mt:latest`
 
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
