@@ -481,6 +481,18 @@ def _inject_github_app_gh_token(env: dict) -> None:
     passes (an explicit force-passed ``GH_TOKEN`` must win — presence in
     ``env`` here means the operator asked for that exact token).
 
+    This must run on EVERY spawn surface. A path that skips it does not merely
+    lose the fresh token — it silently falls back to the boot-written
+    ``hosts.yml``, whose token is dead within the hour, so the failure
+    presents as an unexplained 401 deep inside a tool rather than as missing
+    auth. ``hermes_subprocess_env`` was such a path.
+
+    Side effect by design: the freshly minted token is also written back into
+    the managed ``hosts.yml`` (see ``git_credentials_boot.refresh_gh_hosts``),
+    which is what ties that file's refresh to the token's lifetime instead of
+    to container boot. Free — the token is already in hand — and a no-op while
+    the file is still valid.
+
     Fail-soft: no App creds → no injection (App-less installs see the old
     behavior exactly); mint failure → cooldown, no retry storm. Opt out with
     ``HERMES_GH_TOKEN_INJECT=off``.
@@ -498,14 +510,21 @@ def _inject_github_app_gh_token(env: dict) -> None:
     if not home:
         return
     try:
-        from hermes_cli.github_app_token import get_installation_token
+        from hermes_cli.github_app_token import get_installation_token_detail
 
-        token = get_installation_token(Path(home).parent)
+        detail = get_installation_token_detail(Path(home).parent)
     except Exception:
         _GH_TOKEN_MINT_FAILURE_TS = time.time()
         return
-    if token:
-        env["GH_TOKEN"] = token
+    if not detail:
+        return
+    env["GH_TOKEN"] = detail.token
+    try:
+        from hermes_cli.git_credentials_boot import refresh_gh_hosts
+
+        refresh_gh_hosts(Path(home), detail.token, detail.expires_at)
+    except Exception:
+        pass  # the env var is the load-bearing path; the file is belt-and-braces
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
@@ -662,6 +681,15 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     _inject_context_hermes_home(env)
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
+
+    # Tier-1 stripped GH_TOKEN/GITHUB_TOKEN above, same as the terminal paths —
+    # so hand back the short-lived App token here too. Without this, every
+    # non-terminal spawn (browser worker, ACP/codex/copilot executor, TUI Node
+    # host, dep-ensure, detached gateway) reached GitHub through the boot-written
+    # hosts.yml instead: silent, unrefreshable, and dead within an hour of the
+    # container's first boot. Ordering is the same contract as
+    # _sanitize_subprocess_env — after apply_subprocess_home_env, after strips.
+    _inject_github_app_gh_token(env)
 
     # Active-venv markers must not clobber another project's environment.
     for _marker in _ACTIVE_VENV_MARKER_VARS:

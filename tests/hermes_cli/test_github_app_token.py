@@ -215,6 +215,59 @@ def test_remint_when_cache_corrupt(app_env, monkeypatch):
     assert gat.get_installation_token(app_env) == "ghs_recovered"
 
 
+# ---------------------------------------------------------------------------
+# get_installation_token_detail — the expiry travels WITH the token
+#
+# A token handed around as a bare string is a credential whose lifetime is
+# invisible. Every consumer that PERSISTS it (gh's hosts.yml) needs to know
+# when its copy dies, or it cannot tell "still good" from "dead for 16 days".
+# ---------------------------------------------------------------------------
+
+
+def test_detail_carries_expiry_from_a_cache_hit(app_env, monkeypatch):
+    _write_cache(app_env, "ghs_cached", time.time() + 3600)
+    monkeypatch.setattr(
+        gat.httpx, "post", lambda *a, **k: pytest.fail("must not mint on cache hit")
+    )
+
+    detail = gat.get_installation_token_detail(app_env)
+
+    assert detail.token == "ghs_cached"
+    assert detail.expires_epoch - time.time() == pytest.approx(3600, abs=5)
+
+
+def test_detail_carries_expiry_from_a_fresh_mint(app_env, monkeypatch):
+    class FakeResp:
+        status_code = 201
+
+        def json(self):
+            return {"token": "ghs_fresh", "expires_at": "2099-01-01T00:00:00Z"}
+
+    monkeypatch.setattr(gat.httpx, "post", lambda *a, **k: FakeResp())
+
+    detail = gat.get_installation_token_detail(app_env, force=True)
+
+    assert detail.token == "ghs_fresh"
+    assert detail.expires_at == "2099-01-01T00:00:00Z"
+
+
+def test_detail_none_without_app_credentials(tmp_path: Path):
+    (tmp_path / ".env").write_text("OPENAI_API_KEY=sk-x\n")
+    assert gat.get_installation_token_detail(tmp_path) is None
+
+
+def test_string_wrapper_still_matches_detail(app_env, monkeypatch):
+    """get_installation_token stays the string-only convenience path — callers
+    that only authenticate right now must be unaffected."""
+    _write_cache(app_env, "ghs_cached", time.time() + 3600)
+    monkeypatch.setattr(
+        gat.httpx, "post", lambda *a, **k: pytest.fail("must not mint on cache hit")
+    )
+    assert gat.get_installation_token(app_env) == (
+        gat.get_installation_token_detail(app_env).token
+    )
+
+
 def test_cache_written_0600(app_env, monkeypatch):
     import stat
 

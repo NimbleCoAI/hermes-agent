@@ -4,11 +4,11 @@
 
 # Hermes Agent ☤
 
-> **🔀 Multi-Tenant Fork** — This is `hermes-agent-mt`, patched for multi-tenant deployments with per-context memory isolation, group policy enforcement, and [Hermes Swarm Map](https://github.com/NimbleCoAI/hermes-swarm-map) integration. See [FORK-NOTICE.md](FORK-NOTICE.md) for details.
+> **🔀 Multi-Tenant Fork** — This is `hermes-agent-mt`, patched for multi-tenant deployments with per-context memory isolation, group policy enforcement, and [Swarm Map](https://github.com/NimbleCoOrg/swarm-map) integration. See [FORK-NOTICE.md](FORK-NOTICE.md) for details.
 >
-> **⚠️ Repo renamed:** `NimbleCoAI/hermes-agent` → `NimbleCoAI/hermes-agent-mt`. Git clone/remote URLs auto-redirect (no action needed). The image moved to **`ghcr.io/nimblecoai/hermes-agent-mt`**; the old `ghcr.io/nimblecoai/hermes-agent` path is a **deprecated alias** that stops updating after **2026-07-15**.
+> **⚠️ Repo moved orgs:** `NimbleCoAI/hermes-agent-mt` → `NimbleCoOrg/hermes-agent-mt` (and earlier, `hermes-agent` → `hermes-agent-mt`). Git clone/remote URLs auto-redirect — no action needed. **The image path did change:** CI now publishes to **`ghcr.io/nimblecoorg/hermes-agent-mt`**. The old `ghcr.io/nimblecoai/hermes-agent-mt` package is kept read-only, **frozen at 2026-07-21** — pulls against it still succeed and silently return pre-move code, so repoint anything pinned to it. The pre-rename `ghcr.io/nimblecoai/hermes-agent` package is frozen the same way and also still pulls successfully — repoint anything pinned to it too.
 >
-> Upstream: [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) · Image: `ghcr.io/nimblecoai/hermes-agent-mt:latest`
+> Upstream: [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) · Image: `ghcr.io/nimblecoorg/hermes-agent-mt:latest`
 
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
@@ -184,10 +184,44 @@ All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes
 | [MCP Integration](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp)               | Connect any MCP server for extended capabilities           |
 | [Cron Scheduling](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron)              | Scheduled tasks with platform delivery                     |
 | [Context Files](https://hermes-agent.nousresearch.com/docs/user-guide/features/context-files)       | Project context that shapes every conversation             |
+| [Letta Brain Mode](https://hermes-agent.nousresearch.com/docs/user-guide/features/letta-brain-mode) | Experimental — delegate turns to a Letta agent             |
 | [Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)             | Project structure, agent loop, key classes                 |
 | [Contributing](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing)             | Development setup, PR process, code style                  |
 | [CLI Reference](https://hermes-agent.nousresearch.com/docs/reference/cli-commands)                  | All commands and flags                                     |
 | [Environment Variables](https://hermes-agent.nousresearch.com/docs/reference/environment-variables) | Complete env var reference                                 |
+
+---
+
+## Alternate Runtimes
+
+Hermes normally runs its own agent loop, but the gateway can hand a turn to a different runtime while staying the messaging "door" — it keeps the platform adapters, pairing/authorization, group approval, streaming delivery, and transcript persistence.
+
+| Runtime | Enable with | Status |
+| --- | --- | --- |
+| **Native Hermes loop** | default | Stable |
+| **[Codex app-server](https://hermes-agent.nousresearch.com/docs/user-guide/features/codex-app-server-runtime)** | opt-in flag | Opt-in |
+| **[Letta agent](https://hermes-agent.nousresearch.com/docs/user-guide/features/letta-brain-mode)** | `LETTA_BRAIN_URL` + `LETTA_BRAIN_AGENT_ID` | Experimental |
+| **[Proxy mode](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/matrix#proxy-mode-e2ee-on-macos)** (remote Hermes) | `GATEWAY_PROXY_URL` | Stable |
+
+### Letta-backed agent mode (experimental)
+
+Point a gateway at a Letta server and it forwards each turn to a bound Letta agent over REST, returning that agent's reply. Letta keeps its own conversation state, so only the new message is sent — tagged with who is speaking and which group (`[from Alice in #family]`) so a shared brain can tell senders apart.
+
+```bash
+LETTA_BRAIN_URL="http://localhost:8283"
+LETTA_BRAIN_AGENT_ID="agent-0000-1111-2222"
+LETTA_BRAIN_API_KEY="..."        # optional; Letta Cloud / secured servers
+LETTA_BRAIN_STREAMING="off"      # optional; see the caveat below
+```
+
+Both the URL and the agent ID are required, and there is no separate on/off flag. If **either** is missing or misspelled the binding simply doesn't activate: the turn falls through to the **native Hermes loop** with no warning, so confirm the binding is live before assuming traffic reaches Letta.
+
+Authorization, pairing, group approval, and transcript audit all run **upstream** of the bridge, so they apply unchanged — a Letta-brained gateway is not an authorization bypass. Hermes' personality, memory, context files, skills, and toolset are **not** forwarded; configure those on the Letta agent itself.
+
+> [!WARNING]
+> **Usage accounting is not reliable on the default path.** Streaming is on unless you explicitly set `LETTA_BRAIN_STREAMING` to `off`/`0`/`false`/`no`, and the streaming client does not capture Letta's terminal `usage_statistics` event — so **streamed turns report 0 prompt/completion tokens**. Context-window tracking, compression decisions, and the runtime footer all read 0 for those turns. Real token counts come back only on the non-streaming path, which is the only path the audit-parity tests cover. Separately, Hermes' credits/cost tracker lives in the native loop and never runs for brain turns, and Letta's tool calls do not appear in Hermes' tool audit log. If you need spend caps, enforce them at the Letta server or the upstream provider.
+
+This is a productionized prototype. See [Letta Brain Mode](https://hermes-agent.nousresearch.com/docs/user-guide/features/letta-brain-mode) for the full contract, streaming-fallback rules, concurrency model, and known limitations.
 
 ---
 

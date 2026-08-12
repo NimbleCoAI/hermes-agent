@@ -181,12 +181,19 @@ def _expires_epoch(iso: str) -> float:
     ).timestamp()
 
 
-def _load_cache(path: Path) -> Optional[Tuple[str, float]]:
+def _load_cache_raw(path: Path) -> Optional[Tuple[str, str]]:
+    """``(token, expires_at_iso)`` from the cache, or ``None`` if absent/corrupt."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data["token"], _expires_epoch(data["expires_at"])
+        _expires_epoch(data["expires_at"])  # validate parseability
+        return data["token"], data["expires_at"]
     except Exception:
         return None  # absent or corrupt → caller re-mints
+
+
+def _load_cache(path: Path) -> Optional[Tuple[str, float]]:
+    raw = _load_cache_raw(path)
+    return (raw[0], _expires_epoch(raw[1])) if raw else None
 
 
 def _store_cache(path: Path, token: str, expires_at_iso: str) -> None:
@@ -197,11 +204,35 @@ def _store_cache(path: Path, token: str, expires_at_iso: str) -> None:
     os.replace(tmp, path)  # atomic — a concurrent reader never sees a partial file
 
 
-def get_installation_token(home_dir: Path, *, force: bool = False) -> Optional[str]:
-    """Return a valid installation token for ``home_dir``, minting if needed.
+@dataclass(frozen=True)
+class InstallationToken:
+    """A minted installation token together with the instant it dies.
+
+    The expiry travels WITH the token because every consumer that persists it
+    (``gh``'s ``hosts.yml``) needs to know when its copy goes dead. A token
+    handed around as a bare string is a credential whose lifetime is invisible,
+    which is exactly how ``hosts.yml`` fossilized for 16 days.
+    """
+
+    token: str
+    expires_at: str  # ISO-8601 Z, verbatim from GitHub
+
+    @property
+    def expires_epoch(self) -> float:
+        return _expires_epoch(self.expires_at)
+
+
+def get_installation_token_detail(
+    home_dir: Path, *, force: bool = False
+) -> Optional[InstallationToken]:
+    """Return a valid :class:`InstallationToken` for ``home_dir``, minting if needed.
 
     Cache-first: a cached token with more than ``REMINT_MARGIN_SECONDS`` of life
     left is returned as-is. Returns ``None`` only if the home has no App creds.
+
+    This is the lifetime-aware primitive; :func:`get_installation_token` is the
+    string-only convenience wrapper for callers that only need to authenticate
+    right now and never persist the value.
     """
     creds = read_app_credentials(home_dir / ".env")
     if creds is None:
@@ -209,13 +240,19 @@ def get_installation_token(home_dir: Path, *, force: bool = False) -> Optional[s
 
     path = cache_path(home_dir)
     if not force:
-        cached = _load_cache(path)
-        if cached and cached[1] - time.time() > REMINT_MARGIN_SECONDS:
-            return cached[0]
+        cached = _load_cache_raw(path)
+        if cached and _expires_epoch(cached[1]) - time.time() > REMINT_MARGIN_SECONDS:
+            return InstallationToken(cached[0], cached[1])
 
     token, expires_at = mint_installation_token(creds)
     _store_cache(path, token, expires_at)
-    return token
+    return InstallationToken(token, expires_at)
+
+
+def get_installation_token(home_dir: Path, *, force: bool = False) -> Optional[str]:
+    """Return a valid installation token string for ``home_dir``, minting if needed."""
+    detail = get_installation_token_detail(home_dir, force=force)
+    return detail.token if detail else None
 
 
 # ---------------------------------------------------------------------------

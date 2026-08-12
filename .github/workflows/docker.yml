@@ -42,7 +42,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout code
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -121,7 +121,7 @@ jobs:
       # cheapest path to coverage on every PR that touches docker code.
       # ---------------------------------------------------------------------
       - name: Install uv (for docker tests)
-        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # 8.3.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # 9.0.0
 
       - name: Set up Python 3.11 (for docker tests)
         run: uv python install 3.11

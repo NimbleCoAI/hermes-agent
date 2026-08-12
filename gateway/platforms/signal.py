@@ -1540,10 +1540,17 @@ class SignalAdapter(BasePlatformAdapter):
                         status_sid = status.get("uuid") or status.get("serviceId")
                         break
             if candidate and status_sid and status_sid != candidate:
-                logger.warning(
-                    "Signal: getUserStatus self-lookup returned %s (likely the "
-                    "account PNI) but listIdentities returned ACI %s — using "
-                    "the ACI. Do not trust getUserStatus for self-identity.",
+                # INFO, not WARNING: per the docstring above this mismatch is
+                # the expected steady state on every connect, so at WARNING it
+                # was a 100%-false-positive "fault" that home_log_router
+                # relayed to the operator on every restart. INFO clears that
+                # floor while keeping the line in gateway.log — DEBUG would
+                # drop it from the component log entirely.
+                logger.info(
+                    "Signal: getUserStatus self-lookup returned %s (presumed "
+                    "the account PNI) but listIdentities returned ACI %s — "
+                    "using the ACI. getUserStatus is never trusted for "
+                    "self-identity.",
                     str(status_sid)[:12], candidate[:12],
                 )
         except Exception:

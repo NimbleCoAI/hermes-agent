@@ -58,6 +58,10 @@ from agent.model_metadata import (
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from agent.tool_call_ids import (
+    count_visible_tool_results,
+    repair_conversation_tool_call_ids,
+)
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
@@ -636,6 +640,20 @@ def run_conversation(
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
     messages = _ctx.messages
+    # Keep the live turn transcript reachable from the agent object so an
+    # *external* observer can read it mid-turn. Delegation needs this: when a
+    # subagent hits delegation.child_timeout_seconds the parent abandons the
+    # child's future and never receives its return value, so the salvage in
+    # tools.delegate_tool reads this list instead.
+    #
+    # build_turn_context already sets this via _persist_session, so this line
+    # is mostly belt-and-braces for the paths that skip persistence. The part
+    # that actually matters is that `messages` is REBOUND (not just appended
+    # to) by every _compress_context call — 5 sites in this function alone —
+    # and each rebind abandons the list this reference points at. That
+    # re-publish lives in _compress_context itself (run_agent.py) so it cannot
+    # be missed by a new call site; test_delegate_partial_summary asserts it.
+    agent._session_messages = messages
     conversation_history = _ctx.conversation_history
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
@@ -836,6 +854,29 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        # Make tool_call ids conversation-unique BEFORE anything keys on them.
+        # Some providers scope ids to the assistant message that issued them and
+        # restart the numbering every round (Moonshot kimi-k3 via OpenRouter:
+        # "read_file:0", "read_file:1", "terminal:0", ...).  Every id-keyed pass
+        # downstream — the pre-call orphan/duplicate sanitizer, the compressor's
+        # tool-pair sanitizer, the Codex Responses adapter — assumes ids are
+        # unique across the conversation, so a round-scoped provider makes every
+        # later round look like a duplicate of the first and its results get
+        # deleted before the request.  Repairing the stored list (not a per-call
+        # copy) means the session DB, the compressor and a resumed transcript all
+        # see clean ids too.  See agent/tool_call_ids.py for the incident.
+        renamed_ids = repair_conversation_tool_call_ids(
+            messages,
+            logger=request_logger,
+            model=agent.model,
+            provider=agent.provider,
+            session_id=agent.session_id or "",
+        )
+        if renamed_ids:
+            agent._tool_call_ids_renamed = (
+                getattr(agent, "_tool_call_ids_renamed", 0) + renamed_ids
+            )
+
         api_messages = []
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
@@ -1027,6 +1068,30 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # Invariant: whatever assembly did to the payload, the model must still
+        # see the tool output it asked for.  A tool result that vanishes here is
+        # invisible from the model's side — it requests a file, gets nothing back,
+        # and requests it again until the turn burns its api_call budget.  That
+        # failure used to be a debug line, which is why the production incident
+        # presented as "the model is stuck in a read loop" instead of "the harness
+        # deleted the answer".  Say it loudly, with the numbers.
+        _live_results, _live_chars = count_visible_tool_results(messages)
+        _api_results, _api_chars = count_visible_tool_results(api_messages)
+        if _api_results < _live_results:
+            _lost_chars = max(0, _live_chars - _api_chars)
+            _log = request_logger.error if _lost_chars >= 500 else request_logger.info
+            _log(
+                "Request assembly dropped %d of %d tool result(s) (%d characters "
+                "of tool output the model will not see) — model=%s provider=%s "
+                "session=%s. The model is likely to re-request this output.",
+                _live_results - _api_results,
+                _live_results,
+                _lost_chars,
+                agent.model,
+                agent.provider or "unknown",
+                agent.session_id or "-",
+            )
 
         # Calculate approximate request size for logging and pressure checks.
         # estimate_messages_tokens_rough(api_messages) includes the system

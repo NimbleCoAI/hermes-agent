@@ -161,6 +161,24 @@ def _sync_allowlist_remove(platform: str, user_id: str) -> None:
         pass
 
 
+def revoke_platform_authorization(platform: str, user_id: str) -> None:
+    """Revoke every pairing-layer grant for ``user_id`` on ``platform``.
+
+    Public entry point for moderation-driven revocation (R7). Unlike
+    :meth:`PairingStore.revoke` — whose allowlist mirror only fires when the
+    user was actually paired — this also prunes the platform allowlist env
+    var for never-paired users who were allowlisted directly.
+
+    Callers that also maintain an in-process copy of the allowlist MUST call
+    this BEFORE pruning ``os.environ``: ``_sync_allowlist_remove`` reads the
+    current ``os.getenv`` value to compute the persisted remainder.
+    """
+    PairingStore().revoke(platform, user_id)
+    # Unconditional: revoke()'s internal sync only runs when the user was
+    # paired; a never-paired allowlisted user still needs the .env prune.
+    _sync_allowlist_remove(platform, user_id)
+
+
 def _load_json_file(path: Path) -> dict:
     if path.exists():
         try:

@@ -405,6 +405,54 @@ class GatewayAuthorizationMixin:
                 ):
                     return True
 
+        # Discord: channel-scoped access — "anyone posting in #open-science may
+        # talk to the bot". The Discord adapter already implements this at
+        # intake (``_is_allowed_user`` consults DISCORD_ALLOWED_CHANNELS when no
+        # user/role allowlist matches), but this layer had no Discord entry at
+        # all, so the adapter admitted the message and the gateway then denied
+        # it — the bot went silent with no operator-visible error, and the
+        # obvious "fix" is DISCORD_ALLOWED_USERS=*, the worst available state.
+        #
+        # OPT-IN per agent, deliberately. Adding Discord to the shared
+        # chat_allowlist_env map above would widen every existing Discord agent
+        # the moment this ships: those agents use DISCORD_ALLOWED_CHANNELS to
+        # scope *where the bot speaks* while restricting *who may command it* to
+        # a short DISCORD_ALLOWED_USERS list. A chat-scoped grant authorizes
+        # every sender in the channel, so the map entry alone would silently
+        # promote "the bot may post here" into "anyone here may drive the bot".
+        #
+        # ``*`` is NOT honored, unlike the other platforms above. For channels
+        # it states where the bot may speak, not who may command it; treating it
+        # as an authorization grant turns one permissive scope value into a
+        # fully open bot. Channel-scoped access requires an explicit list.
+        #
+        # Threads sit outside the {"group", "forum", "channel"} guard above
+        # (Discord threads arrive as chat_type "thread"), so this block runs on
+        # its own guard that includes them. A thread authorizes iff its parent
+        # channel would: the adapter stamps the parent channel id into
+        # ``source.parent_chat_id`` at build_source time, and with auto-threading
+        # on (the default) most conversation happens in threads — a
+        # channel-scoped grant that skipped them would deny the very traffic it
+        # was written for.
+        if (
+            source.platform == Platform.DISCORD
+            and source.chat_type in {"group", "forum", "channel", "thread"}
+            and source.chat_id
+            and _auth_env("DISCORD_CHANNEL_SCOPED_ACCESS").lower()
+            in {"true", "1", "yes"}
+        ):
+            raw_channels = _auth_env("DISCORD_ALLOWED_CHANNELS")
+            allowed_channel_ids = {
+                cid.strip()
+                for cid in raw_channels.split(",")
+                if cid.strip() and cid.strip() != "*"
+            }
+            if allowed_channel_ids and (
+                self._chat_id_in_allowlist(source, allowed_channel_ids)
+                or (source.parent_chat_id or "") in allowed_channel_ids
+            ):
+                return True
+
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
         # Checked before the no-user-id guard below: some platforms deliver
         # bot/automation traffic with no user_id at all -- e.g. Slack Workflow

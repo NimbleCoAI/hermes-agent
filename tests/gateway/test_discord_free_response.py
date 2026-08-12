@@ -1486,3 +1486,164 @@ async def test_discord_non_reply_free_channel_skips_backfill(adapter, monkeypatc
 
     adapter._fetch_channel_context.assert_not_awaited()
 
+
+
+@pytest.mark.asyncio
+async def test_discord_accepts_managed_role_mentions_when_required(adapter, monkeypatch):
+    """Mention-picker often yields the bot's managed role (<@&ID>), not the user.
+
+    A resolved role_mentions entry matching guild.self_role must count as an
+    explicit mention and be stripped from the delivered text (#67869 upstream).
+    """
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    self_role = SimpleNamespace(id=5555)
+    message = make_message(
+        channel=FakeTextChannel(channel_id=323),
+        content="<@&5555> hey girl you up?",
+        mentions=[],
+    )
+    message.guild = SimpleNamespace(id=99, self_role=self_role)
+    message.role_mentions = [self_role]
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hey girl you up?"
+
+
+@pytest.mark.asyncio
+async def test_discord_accepts_raw_managed_role_mention_token(adapter, monkeypatch):
+    """Raw <@&self_role> token counts even when role_mentions is empty."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=324),
+        content="<@&5555> hello from raw role mention",
+        mentions=[],
+    )
+    message.guild = SimpleNamespace(id=99, self_role=SimpleNamespace(id=5555))
+    message.role_mentions = []
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello from raw role mention"
+
+
+@pytest.mark.asyncio
+async def test_discord_ignores_unrelated_role_mentions(adapter, monkeypatch):
+    """Roles the bot merely holds (shared @bots role) must NOT wake it."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=325),
+        content="<@&7777> everyone in bots-role, sound off",
+        mentions=[],
+    )
+    message.guild = SimpleNamespace(id=99, self_role=SimpleNamespace(id=5555))
+    message.role_mentions = [SimpleNamespace(id=7777)]
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_role_mention_without_self_role_still_gated(adapter, monkeypatch):
+    """No managed self-role in the guild -> role mentions change nothing."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=326),
+        content="<@&5555> anyone home?",
+        mentions=[],
+    )
+    message.guild = SimpleNamespace(id=99, self_role=None)
+    message.role_mentions = [SimpleNamespace(id=5555)]
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# observe-unmentioned: input/context is orthogonal to the response gate. When
+# enabled, an unmentioned channel message is ingested as observe_only context
+# (no response, no auto-thread). Defaults OFF (opt-in) so existing deployments
+# are unchanged; HSM opts in per surface.
+# ---------------------------------------------------------------------------
+
+def test_discord_observe_unmentioned_defaults_false(adapter, monkeypatch):
+    monkeypatch.delenv("DISCORD_OBSERVE_UNMENTIONED", raising=False)
+    assert adapter._discord_observe_unmentioned() is False
+
+
+def test_discord_observe_unmentioned_config_true(adapter):
+    adapter.config.extra["observe_unmentioned"] = "true"
+    assert adapter._discord_observe_unmentioned() is True
+
+
+def test_discord_observe_unmentioned_env_true(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_OBSERVE_UNMENTIONED", "true")
+    assert adapter._discord_observe_unmentioned() is True
+
+
+@pytest.mark.asyncio
+async def test_discord_unmentioned_observed_when_enabled(adapter, monkeypatch):
+    """observe on + unmentioned channel msg → ingested observe_only, no response."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_OBSERVE_UNMENTIONED", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(channel=FakeTextChannel(channel_id=777), content="passing chatter")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.observe_only is True
+
+
+@pytest.mark.asyncio
+async def test_discord_unmentioned_dropped_by_default(adapter, monkeypatch):
+    """observe default off → unmentioned channel msg is hard-dropped."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.delenv("DISCORD_OBSERVE_UNMENTIONED", raising=False)
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(channel=FakeTextChannel(channel_id=778), content="passing chatter")
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_mentioned_is_not_observe_only(adapter, monkeypatch):
+    """A mentioned message is a normal (responded) turn, not observe_only."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_OBSERVE_UNMENTIONED", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=779),
+        content="<@999> hello",
+        mentions=[SimpleNamespace(id=999)],
+    )
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.observe_only is False

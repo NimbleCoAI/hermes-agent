@@ -10654,8 +10654,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
-        if canonical == "credits":
-            return await self._handle_credits_command(event)
+        if canonical == "topup":
+            return await self._handle_topup_command(event)
 
         if canonical == "insights":
             return await self._handle_insights_command(event)
@@ -11215,7 +11215,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 # Decide routing: native (attach pixels) vs text (vision_analyze
                 # pre-run + prepend description).  See agent/image_routing.py.
-                _img_mode = self._decide_image_input_mode(
+                # Offload to a worker thread: the decision does blocking network
+                # I/O — a models.dev fetch on cache miss, and the Ollama
+                # ``/api/show`` capability probe for local servers — whose
+                # request timeout would otherwise stall the whole gateway event
+                # loop (every session) while a single image is routed.
+                _img_mode = await asyncio.to_thread(
+                    self._decide_image_input_mode,
                     source=source,
                     session_key=session_key,
                 )
@@ -13006,6 +13012,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
+
+            # R6: feed the authoritative per-turn cost into the daily spend
+            # ledger. The agent result (agent/turn_finalizer.py) is the ONLY
+            # live source of estimated_cost_usd — the SessionStore cost
+            # columns have no writer and must not be used for budgeting.
+            # NOTE: estimated_cost_usd is the agent's CUMULATIVE session
+            # total, so record_session_spend charges only this turn's delta.
+            # Unknown/zero cost still consumes a fallback amount inside
+            # record_spend (fail-closed spend accounting).
+            try:
+                from gateway.inbound_throttle import get_throttle
+
+                await asyncio.to_thread(
+                    get_throttle().record_session_spend,
+                    session_entry.session_key,
+                    agent_result.get("estimated_cost_usd"),
+                    agent_result.get("cost_status"),
+                )
+            except Exception as _spend_err:
+                logger.warning("Throttle spend recording failed: %s", _spend_err)
 
             # Re-baseline the cached agent's message_count snapshot now that
             # ALL of this turn's transcript writes are done — the agent's
