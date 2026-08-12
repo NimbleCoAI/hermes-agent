@@ -5,12 +5,21 @@ name: Publish Docker Image (Fork)
 # publishing to GHCR for this fork.
 #
 # The image namespace is derived from github.repository_owner (lowercased by
-# docker/metadata-action), NOT hardcoded — so a repo TRANSFER auto-repoints the
-# publish target with no coordinated code change. Today (owner NimbleCoAI) it
-# publishes ghcr.io/nimblecoai/hermes-agent-mt exactly as before; after a
-# transfer to NimbleCoOrg it publishes ghcr.io/nimblecoorg/hermes-agent-mt.
-# The GHCR package under the OLD owner is retained (frozen) as a pull grace
-# window — never delete it.
+# docker/metadata-action), NOT hardcoded — so a repo TRANSFER or an org RENAME
+# auto-repoints the publish target with no coordinated code change. Today the
+# owner is the cyborg-garden org, so this publishes
+# ghcr.io/cyborg-garden/hermes-agent-mt.
+#
+# History: the repo was transferred NimbleCoAI → NimbleCoOrg, and the org was
+# later renamed NimbleCoOrg → cyborg-garden. These two events behave DIFFERENTLY
+# downstream, and the difference is the thing to remember:
+#   - A repo TRANSFER leaves the old owner's GHCR package behind, public and
+#     frozen. ghcr.io/nimblecoai/hermes-agent-mt still pulls SUCCESSFULLY and
+#     silently serves stale pre-move code. Never delete it; it is the grace
+#     window — but consumers must be repointed or they rot in silence.
+#   - An org RENAME carries the package namespace with it and leaves NO
+#     redirect. ghcr.io/nimblecoorg/hermes-agent-mt no longer resolves; pulls
+#     against it fail outright rather than going stale.
 
 on:
   push:
@@ -42,7 +51,8 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           # Owner-derived (see header): metadata-action lowercases the owner, so
-          # NimbleCoAI→nimblecoai, NimbleCoOrg→nimblecoorg, transfer-safe. The
+          # NimbleCoAI→nimblecoai, NimbleCoOrg→nimblecoorg,
+          # cyborg-garden→cyborg-garden — transfer- and rename-safe. The
           # deprecated `…/hermes-agent` dual-publish alias (removal date
           # 2026-07-15, now passed) is dropped — only the canonical
           # hermes-agent-mt path is published.
