@@ -11,6 +11,7 @@ from gateway.session import SessionSource
 def _make_adapter(
     require_mention=None,
     free_response_chats=None,
+    free_response_topics=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -30,6 +31,8 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if free_response_topics is not None:
+        extra["free_response_topics"] = free_response_topics
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -248,7 +251,8 @@ def test_observed_group_context_replays_as_current_message_context_not_user_turn
     )
 
     assert agent_history == [{"role": "assistant", "content": "previous explicit reply"}]
-    assert "[Observed Telegram group context - context only, not requests]" in api_message
+    # Header generalized for multi-platform observed context (#112).
+    assert "[Observed group context - context only, not requests]" in api_message
     assert "[Current addressed message - answer only this" in api_message
     assert "Acha que dá fazer estoque?" in api_message
     assert "Tem lote e vencimento" in api_message
@@ -295,7 +299,7 @@ def test_observed_group_context_wraps_multimodal_current_message_without_mutatin
     )
 
     assert original[0]["text"] == "[Bob|222]\nsee this image"
-    assert wrapped[0]["text"].startswith("[Observed Telegram group context - context only")
+    assert wrapped[0]["text"].startswith("[Observed group context - context only")
     assert wrapped[0]["text"].endswith("[Bob|222]\nsee this image")
     assert wrapped[1] == original[1]
 
@@ -541,6 +545,41 @@ def test_free_response_chats_bypass_mention_requirement():
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+def test_free_response_topics_bypass_mention_requirement_only_for_topic():
+    adapter = _make_adapter(require_mention=True, free_response_topics=["-200:31"])
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=31)) is True
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=32)) is False
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201, thread_id=31)) is False
+
+
+def test_free_response_topics_treat_missing_thread_as_general_topic():
+    adapter = _make_adapter(require_mention=True, free_response_topics=["-200:1"])
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=None)) is True
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=31)) is False
+
+
+def test_free_response_topic_messages_are_dispatched_not_observed():
+    """A free-response topic message must go to the dispatcher, not the observe path."""
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-200"],
+        group_allowed_chats=["-200"],
+        observe_unmentioned_group_messages=True,
+        free_response_topics=["-200:31"],
+    )
+
+    in_topic = _group_message("hello everyone", chat_id=-200, thread_id=31)
+    assert adapter._should_process_message(in_topic) is True
+    assert adapter._should_observe_unmentioned_group_message(in_topic) is False
+
+    # Same chat, different topic: not dispatched, but still observable.
+    other_topic = _group_message("side chatter", chat_id=-200, thread_id=32)
+    assert adapter._should_process_message(other_topic) is False
+    assert adapter._should_observe_unmentioned_group_message(other_topic) is True
 
 
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():
@@ -936,6 +975,33 @@ def test_top_level_require_mention_does_not_override_telegram_section(monkeypatc
     assert config is not None
     # The telegram-specific "false" must win over the top-level "true".
     assert __import__("os").environ.get("TELEGRAM_REQUIRE_MENTION") == "false"
+
+
+def test_config_bridges_telegram_free_response_topics(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "telegram:\n"
+        "  free_response_topics:\n"
+        '    - "-1001234567:3"\n'
+        '    - "-1001234567:9"\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_TOPICS", raising=False)
+
+    config = load_gateway_config()
+
+    assert config is not None
+    tg_cfg = config.platforms.get(Platform.TELEGRAM)
+    assert tg_cfg is not None
+    # free_response_topics is carried in PlatformConfig.extra (like guest_mode)
+    # AND bridged to the env var the adapter reads at runtime. The env var is
+    # not a key that appears in developer .env files, so asserting it via
+    # os.environ stays deterministic.
+    assert tg_cfg.extra.get("free_response_topics") == ["-1001234567:3", "-1001234567:9"]
+    assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_TOPICS"] == "-1001234567:3,-1001234567:9"
 
 
 def test_config_bridges_telegram_ignored_threads(monkeypatch, tmp_path):

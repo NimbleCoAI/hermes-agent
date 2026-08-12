@@ -2,7 +2,15 @@ name: Publish Docker Image (Fork)
 
 # Fork-specific workflow. The upstream docker-publish.yml only runs on
 # github.repository == 'NousResearch/hermes-agent'; this workflow handles
-# publishing to GHCR for NimbleCoAI/hermes-agent-mt.
+# publishing to GHCR for this fork.
+#
+# The image namespace is derived from github.repository_owner (lowercased by
+# docker/metadata-action), NOT hardcoded — so a repo TRANSFER auto-repoints the
+# publish target with no coordinated code change. Today (owner NimbleCoAI) it
+# publishes ghcr.io/nimblecoai/hermes-agent-mt exactly as before; after a
+# transfer to NimbleCoOrg it publishes ghcr.io/nimblecoorg/hermes-agent-mt.
+# The GHCR package under the OLD owner is retained (frozen) as a pull grace
+# window — never delete it.
 
 on:
   push:
@@ -20,7 +28,7 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Log in to Container Registry
         uses: docker/login-action@v4
@@ -33,13 +41,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          # Transitional DUAL-PUBLISH for the hermes-agent → hermes-agent-mt
-          # rename. The new path is canonical; the old path is a deprecated
-          # alias so existing pullers keep getting updates during the window.
-          # Remove the deprecated `…/hermes-agent` line after 2026-07-15.
+          # Owner-derived (see header): metadata-action lowercases the owner, so
+          # NimbleCoAI→nimblecoai, NimbleCoOrg→nimblecoorg, transfer-safe. The
+          # deprecated `…/hermes-agent` dual-publish alias (removal date
+          # 2026-07-15, now passed) is dropped — only the canonical
+          # hermes-agent-mt path is published.
           images: |
-            ${{ env.REGISTRY }}/nimblecoai/hermes-agent-mt
-            ${{ env.REGISTRY }}/nimblecoai/hermes-agent
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/hermes-agent-mt
           tags: |
             type=raw,value=latest
             type=sha,prefix=

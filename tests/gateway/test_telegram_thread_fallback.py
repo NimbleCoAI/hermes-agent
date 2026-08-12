@@ -102,6 +102,26 @@ _fake_telegram_ext.MessageHandler = object
 _fake_telegram_ext.TypeHandler = object
 _fake_telegram_ext.ContextTypes = SimpleNamespace(DEFAULT_TYPE=object)
 _fake_telegram_ext.filters = object
+
+
+class _FakeChatMemberHandler:
+    """Mirror the real ``telegram.ext.ChatMemberHandler`` surface.
+
+    The adapter treats this symbol as OPTIONAL — it imports it separately from
+    the mandatory ``telegram.ext`` tuple so an SDK build without it loses only
+    the group auto-approval gate. This fake carries it so the fake looks like
+    the SDK the adapter actually runs against; the absent case has its own
+    coverage in tests/gateway/test_telegram_optional_chatmemberhandler.py.
+    """
+
+    MY_CHAT_MEMBER = "my_chat_member"
+
+    def __init__(self, callback, chat_member_types=None):
+        self.callback = callback
+        self.chat_member_types = chat_member_types
+
+
+_fake_telegram_ext.ChatMemberHandler = _FakeChatMemberHandler
 _fake_telegram_request = types.ModuleType("telegram.request")
 _fake_telegram_request.HTTPXRequest = object
 
@@ -456,6 +476,81 @@ async def test_send_private_dm_topic_uses_direct_messages_topic_id():
     assert result.success is True
     assert call_log[0]["message_thread_id"] is None
     assert call_log[0]["direct_messages_topic_id"] == 99999
+
+
+@pytest.mark.asyncio
+async def test_private_chat_explicit_thread_id_uses_message_thread_id_without_anchor():
+    """Cron-resolved private-chat forum topics route by message_thread_id."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=270454)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="775566675",
+        content="cron topic delivery",
+        metadata={"thread_id": "270453"},
+    )
+
+    assert result.success is True
+    assert call_log[0]["reply_to_message_id"] is None
+    assert call_log[0]["message_thread_id"] == 270453
+    assert "direct_messages_topic_id" not in call_log[0]
+
+
+@pytest.mark.asyncio
+async def test_private_chat_explicit_direct_messages_topic_id_uses_direct_topic_without_anchor():
+    """Explicit Bot API Direct Messages topics do not need a reply anchor."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=270454)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="775566675",
+        content="direct topic delivery",
+        metadata={"direct_messages_topic_id": "270453"},
+    )
+
+    assert result.success is True
+    assert call_log[0]["reply_to_message_id"] is None
+    assert call_log[0]["message_thread_id"] is None
+    assert call_log[0]["direct_messages_topic_id"] == 270453
+
+
+@pytest.mark.asyncio
+async def test_private_dm_topic_reply_fallback_without_anchor_fails_loud():
+    """Anchor-required DM topic fallback must not silently send elsewhere."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        return SimpleNamespace(message_id=270454)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="775566675",
+        content="missing anchor",
+        metadata={
+            "thread_id": "270453",
+            "telegram_dm_topic_reply_fallback": True,
+        },
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.error == adapter._dm_topic_missing_anchor_error()
+    assert call_log == []
 
 
 def test_base_gateway_metadata_marks_telegram_dm_topics_as_reply_fallback():

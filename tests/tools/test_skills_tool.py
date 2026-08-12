@@ -94,6 +94,17 @@ class TestParseFrontmatter:
         # Should still parse what it can via fallback
         assert "name" in fm
 
+    def test_utf8_bom_frontmatter(self):
+        """A leading UTF-8 BOM (Windows Notepad / PowerShell ``>`` save) must
+        not drop the frontmatter. Confirms the fix reaches the tools/ surface
+        via the _parse_frontmatter re-export."""
+        bom = chr(0xFEFF)
+        content = bom + "---\nname: test\ndescription: A test.\n---\n\n# Body\n"
+        fm, body = _parse_frontmatter(content)
+        assert fm["name"] == "test"
+        assert fm["description"] == "A test."
+        assert not body.startswith(bom)
+
 
 # ---------------------------------------------------------------------------
 # _parse_tags
@@ -306,6 +317,37 @@ class TestFindAllSkills:
 
         assert [s["name"] for s in skills] == ["knowledge-brain"]
         assert skills[0]["category"] == "linked"
+
+    def test_excludes_platform_incompatible_skill_on_linux(self, tmp_path):
+        """A ``platforms: [macos]`` skill on disk must be dropped from the
+        discovery listing when running on Linux, while a skill declaring no
+        platform requirement (and one that explicitly lists linux) still shows.
+
+        Regression guard for the im7-bot symptom: macOS-only skills
+        (apple-notes, imessage, findmy, apple-reminders) were probed on a
+        Linux container. ``skill_matches_platform`` is unit-tested in
+        isolation, but this asserts the *discovery integration* — that
+        ``_find_all_skills`` actually applies the predicate — so a future
+        refactor can't silently drop the filter and let macOS skills leak
+        into the model's context on Linux.
+        """
+        _make_skill(
+            tmp_path, "imessage", frontmatter_extra="platforms: [macos]\n"
+        )
+        _make_skill(
+            tmp_path, "notion", frontmatter_extra="platforms: [linux, macos]\n"
+        )
+        _make_skill(tmp_path, "generic")  # no platforms field → all platforms
+
+        with patch("agent.skill_utils.sys") as mock_sys:
+            mock_sys.platform = "linux"
+            with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+                skills = _find_all_skills()
+
+        names = {s["name"] for s in skills}
+        assert "imessage" not in names  # macOS-only, excluded on Linux
+        assert "notion" in names  # lists linux, included
+        assert "generic" in names  # no requirement, included
 
 
 # ---------------------------------------------------------------------------

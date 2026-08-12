@@ -67,3 +67,22 @@ def disable_lazy_stt_install():
     """
     with patch("tools.transcription_tools._try_lazy_install_stt", return_value=False):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_web_backend_warn_dedup():
+    """Clear web_tools' session-global warn-dedup set between tests.
+
+    ``_backend_discard_warned`` persists for the process, so without this any
+    test asserting "a backend warning was emitted" becomes order-dependent —
+    passing alone and failing in full-suite order once an earlier test has
+    already consumed the once-per-process warning.
+    """
+    try:
+        from tools import web_tools
+    except Exception:  # pragma: no cover — tools import is optional here
+        yield
+        return
+    web_tools._backend_discard_warned.clear()
+    yield
+    web_tools._backend_discard_warned.clear()

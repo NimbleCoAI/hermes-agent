@@ -153,7 +153,7 @@ class TestDingTalkAdapterInit:
 # ---------------------------------------------------------------------------
 
 
-class TestExtractText:
+class TestExtractTextLegacyShapes:
 
     def test_extracts_dict_text(self):
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
@@ -173,6 +173,10 @@ class TestExtractText:
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         msg = MagicMock()
         msg.text = ""
+        # Must be explicit: an unset MagicMock attribute auto-creates a truthy
+        # Mock, which would satisfy the `rich_text_content` branch and stop the
+        # legacy `rich_text` path this test exists to cover from ever running.
+        msg.rich_text_content = None
         msg.rich_text = [{"text": "part1"}, {"text": "part2"}, {"image": "url"}]
         assert DingTalkAdapter._extract_text(msg) == "part1 part2"
 
@@ -180,6 +184,7 @@ class TestExtractText:
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         msg = MagicMock()
         msg.text = ""
+        msg.rich_text_content = None
         msg.rich_text = None
         assert DingTalkAdapter._extract_text(msg) == ""
 

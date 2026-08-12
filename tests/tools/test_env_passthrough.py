@@ -105,6 +105,50 @@ class TestConfigPassthrough:
         assert "CONFIG_KEY" in all_pt
         assert "SKILL_KEY" in all_pt
 
+    def test_operator_config_survives_sandbox_scrub_without_skill_load(
+        self, tmp_path, monkeypatch
+    ):
+        """A third-party key named in ``terminal.env_passthrough`` reaches the
+        execute_code child even when the owning skill was never loaded.
+
+        This is the load-order-independent Notion fix: the model can run
+        ``execute_code`` that reads ``NOTION_API_KEY`` on the very first turn —
+        without first calling ``skill_view('notion')`` to register it — because
+        the operator declared it in config. It exercises the *real*
+        ``_scrub_child_env`` so the config path is verified against the actual
+        sandbox scrubber, not a reimplementation. A Hermes provider credential
+        added to the same list is still stripped (config must not override the
+        credential blocklist — GHSA-rhgp-j443-p4rf).
+        """
+        from tools.code_execution_tool import _scrub_child_env
+        from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST
+
+        blocked_var = next(iter(_HERMES_PROVIDER_ENV_BLOCKLIST))
+        config = {
+            "terminal": {"env_passthrough": ["NOTION_API_KEY", blocked_var]}
+        }
+        (tmp_path / "config.yaml").write_text(yaml.dump(config))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _ep_mod._config_passthrough = None
+
+        # No skill_view / register_env_passthrough call — config is the only source.
+        assert is_env_passthrough("NOTION_API_KEY")
+        # The provider credential must be filtered out of the config allowlist.
+        assert not is_env_passthrough(blocked_var)
+
+        child_env = _scrub_child_env(
+            {
+                "NOTION_API_KEY": "ntn_synthetic",
+                blocked_var: "synthetic-secret",
+                "PATH": "/usr/bin",
+            },
+            is_passthrough=is_env_passthrough,
+            is_windows=False,
+        )
+        assert child_env["NOTION_API_KEY"] == "ntn_synthetic"
+        assert blocked_var not in child_env
+        assert child_env["PATH"] == "/usr/bin"
+
 
 class TestExecuteCodeIntegration:
     """Verify that the passthrough is checked in execute_code's env filtering."""

@@ -22,7 +22,6 @@ import type {
   LogsResponse,
   McpCatalogResponse,
   McpServerSummary,
-  McpServerTestResponse,
   MemoryProviderConfig,
   MemoryProviderOAuthStatus,
   MemoryStatusResponse,
@@ -62,7 +61,7 @@ import type {
 // model info/options, cron) the moment the backend passes readiness. On a
 // profile-heavy or remote install these can each take tens of seconds — e.g.
 // /api/profiles runs list_profiles(), which does a recursive skill-tree walk
-// per profile — so the 15s default (DEFAULT_FETCH_TIMEOUT_MS in hardening.cjs)
+// per profile — so the 15s default (DEFAULT_FETCH_TIMEOUT_MS in hardening.ts)
 // times out a backend that is alive-but-busy, surfacing as a spurious
 // "Timed out connecting to Hermes backend" that hangs the UI (#48504).
 //
@@ -194,6 +193,109 @@ export function setApiRequestProfile(profile: null | string): void {
 
 function profileScoped(): { profile?: string } {
   return _apiProfile ? { profile: _apiProfile } : {}
+}
+
+/** Options for a plugin REST call — mirrors the app's own `hermesDesktop.api`
+ *  shape, minus the path (which is namespace-derived). */
+export interface PluginRestOptions {
+  method?: string
+  body?: unknown
+  /** Single-file multipart upload (see HermesApiRequest.upload). */
+  upload?: { filename: string; contentType?: string; bytes: ArrayBuffer }
+  timeoutMs?: number
+}
+
+// Normalize `path` to a leading-slash suffix relative to `/api/plugins/<id>`.
+// The namespace is the boundary — reject `..` so a relative segment can't
+// normalize out into another plugin's API or a core route. Check the path
+// portion only (before any query/hash).
+function pluginPathSuffix(caller: string, path: string): string {
+  const suffix = path.startsWith('/') ? path : `/${path}`
+
+  if (suffix.split(/[?#]/, 1)[0].split('/').includes('..')) {
+    throw new Error(`${caller}: illegal path traversal in "${path}"`)
+  }
+
+  return suffix
+}
+
+/** The plugin REST door. Every call is scoped BY CONSTRUCTION to the plugin's
+ *  own backend namespace — `path` is relative to `/api/plugins/<pluginId>`
+ *  ('/board' → `/api/plugins/kanban/board`), so a plugin can't address another
+ *  plugin's API or a core route through it. Profile-aware like every desktop
+ *  REST call. Broader reach (core endpoints, another namespace) is the future
+ *  declared-capability seam; today the namespace IS the boundary. */
+export async function pluginRest<T>(pluginId: string, path: string, opts: PluginRestOptions = {}): Promise<T> {
+  if (!window.hermesDesktop?.api) {
+    throw new Error('Hermes desktop bridge unavailable')
+  }
+
+  const suffix = pluginPathSuffix('pluginRest', path)
+
+  return window.hermesDesktop.api<T>({
+    path: `/api/plugins/${pluginId}${suffix}`,
+    method: opts.method,
+    body: opts.body,
+    upload: opts.upload,
+    timeoutMs: opts.timeoutMs,
+    ...profileScoped()
+  })
+}
+
+/** The plugin WebSocket door — the live twin of `pluginRest`, scoped the same
+ *  way: `path` is relative to `/api/plugins/<pluginId>` ('/events' → the
+ *  plugin's own event stream). Token-mode backends auth via the same query
+ *  credential the app's own sockets use; OAuth remotes resolve null (callers
+ *  keep their polling fallback — every consumer must have one anyway, since a
+ *  socket can drop). Auto-reconnects with backoff until disposed. */
+export function pluginSocket(pluginId: string, path: string, onMessage: (data: unknown) => void): () => void {
+  const suffix = pluginPathSuffix('pluginSocket', path)
+
+  let socket: null | WebSocket = null
+  let disposed = false
+  let attempt = 0
+
+  const connect = async () => {
+    const connection = await window.hermesDesktop.getConnection().catch(() => null)
+
+    // No bridge / OAuth cookie auth (WS tickets are single-use, core-managed):
+    // stay on the polling fallback rather than half-working.
+    if (disposed || !connection || connection.authMode === 'oauth') {
+      return
+    }
+
+    const base = connection.baseUrl.replace(/^http/, 'ws')
+    const join = suffix.includes('?') ? '&' : '?'
+    socket = new WebSocket(
+      `${base}/api/plugins/${pluginId}${suffix}${join}token=${encodeURIComponent(connection.token)}`
+    )
+
+    socket.onmessage = event => {
+      attempt = 0
+
+      try {
+        onMessage(JSON.parse(String(event.data)))
+      } catch {
+        // Non-JSON frame — plugin streams are JSON by contract; skip it.
+      }
+    }
+
+    socket.onclose = () => {
+      socket = null
+
+      if (!disposed) {
+        attempt += 1
+        window.setTimeout(() => void connect(), Math.min(30_000, 1_000 * 2 ** attempt))
+      }
+    }
+  }
+
+  void connect()
+
+  return () => {
+    disposed = true
+    socket?.close()
+  }
 }
 
 export async function listSessions(
@@ -343,6 +445,7 @@ export function getLogs(params: {
   file?: string
   level?: string
   lines?: number
+  search?: string
 }): Promise<LogsResponse> {
   const query = new URLSearchParams()
 
@@ -360,6 +463,10 @@ export function getLogs(params: {
 
   if (params.component && params.component !== 'all') {
     query.set('component', params.component)
+  }
+
+  if (params.search) {
+    query.set('search', params.search)
   }
 
   const suffix = query.toString()
@@ -409,15 +516,16 @@ export function saveHermesConfig(config: HermesConfigRecord): Promise<{ ok: bool
   })
 }
 
+// surface=declared serves the curated desktop schema; the dashboard consumes the raw plugin schema.
 export function getMemoryProviderConfig(provider: string): Promise<MemoryProviderConfig> {
   return window.hermesDesktop.api<MemoryProviderConfig>({
-    path: `/api/memory/providers/${encodeURIComponent(provider)}/config`
+    path: `/api/memory/providers/${encodeURIComponent(provider)}/config?surface=declared`
   })
 }
 
 export function saveMemoryProviderConfig(provider: string, values: Record<string, string>): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    path: `/api/memory/providers/${encodeURIComponent(provider)}/config`,
+    path: `/api/memory/providers/${encodeURIComponent(provider)}/config?surface=declared`,
     method: 'PUT',
     body: { values }
   })
@@ -589,6 +697,64 @@ export function toggleSkill(name: string, enabled: boolean): Promise<{ ok: boole
     path: '/api/skills/toggle',
     method: 'PUT',
     body: { name, enabled }
+  })
+}
+
+export interface McpTestResult {
+  ok: boolean
+  error?: string
+  tools: { name: string; description: string }[]
+  /** Capability counts (absent on older backends / failed probes). */
+  prompts?: number
+  resources?: number
+}
+
+export interface McpOAuthFlow {
+  flow_id: string
+  server_name: string
+  status: 'starting' | 'authorization_required' | 'approved' | 'error'
+  authorization_url: string | null
+  error: string | null
+  tools?: { name: string; description: string }[]
+}
+
+/** Connect to the server, list its tools, disconnect. Slow (spawns/handshakes
+ *  for real) — well past the 15s default fetch timeout. */
+export function testMcpServer(name: string): Promise<McpTestResult> {
+  return window.hermesDesktop.api<McpTestResult>({
+    ...profileScoped(),
+    path: `/api/mcp/servers/${encodeURIComponent(name)}/test`,
+    method: 'POST',
+    timeoutMs: 60_000
+  })
+}
+
+/** Replace the whole `mcp_servers` map (the mcp.json editor's save). Unlike
+ *  `saveHermesConfig`, this REPLACES rather than deep-merges, so deletes,
+ *  re-enables (dropping `enabled: false`), and removed nested fields persist. */
+export function saveMcpServers(servers: Record<string, Record<string, unknown>>): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(),
+    path: '/api/mcp/servers',
+    method: 'PUT',
+    body: { servers }
+  })
+}
+
+/** Start an MCP OAuth flow and return the authorization URL. */
+export function authMcpServer(name: string): Promise<McpOAuthFlow> {
+  return window.hermesDesktop.api<McpOAuthFlow>({
+    ...profileScoped(),
+    path: `/api/mcp/servers/${encodeURIComponent(name)}/auth`,
+    method: 'POST',
+    timeoutMs: 60_000
+  })
+}
+
+export function getMcpOAuthFlow(flowId: string): Promise<McpOAuthFlow> {
+  return window.hermesDesktop.api<McpOAuthFlow>({
+    ...profileScoped(),
+    path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`
   })
 }
 
@@ -822,10 +988,28 @@ export function getUsageAnalytics(days = 30): Promise<AnalyticsResponse> {
   })
 }
 
-export function getGlobalModelOptions(opts?: { refresh?: boolean }): Promise<ModelOptionsResponse> {
+export function getGlobalModelOptions(opts?: {
+  refresh?: boolean
+  includeUnconfigured?: boolean
+  explicitOnly?: boolean
+}): Promise<ModelOptionsResponse> {
+  const params = new URLSearchParams()
+
+  if (opts?.refresh) {
+    params.set('refresh', '1')
+  }
+
+  if (opts?.includeUnconfigured) {
+    params.set('include_unconfigured', '1')
+  }
+
+  if (opts?.explicitOnly !== false) {
+    params.set('explicit_only', '1')
+  }
+
   return window.hermesDesktop.api<ModelOptionsResponse>({
     ...profileScoped(),
-    path: opts?.refresh ? '/api/model/options?refresh=1' : '/api/model/options',
+    path: params.size > 0 ? `/api/model/options?${params.toString()}` : '/api/model/options',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
 }
@@ -981,6 +1165,7 @@ export function searchSkillsHub(query: string, source = 'all', limit = 20): Prom
 
 export function previewSkillHub(identifier: string): Promise<SkillHubPreview> {
   return window.hermesDesktop.api<SkillHubPreview>({
+    ...profileScoped(),
     path: `/api/skills/hub/preview?identifier=${encodeURIComponent(identifier)}`,
     timeoutMs: HUB_REQUEST_TIMEOUT_MS
   })
@@ -988,6 +1173,7 @@ export function previewSkillHub(identifier: string): Promise<SkillHubPreview> {
 
 export function scanSkillHub(identifier: string): Promise<SkillHubScanResult> {
   return window.hermesDesktop.api<SkillHubScanResult>({
+    ...profileScoped(),
     path: `/api/skills/hub/scan?identifier=${encodeURIComponent(identifier)}`,
     timeoutMs: HUB_REQUEST_TIMEOUT_MS
   })
@@ -1033,16 +1219,6 @@ export function listMcpServers(): Promise<{ servers: McpServerSummary[] }> {
   })
 }
 
-export function testMcpServer(name: string): Promise<McpServerTestResponse> {
-  return window.hermesDesktop.api<McpServerTestResponse>({
-    ...profileScoped(),
-    path: `/api/mcp/servers/${encodeURIComponent(name)}/test`,
-    method: 'POST',
-    // Connect + list tools can be slow for stdio servers that boot a process.
-    timeoutMs: 60_000
-  })
-}
-
 export function setMcpServerEnabled(name: string, enabled: boolean): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
     ...profileScoped(),
@@ -1062,8 +1238,8 @@ export function getMcpCatalog(): Promise<McpCatalogResponse> {
 export function installMcpCatalogEntry(
   name: string,
   env: Record<string, string> = {}
-): Promise<{ ok: boolean; name?: string; pid?: number; action?: string }> {
-  return window.hermesDesktop.api<{ ok: boolean; name?: string; pid?: number; action?: string }>({
+): Promise<{ ok: boolean; name?: string; pid?: number; action?: string; background?: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean; name?: string; pid?: number; action?: string; background?: boolean }>({
     ...profileScoped(),
     path: '/api/mcp/catalog/install',
     method: 'POST',

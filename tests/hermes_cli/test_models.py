@@ -1,5 +1,6 @@
 """Tests for the hermes_cli models module."""
 
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch, MagicMock
 
 from hermes_cli.nous_account import NousPortalAccountInfo
@@ -17,6 +18,48 @@ LIVE_OPENROUTER_MODELS = [
     ("qwen/qwen3.7-max", ""),
     ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
 ]
+
+# A model id that no real catalog will ever label as the silent default, so
+# pinning it keeps the "default" badge branch out of tests that aren't about it.
+_NEVER_THE_SILENT_DEFAULT = "sentinel/not-a-real-model"
+
+# Description stamped on the pinned curated entries. ``fetch_openrouter_models``
+# recomputes every description on the live path, so this string can only ever
+# reach a caller through the "live refresh produced nothing, return the curated
+# fallback" branch. That makes it a vacuity marker: a test that wants to prove
+# it exercised the live path asserts this string is absent from the result.
+CURATED_FALLBACK_MARKER = "curated-fallback"
+
+
+@contextmanager
+def _pinned_curated_openrouter(ids, *, silent_default=_NEVER_THE_SILENT_DEFAULT):
+    """Make ``fetch_openrouter_models`` depend only on its stubbed live payload.
+
+    ``fetch_openrouter_models`` intersects the live OpenRouter ``/v1/models``
+    response against a *curated* preference list, and that list is fetched over
+    the network from the hosted ``model-catalog.json`` manifest. Stubbing only
+    ``_urlopen_model_catalog_request`` therefore leaves the test asserting on
+    whichever models the manifest happens to publish today: when
+    ``qwen/qwen3.7-max`` was dropped upstream, two tests here went red on
+    ``main`` and stayed red, with no change on our side. The badge the first
+    entry receives leaks the same way, via the catalog's ``"default": true``
+    label read out of ``~/.hermes/cache``.
+
+    Pinning both inputs makes these tests exercise OUR filtering, ordering and
+    badge logic against a fixed catalog. Regressions in that logic still fail
+    the tests; upstream catalog churn no longer does.
+    """
+    curated = [(mid, CURATED_FALLBACK_MARKER) for mid in ids]
+    with ExitStack() as stack:
+        stack.enter_context(patch(
+            "hermes_cli.model_catalog.get_curated_openrouter_models",
+            return_value=curated,
+        ))
+        stack.enter_context(patch(
+            "hermes_cli.models.get_preferred_silent_default_model",
+            return_value=silent_default,
+        ))
+        yield
 
 
 
@@ -70,7 +113,9 @@ class TestFetchOpenRouterModels:
                 return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"}}]}'
 
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()):
+        with _pinned_curated_openrouter(
+            ["anthropic/claude-opus-4.8", "qwen/qwen3.7-max", "nvidia/nemotron-3-super-120b-a12b:free"]
+        ), patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
             models = fetch_openrouter_models(force_refresh=True)
 
         assert models == [
@@ -79,9 +124,48 @@ class TestFetchOpenRouterModels:
             ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
         ]
 
+    def test_silent_default_keeps_its_badge_through_the_live_refresh(self, monkeypatch):
+        """The catalog-labeled silent default is badged "default", not "recommended".
+
+        Guards the branch that ``_pinned_curated_openrouter`` pins away in the
+        tests above: entry [0] normally gets the "recommended" badge, but when
+        it is the silent default the "default" badge must win so the picker
+        shows which model Hermes lands on when the user never picks one.
+        """
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"data":['
+                    b'{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},'
+                    b'{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}}'
+                    b']}'
+                )
+
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        with _pinned_curated_openrouter(
+            ["anthropic/claude-opus-4.8", "qwen/qwen3.7-max"],
+            silent_default="anthropic/claude-opus-4.8",
+        ), patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        assert models == [
+            ("anthropic/claude-opus-4.8", "default"),
+            ("qwen/qwen3.7-max", ""),
+        ]
+
+
     def test_falls_back_to_static_snapshot_on_fetch_failure(self, monkeypatch):
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with patch("hermes_cli.models.urllib.request.urlopen", side_effect=OSError("boom")):
+        # Pin the remote manifest out too — otherwise the fallback silently
+        # depends on whatever the deployed catalog currently contains.
+        with patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=None), \
+             patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=OSError("boom")):
             models = fetch_openrouter_models(force_refresh=True)
 
         assert models == OPENROUTER_MODELS
@@ -126,7 +210,10 @@ class TestFetchOpenRouterModels:
             ],
         )
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()):
+        with (
+            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=[]),
+            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()),
+        ):
             models = fetch_openrouter_models(force_refresh=True)
 
         ids = [mid for mid, _ in models]
@@ -160,12 +247,21 @@ class TestFetchOpenRouterModels:
                 )
 
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with patch("hermes_cli.models.urllib.request.urlopen", return_value=_Resp()):
+        with _pinned_curated_openrouter(
+            ["anthropic/claude-opus-4.8", "qwen/qwen3.7-max"]
+        ), patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
             models = fetch_openrouter_models(force_refresh=True)
 
+        # Both models survive the tool-support filter...
         ids = [mid for mid, _ in models]
         assert "anthropic/claude-opus-4.8" in ids
         assert "qwen/qwen3.7-max" in ids
+        # ...and did so on the LIVE path. Without this, a regression that made
+        # the filter restrictive would drop every model, leave `curated` empty,
+        # and return the curated fallback — which contains both ids, so the
+        # assertions above would still pass while the behaviour under test was
+        # gone. The marker only ever survives on the fallback path.
+        assert CURATED_FALLBACK_MARKER not in [desc for _, desc in models]
 
 
 class TestOpenRouterToolSupportHelper:
@@ -779,7 +875,7 @@ class TestNousRecommendedModels:
     def test_fetch_caches_per_portal_url(self):
         from hermes_cli.models import fetch_nous_recommended_models
         mock_cm = self._mock_urlopen(self._SAMPLE_PAYLOAD)
-        with patch("urllib.request.urlopen", return_value=mock_cm) as mock_urlopen:
+        with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=mock_cm) as mock_urlopen:
             a = fetch_nous_recommended_models("https://portal.example.com")
             b = fetch_nous_recommended_models("https://portal.example.com")
         assert a == self._SAMPLE_PAYLOAD
@@ -789,21 +885,21 @@ class TestNousRecommendedModels:
     def test_fetch_cache_is_keyed_per_portal(self):
         from hermes_cli.models import fetch_nous_recommended_models
         mock_cm = self._mock_urlopen(self._SAMPLE_PAYLOAD)
-        with patch("urllib.request.urlopen", return_value=mock_cm) as mock_urlopen:
+        with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=mock_cm) as mock_urlopen:
             fetch_nous_recommended_models("https://portal.example.com")
             fetch_nous_recommended_models("https://portal.staging-nousresearch.com")
         assert mock_urlopen.call_count == 2  # different portals → separate fetches
 
     def test_fetch_returns_empty_on_network_failure(self):
         from hermes_cli.models import fetch_nous_recommended_models
-        with patch("urllib.request.urlopen", side_effect=OSError("boom")):
+        with patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=OSError("boom")):
             result = fetch_nous_recommended_models("https://portal.example.com")
         assert result == {}
 
     def test_fetch_force_refresh_bypasses_cache(self):
         from hermes_cli.models import fetch_nous_recommended_models
         mock_cm = self._mock_urlopen(self._SAMPLE_PAYLOAD)
-        with patch("urllib.request.urlopen", return_value=mock_cm) as mock_urlopen:
+        with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=mock_cm) as mock_urlopen:
             fetch_nous_recommended_models("https://portal.example.com")
             fetch_nous_recommended_models("https://portal.example.com", force_refresh=True)
         assert mock_urlopen.call_count == 2

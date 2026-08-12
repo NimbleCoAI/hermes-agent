@@ -122,7 +122,7 @@ def register_env_passthrough(var_names: Iterable[str]) -> None:
 
 
 def _load_config_passthrough() -> frozenset[str]:
-    """Load ``tools.env_passthrough`` from config.yaml (cached)."""
+    """Load ``terminal.env_passthrough`` from config.yaml (cached)."""
     global _config_passthrough
     if _config_passthrough is not None:
         return _config_passthrough
@@ -155,7 +155,7 @@ def _load_config_passthrough() -> frozenset[str]:
                     continue
                 result.add(name)
     except Exception as e:
-        logger.debug("Could not read tools.env_passthrough from config: %s", e)
+        logger.debug("Could not read terminal.env_passthrough from config: %s", e)
 
     _config_passthrough = frozenset(result)
     return _config_passthrough
@@ -165,7 +165,7 @@ def is_env_passthrough(var_name: str) -> bool:
     """Check whether *var_name* is allowed to pass through to sandboxes.
 
     Returns ``True`` if the variable was registered by a skill or listed in
-    the user's ``tools.env_passthrough`` config.
+    the user's ``terminal.env_passthrough`` config.
     """
     if var_name in _get_allowed():
         return True

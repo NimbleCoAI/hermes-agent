@@ -1,6 +1,6 @@
 """Swarm Map Policy Plugin — HSM-backed group access control.
 
-Integrates with Hermes Swarm Map (HSM) to enforce:
+Integrates with Swarm Map (formerly HSM) to enforce:
 - Group allowlists: only groups registered in HSM can interact
 - Admin checks: platform admin status from HSM settings
 - Session context caching: platform/chat_id/user_id/is_admin from gateway events
@@ -80,6 +80,57 @@ def is_group_allowed(group_id: str, platform: str) -> bool:
         return resp.status_code == 200 and resp.json().get("allowed", False)
     except Exception as e:
         logger.warning("swarm-map-policy: HSM check failed (fail-closed): %s", e)
+        return False
+
+
+def approve_group_add(
+    group_id: str, added_by_user_id: str, platform: str = "telegram"
+) -> bool:
+    """Request HSM auto-approval for a group the bot was just added to.
+
+    Called when someone adds the bot to a new group. HSM verifies that the
+    adder is a platform admin and, if so, adds the group to the allowlist.
+    Fail-closed: returns True only on HTTP 200 with ``approved: true`` —
+    network errors, non-200 responses, and missing fields all deny.
+    """
+    url = _hsm_url()
+    harness = _harness_id()
+    if not url or not harness:
+        logger.warning("swarm-map-policy: HSM not configured, denying group add")
+        return False
+    try:
+        resp = requests.post(
+            f"{url}/api/harnesses/{harness}/surfaces/{platform}/groups/{group_id}",
+            json={"addedByUserId": added_by_user_id},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            reason = ""
+            try:
+                reason = resp.json().get("error", "")
+            except Exception:
+                pass
+            logger.info(
+                "swarm-map-policy: group add denied for %s (HTTP %s%s)",
+                group_id, resp.status_code, f": {reason}" if reason else "",
+            )
+            return False
+        data = resp.json()
+        if data.get("approved") is True:
+            logger.info(
+                "swarm-map-policy: group add approved for %s (already_allowed=%s restarted=%s)",
+                group_id, data.get("already_allowed", False), data.get("restarted"),
+            )
+            return True
+        logger.info(
+            "swarm-map-policy: group add not approved for %s: %s",
+            group_id, data.get("reason", "no reason given"),
+        )
+        return False
+    except Exception as e:
+        logger.warning(
+            "swarm-map-policy: group add approval failed (fail-closed): %s", e
+        )
         return False
 
 

@@ -214,6 +214,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
     "HERMES_TENANT",
+    # Honcho host selection changes which nested config block wins. A local
+    # shell override leaked "myhost" into the full suite and flipped 20
+    # otherwise-unrelated config tests away from the default "hermes" host.
+    "HERMES_HONCHO_HOST",
     # Dashboard OAuth auth gate (PR #30156). When set, the bundled
     # dashboard-auth `nous` plugin auto-registers itself on plugin discovery,
     # which is triggered by any `/api/status` call. That leaks a provider
@@ -342,6 +346,13 @@ def _hermetic_environment(tmp_path, monkeypatch):
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
 
+    # Honcho's fallback host/config resolution legitimately reads the user's
+    # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
+    # on it), but pin the host so ordinary tests cannot inherit a developer's
+    # defaultHost and silently select the wrong nested config block. Tests of
+    # custom host resolution override/delete this explicitly.
+    monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes")
+
     # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
     #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
     #
@@ -379,6 +390,12 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # should never perform that implicit network/bootstrap path; Tirith-specific
     # tests opt back in by patching the security config directly.
     monkeypatch.setenv("TIRITH_ENABLED", "false")
+    # R6 inbound throttle: default-on in production, default-off in the
+    # hermetic suite — hundreds of existing tests drive handle_message far
+    # faster than any human and would trip the per-user window. Throttle
+    # tests opt back in with monkeypatch.setenv("GATEWAY_THROTTLE_ENABLED",
+    # "true") and a fresh InboundThrottle/reset singleton.
+    monkeypatch.setenv("GATEWAY_THROTTLE_ENABLED", "false")
 
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
@@ -616,6 +633,13 @@ def _live_system_guard(request, monkeypatch):
     real_kill = _os.kill
 
     def _guarded_kill(pid, sig, *args, **kwargs):
+        # Signal 0 is a pure liveness probe — it cannot terminate anything.
+        # psutil.pid_exists() uses os.kill(pid, 0) on POSIX, and probing a
+        # just-killed grandchild that was reparented to init (zombie with a
+        # foreign parent chain) must not trip the guard. Flaked in CI on
+        # test_entire_tree_is_sigkilled_not_just_parent.
+        if int(sig) == 0:
+            return real_kill(pid, sig, *args, **kwargs)
         if _is_own_subtree(int(pid)):
             return real_kill(pid, sig, *args, **kwargs)
         raise RuntimeError(
@@ -641,6 +665,9 @@ def _live_system_guard(request, monkeypatch):
         own_pgid = _os.getpgrp()
 
         def _guarded_killpg(pgid, sig, *args, **kwargs):
+            # Signal 0 is a pure liveness probe — never destructive.
+            if int(sig) == 0:
+                return real_killpg(pgid, sig, *args, **kwargs)
             if int(pgid) == own_pgid or _is_own_subtree(int(pgid)):
                 return real_killpg(pgid, sig, *args, **kwargs)
             raise RuntimeError(
