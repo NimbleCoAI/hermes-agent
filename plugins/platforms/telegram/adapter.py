@@ -219,6 +219,15 @@ try:
         ContextTypes,
         filters,
     )
+    # Optional: only powers the bot-membership (group auto-approval) gate.
+    # Older/patched python-telegram-bot builds — and test doubles that stub
+    # telegram.ext — may not expose it. Import it on its own so a missing
+    # symbol disables that one feature instead of collapsing into the
+    # TELEGRAM_AVAILABLE=False fallback and disabling the whole adapter.
+    try:
+        from telegram.ext import ChatMemberHandler
+    except ImportError:
+        ChatMemberHandler = None
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
     TELEGRAM_AVAILABLE = True
@@ -233,6 +242,9 @@ except ImportError:
     Application = Any
     CommandHandler = Any
     CallbackQueryHandler = Any
+    # None (not Any) so the single "is it available?" test at the registration
+    # site works the same whether the SDK is absent or merely lacks the symbol.
+    ChatMemberHandler = None
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -373,7 +385,8 @@ def check_telegram_requirements() -> bool:
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
-    global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
+    global CommandHandler, CallbackQueryHandler, ChatMemberHandler
+    global TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
         return True
@@ -395,6 +408,11 @@ def check_telegram_requirements() -> bool:
             MessageHandler as _MH,
             ContextTypes as _CT, filters as _filters,
         )
+        # Optional — see the module-level import block.
+        try:
+            from telegram.ext import ChatMemberHandler as _CMH
+        except ImportError:
+            _CMH = None
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
         from telegram.request import HTTPXRequest as _HR
     except ImportError:
@@ -408,6 +426,7 @@ def check_telegram_requirements() -> bool:
     Application = _App
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
+    ChatMemberHandler = _CMH
     TelegramMessageHandler = _MH
     ContextTypes = _CT
     filters = _filters
@@ -3589,6 +3608,9 @@ class TelegramAdapter(BasePlatformAdapter):
             ))
             # Handle inline keyboard button callbacks (update prompts)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            # Bot's own membership changes (added to / removed from chats) —
+            # drives the HSM group auto-approval gate (TELEGRAM_GROUP_AUTOAPPROVE).
+            self._register_my_chat_member_handler()
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -8126,6 +8148,152 @@ class TelegramAdapter(BasePlatformAdapter):
         consuming channel posts without ever building a gateway event.
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
+
+    def _telegram_group_autoapprove_enabled(self) -> bool:
+        """Return whether bot-added-to-group events are gated through HSM."""
+        return os.getenv("TELEGRAM_GROUP_AUTOAPPROVE", "false").lower() in {"true", "1", "yes", "on"}
+
+    def _register_my_chat_member_handler(self) -> bool:
+        """Register the bot's own-membership handler; return whether it was.
+
+        ``telegram.ext.ChatMemberHandler`` is treated as OPTIONAL. It only
+        powers the group auto-approval gate, so a build of
+        python-telegram-bot that doesn't export it must cost us that one
+        feature — not the entire Telegram adapter. (Importing it as part of
+        the mandatory ``from telegram.ext import (...)`` tuple would send an
+        older SDK down the ``TELEGRAM_AVAILABLE = False`` path, silently
+        nulling ParseMode/ChatType and disabling Telegram altogether.)
+        """
+        if ChatMemberHandler is None:
+            if self._telegram_group_autoapprove_enabled():
+                logger.warning(
+                    "[%s] TELEGRAM_GROUP_AUTOAPPROVE is enabled but this "
+                    "python-telegram-bot build does not provide "
+                    "telegram.ext.ChatMemberHandler — bot-added-to-group events "
+                    "will NOT be gated through HSM. Upgrade python-telegram-bot "
+                    "to restore the gate.",
+                    self.name,
+                )
+            else:
+                logger.debug(
+                    "[%s] telegram.ext.ChatMemberHandler unavailable — skipping "
+                    "bot-membership handler (group auto-approval is off anyway)",
+                    self.name,
+                )
+            return False
+        app = self._app
+        if app is None:
+            return False
+        app.add_handler(ChatMemberHandler(
+            self._handle_my_chat_member,
+            ChatMemberHandler.MY_CHAT_MEMBER,
+        ))
+        return True
+
+    async def _handle_my_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle changes to the bot's OWN chat membership (my_chat_member).
+
+        When the bot is newly added to a group/supergroup and
+        ``TELEGRAM_GROUP_AUTOAPPROVE`` is enabled, ask HSM to auto-approve the
+        group: HSM checks whether the adder is a platform admin and, if so,
+        adds the group to the allowlist. On approval the bot greets the group;
+        otherwise it politely declines and leaves (fail-closed — any error on
+        the enforcement path counts as not approved).
+
+        With the flag unset (default) the event is only logged, preserving
+        prior behavior for fleets that deploy this adapter before the HSM
+        endpoint is live.
+        """
+        change = getattr(update, "my_chat_member", None)
+        if change is None:
+            return
+
+        chat = getattr(change, "chat", None)
+        chat_type = str(getattr(chat, "type", "") or "").lower()
+        if chat_type not in ("group", "supergroup"):
+            return
+
+        old_status = str(
+            getattr(getattr(change, "old_chat_member", None), "status", "") or ""
+        ).lower()
+        new_status = str(
+            getattr(getattr(change, "new_chat_member", None), "status", "") or ""
+        ).lower()
+
+        # Only act on transitions INTO the chat. Promotions/demotions
+        # (member <-> administrator) re-fire my_chat_member and must not
+        # re-trigger approval; the bot leaving/being kicked is ignored too.
+        if new_status not in ("member", "administrator"):
+            return
+        if old_status not in ("", "left", "kicked"):
+            return
+
+        chat_id = getattr(chat, "id", None)
+        if chat_id is None:
+            return
+        group_id = str(chat_id)
+        adder = str(getattr(getattr(change, "from_user", None), "id", "") or "")
+
+        if not self._telegram_group_autoapprove_enabled():
+            logger.info(
+                "[%s] Bot added to Telegram group %s by user %s — "
+                "auto-approval disabled (TELEGRAM_GROUP_AUTOAPPROVE unset), no action",
+                self.name, group_id, adder or "unknown",
+            )
+            return
+
+        approved = False
+        try:
+            from plugins.swarm_map_policy import approve_group_add
+            approved = approve_group_add(group_id, adder, platform="telegram")
+        except Exception as e:
+            logger.warning(
+                "[%s] Group auto-approval check failed for %s (fail-closed): %s",
+                self.name, group_id, e,
+            )
+            approved = False
+
+        if approved:
+            logger.info(
+                "[%s] Telegram group %s approved via HSM (added by %s) — staying",
+                self.name, group_id, adder or "unknown",
+            )
+            try:
+                await self._bot.send_message(
+                    chat_id=chat_id,
+                    text="Hi! This group has been approved for me — I'm ready to help.",
+                )
+            except Exception as e:
+                logger.warning(
+                    "[%s] Failed to send group greeting to %s: %s",
+                    self.name, group_id, _redact_telegram_error_text(e),
+                )
+            return
+
+        logger.info(
+            "[%s] Telegram group %s not approved via HSM (added by %s) — leaving",
+            self.name, group_id, adder or "unknown",
+        )
+        try:
+            await self._bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Sorry — this group isn't approved for me yet. "
+                    "Ask my admin to approve it, then add me again."
+                ),
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] Failed to send decline notice to %s: %s",
+                self.name, group_id, _redact_telegram_error_text(e),
+            )
+        try:
+            await self._bot.leave_chat(chat_id=chat_id)
+        except Exception as e:
+            logger.warning(
+                "[%s] Failed to leave unapproved group %s: %s",
+                self.name, group_id, _redact_telegram_error_text(e),
+            )
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.

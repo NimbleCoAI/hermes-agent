@@ -65,6 +65,86 @@ class TestSwarmMapPolicy:
             assert is_platform_admin("user-123", "signal") is False
 
 
+class TestApproveGroupAdd:
+    """Tests for approve_group_add — HSM group auto-approval on bot add."""
+
+    def _call(self, mock_resp=None, side_effect=None, group_id="-100123", adder="777"):
+        from plugins.swarm_map_policy import approve_group_add
+        with patch("plugins.swarm_map_policy._hsm_url", return_value="http://hsm:3002"), \
+             patch("plugins.swarm_map_policy._harness_id", return_value="hermes-test"), \
+             patch("plugins.swarm_map_policy.requests") as mock_req:
+            if side_effect is not None:
+                mock_req.post.side_effect = side_effect
+            else:
+                mock_req.post.return_value = mock_resp
+            result = approve_group_add(group_id, adder)
+            return result, mock_req
+
+    @staticmethod
+    def _resp(status_code=200, body=None):
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.json.return_value = body if body is not None else {}
+        return resp
+
+    def test_approved(self):
+        """200 + approved:true returns True."""
+        result, _ = self._call(self._resp(200, {"approved": True, "restarted": True}))
+        assert result is True
+
+    def test_approved_already_allowed(self):
+        """200 + approved:true + already_allowed (wildcard/listed) returns True."""
+        result, _ = self._call(self._resp(200, {"approved": True, "already_allowed": True}))
+        assert result is True
+
+    def test_approved_restart_failed_still_true(self):
+        """approved:true with restarted:false (env written, recreate failed) is still approved."""
+        result, _ = self._call(self._resp(200, {"approved": True, "restarted": False}))
+        assert result is True
+
+    def test_not_approved(self):
+        """200 + approved:false returns False."""
+        result, _ = self._call(
+            self._resp(200, {"approved": False, "reason": "adder is not an admin"})
+        )
+        assert result is False
+
+    def test_bad_request_denied(self):
+        """400 with error body is treated as not approved."""
+        result, _ = self._call(self._resp(400, {"error": "missing addedByUserId"}))
+        assert result is False
+
+    def test_network_error_fail_closed(self):
+        """Network failure denies (fail-closed)."""
+        result, _ = self._call(side_effect=Exception("Connection refused"))
+        assert result is False
+
+    def test_missing_approved_field_denied(self):
+        """200 with no approved field denies (fail-closed)."""
+        result, _ = self._call(self._resp(200, {}))
+        assert result is False
+
+    def test_non_bool_approved_denied(self):
+        """approved must be strictly true — truthy strings deny."""
+        result, _ = self._call(self._resp(200, {"approved": "yes"}))
+        assert result is False
+
+    def test_no_config_fail_closed(self):
+        """Missing HSM_URL denies without any request."""
+        from plugins.swarm_map_policy import approve_group_add
+        with patch("plugins.swarm_map_policy._hsm_url", return_value=None):
+            assert approve_group_add("-100123", "777") is False
+
+    def test_posts_correct_url_and_body(self):
+        """Request hits the HSM group endpoint with addedByUserId body."""
+        _, mock_req = self._call(self._resp(200, {"approved": True}))
+        mock_req.post.assert_called_once_with(
+            "http://hsm:3002/api/harnesses/hermes-test/surfaces/telegram/groups/-100123",
+            json={"addedByUserId": "777"},
+            timeout=5,
+        )
+
+
 class TestSessionContextCaching:
     """Tests for session context caching via pre_gateway_dispatch."""
 

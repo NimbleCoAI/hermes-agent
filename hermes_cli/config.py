@@ -743,7 +743,7 @@ def get_container_exec_info() -> Optional[dict]:
 # =============================================================================
 
 # Re-export from hermes_constants — canonical definition lives there.
-from hermes_constants import get_hermes_home  # noqa: F811,E402
+from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402
 from utils import atomic_replace, fast_safe_load
 
 def get_config_path() -> Path:
@@ -913,14 +913,32 @@ def _ensure_default_soul_md(home: Path) -> None:
     _secure_file(soul_path)
 
 
+# Home paths whose directory skeleton has been created this process — see
+# ensure_hermes_home(). Only successful passes are recorded, so a raised
+# managed-mode/missing-profile error keeps re-checking on later loads.
+_HERMES_HOME_ENSURED: set = set()
+
+
 def ensure_hermes_home():
     """Ensure ~/.hermes directory structure exists with secure permissions.
 
     In managed mode (NixOS), dirs are created by the activation script with
     setgid + group-writable (2770). We skip mkdir and set umask(0o007) so
     any files created (e.g. SOUL.md) are group-writable (0660).
+
+    Memoized per home path: this runs on EVERY ``load_config()`` (inside the
+    config lock), and the ~14 mkdir/chmod syscalls per call made repeated
+    config loads the dominant cost of hot read paths like ``model.options``.
+    After the first successful pass for a given ``HERMES_HOME`` we only re-run
+    the full walk if the home directory itself has vanished (a deleted home is
+    recreated on the next load, as before). Profile switches change
+    ``get_hermes_home()`` and therefore re-run for the new path.
     """
     home = get_hermes_home()
+    key = str(home)
+
+    if key in _HERMES_HOME_ENSURED and home.is_dir():
+        return
     # Named profiles must be created explicitly (e.g. ``hermes profile create``).
     # If a stale process keeps running after the profile was renamed/deleted,
     # silently mkdir-ing the old HERMES_HOME would resurrect an empty skeleton
@@ -947,6 +965,8 @@ def ensure_hermes_home():
             d.mkdir(parents=True, exist_ok=True)
             _secure_dir(d)
         _ensure_default_soul_md(home)
+
+    _HERMES_HOME_ENSURED.add(key)
 
 
 def _ensure_hermes_home_managed(home: Path):
@@ -2263,6 +2283,26 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Per-context memory scoping (gateway only). When True, memory in a
+        # messaging chat is partitioned to contexts/{platform:chat_type:chat_id}/
+        # so a fact learned in one DM or group is not readable in another.
+        # Default False = today's behavior (single shared memory). No effect on
+        # the interactive CLI, which is always unscoped.
+        # mt DIVERGES FROM UPSTREAM (which defaults this False): scoping is
+        # already unconditional on this fork, so defaulting to False would
+        # silently collapse every agent back to one shared memory. Keep it on.
+        "context_scoping_enabled": True,
+        # When scoping is on, whether a scoped context ALSO reads the shared
+        # global MEMORY.md/USER.md as a read-only layer. Default False keeps
+        # scoped contexts fully isolated; True lets them see (but never edit)
+        # global facts.
+        #
+        # mt DIVERGES FROM UPSTREAM (False) and sets this True: mt's global
+        # layer is what holds the agent's name, personality and skills, and
+        # those must stay visible inside a group. That is only safe now that
+        # DMs are scoped too — under the old code global also collected DM
+        # content, which is precisely what made the merged read a leak.
+        "include_global_in_scoped": True,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".

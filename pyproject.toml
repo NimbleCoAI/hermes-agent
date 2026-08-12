@@ -389,7 +389,36 @@ preview = true  # required for PLW1514 (unspecified-encoding) — preview rule
 # which silently corrupts any non-ASCII file content.  We had three
 # separate Windows sandbox regressions in one debug session before
 # adding the explicit encoding.  This rule keeps new code honest.
-select = ["PLW1514"]
+#
+# F811 (redefinition-of-unused-name) guards the merge failure mode: when a
+# conflict is resolved by "keep both sides", the second definition silently
+# shadows the first.  Nothing else catches this.  If the two copies are
+# identical it is dead code that no test can detect — every test still passes
+# because the surviving copy behaves the same.  If they have *drifted*, it is
+# worse: the first definition stops running entirely and its coverage
+# disappears without a single red test.  The 2026-08-12 upstream ancestry
+# merge produced both kinds — a duplicated function in
+# plugins/platforms/discord/adapter.py, a duplicated 183-line test class in
+# tests/hermes_cli/test_web_server.py, and four same-name-different-body test
+# definitions whose earlier copies had not executed in some time.
+#
+# This rule is deliberately NOT in per-file-ignores below: tests and plugins
+# are exactly where shadowed definitions hide, since a shadowed test is
+# invisible by construction.  A genuinely intentional redefinition (a lazy
+# import to break a cycle, a conditional re-export) should carry a targeted
+# `# noqa: F811` with a one-line reason rather than reopening the rule.
+select = ["PLW1514", "F811"]
+
+# F811 skips any name matching dummy-variable-rgx, and ruff's default for that
+# regex is "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$" — which matches *every*
+# underscore-prefixed name, not just throwaways.  With the default, F811 stays
+# silent on a duplicated `_truncate_discord_component_text`, i.e. exactly the
+# production duplicate this rule was turned on to catch; it would only have
+# flagged the duplicated test class.  Narrow the regex to bare underscores
+# (`_`, `__`), which is what "dummy" is actually meant to mean, so module-private
+# helpers are covered.  Only PLW1514 and F811 are selected, so this setting
+# changes nothing else today.
+dummy-variable-rgx = "^_+$"
 
 [tool.ruff.lint.per-file-ignores]
 # Tests can intentionally exercise locale-encoding edge cases.

@@ -65,6 +65,7 @@ def _clean_env(monkeypatch):
         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
         "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+        "NVIDIA_API_KEY", "NVIDIA_BASE_URL",
     ):
         monkeypatch.delenv(key, raising=False)
     # Module-level unhealthy cache (10-min TTL) leaks between tests;
@@ -98,7 +99,7 @@ def codex_auth_dir(tmp_path, monkeypatch):
     return codex_dir
 
 
-class TestAuxiliaryMaxTokensParam:
+class TestAuxiliaryMaxTokensParamCustomRuntime:
     def test_uses_max_completion_tokens_for_github_copilot_custom_base(self):
         with patch("agent.auxiliary_client._resolve_custom_runtime", return_value=("https://api.githubcopilot.com", "key", None)), \
              patch("agent.auxiliary_client._read_nous_auth", return_value=None):
@@ -5160,16 +5161,6 @@ class TestBuildCallKwargsToolDedup:
             provider="openai", model="gpt-4o", messages=[], tools=None,
         )
         assert "tools" not in kwargs
-
-
-@pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    """Strip provider env vars so each test starts clean."""
-    for key in (
-        "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
-        "NVIDIA_API_KEY", "NVIDIA_BASE_URL",
-    ):
-        monkeypatch.delenv(key, raising=False)
 
 
 class TestNvidiaBillingHeaders:
