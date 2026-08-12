@@ -1081,7 +1081,6 @@ class TestSafeStderr:
 
     def test_returns_stderr_on_utf8_system(self, monkeypatch):
         """On UTF-8 systems, _safe_stderr() returns sys.stderr unchanged."""
-        import io
         fake_stderr = io.StringIO()
         monkeypatch.setattr(sys, "stderr", fake_stderr)
         # On Linux/macOS, encoding is typically utf-8
@@ -1091,7 +1090,6 @@ class TestSafeStderr:
 
     def test_wraps_non_utf8_stderr(self, monkeypatch):
         """On non-UTF-8 systems (e.g. Windows cp949), wraps stderr with UTF-8."""
-        import io
 
         class FakeStderr:
             """Simulates a Windows stderr with legacy encoding."""
@@ -1114,7 +1112,6 @@ class TestSafeStderr:
 
     def test_handler_emits_unicode_without_crash(self, tmp_path):
         """StreamHandler with _safe_stderr can emit Unicode messages."""
-        import io
 
         # Create a stderr-like stream with ASCII encoding
         class AsciiStream:
