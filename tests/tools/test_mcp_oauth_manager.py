@@ -368,7 +368,6 @@ def test_manager_fails_fast_noninteractive_without_cached_tokens(tmp_path, monke
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 
 def _fake_response(status, url, body):

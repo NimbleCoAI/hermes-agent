@@ -127,6 +127,13 @@ from gateway.platforms.base import (
 )
 from tools.url_safety import is_safe_url
 
+# Sibling plugin module (same dual-context import pattern as voice_mixer:
+# bare when the plugin dir is on sys.path, package-relative under tests).
+try:
+    import moderation_sync as _moderation_sync
+except ImportError:  # package context (tests import plugins.platforms.discord.*)
+    from . import moderation_sync as _moderation_sync
+
 
 def _truncate_discord_component_text(text: str, limit: int) -> str:
     """Return text within Discord's UTF-16 component field budget."""
@@ -821,6 +828,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
+        # Was the corresponding env var SET, regardless of whether it parsed to
+        # anything usable? Distinguishes "no allowlist configured" (may widen to
+        # channel-scoped/allow-all) from "configured but matches nobody" (deny).
+        self._user_allowlist_configured: bool = False
+        self._role_allowlist_configured: bool = False
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
@@ -1008,21 +1020,82 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False
 
             # Parse allowed user entries (may contain usernames or IDs)
+            #
+            # ``_*_allowlist_configured`` records that the operator SET the var,
+            # independently of whether it parsed to anything usable. A var that was
+            # set but yielded zero entries is a misconfiguration, and it must not
+            # read downstream as "no allowlist configured" — that state grants
+            # channel-scoped access to every sender and honors the allow-all flags,
+            # so a typo would silently WIDEN access. See _is_allowed_user.
             allowed_env = os.getenv("DISCORD_ALLOWED_USERS", "")
+            # Sticky across reconnects: ``connect(is_reconnect=True)`` re-runs
+            # this parse, and ``_resolve_allowed_usernames`` may have rewritten
+            # the env var since the first pass. An allowlist that was configured
+            # at startup must never degrade to "not configured" mid-process —
+            # that flips ``_is_allowed_user`` into its widening branch.
+            self._user_allowlist_configured = bool(allowed_env.strip()) or getattr(
+                self, "_user_allowlist_configured", False
+            )
             if allowed_env:
                 self._allowed_user_ids = {
                     _clean_discord_id(uid) for uid in allowed_env.split(",")
                     if uid.strip()
                 }
+            if self._user_allowlist_configured and not self._allowed_user_ids:
+                logger.error(
+                    "[%s] DISCORD_ALLOWED_USERS is set but no usable entry could be "
+                    "parsed from %r — failing CLOSED for user-allowlist access. Fix "
+                    "the value; an empty result is treated as 'matches nobody', not "
+                    "as 'no restriction'.",
+                    self.name, allowed_env,
+                )
 
             # Parse DISCORD_ALLOWED_ROLES — comma-separated role IDs.
             # Users with ANY of these roles can interact with the bot.
             roles_env = os.getenv("DISCORD_ALLOWED_ROLES", "")
+            self._role_allowlist_configured = bool(roles_env.strip())
             if roles_env:
                 self._allowed_role_ids = {
                     int(rid.strip()) for rid in roles_env.split(",")
                     if rid.strip().isdigit()
                 }
+            if self._role_allowlist_configured and not self._allowed_role_ids:
+                # The likely cause is a role NAME where a numeric id is required
+                # ("moderators" instead of 1531…). HSM can write this var since
+                # hsm#186, and its own fixtures use a bare name, so an operator
+                # typing what the UI implies produces a role gate that matches
+                # nobody. Fail closed and say so loudly.
+                logger.error(
+                    "[%s] DISCORD_ALLOWED_ROLES=%r contains no numeric role IDs — "
+                    "role-based access will match NOBODY (failing closed). Discord "
+                    "role IDs are numeric snowflakes, not role names: enable "
+                    "Developer Mode and copy the role's ID.",
+                    self.name, roles_env,
+                )
+
+            # Channel-scoped access needs an explicit channel list to grant
+            # anything — "*" is a scope statement, not a grant, and is filtered
+            # out at both enforcement points (adapter + gateway). Flag on with
+            # nothing usable is a config that looks open but silently drops
+            # every stranger; say so once at startup.
+            if os.getenv("DISCORD_CHANNEL_SCOPED_ACCESS", "").strip().lower() in {
+                "true", "1", "yes",
+            }:
+                _csa_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "").strip()
+                _csa = {
+                    c.strip()
+                    for c in _csa_raw.split(",")
+                    if c.strip() and c.strip() != "*"
+                }
+                if not _csa:
+                    logger.warning(
+                        "[%s] DISCORD_CHANNEL_SCOPED_ACCESS is set but "
+                        "DISCORD_ALLOWED_CHANNELS=%r contains no explicit channel "
+                        "ids (\"*\" is not honored as a grant) — the flag will "
+                        "authorize nobody. List the approved channel ids "
+                        "explicitly.",
+                        self.name, _csa_raw,
+                    )
 
             # Set up intents.
             # Message Content is required for normal text replies.
@@ -1043,6 +1116,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 # online when Members Intent isn't enabled in the Developer Portal.
                 any(entry != "*" and not entry.isdigit() for entry in self._allowed_user_ids)
                 or bool(self._allowed_role_ids)  # Need members intent for role lookup
+                # R7: GUILD_MEMBER_REMOVE (kick/leave propagation) requires the
+                # privileged Server Members intent. Only "remove" mode requests
+                # it — the default "ban" mode works with default intents and
+                # carries zero boot risk. Same portal caveat as above: enable
+                # Server Members in the Developer Portal BEFORE setting
+                # DISCORD_MODERATION_SYNC=remove or the bot may not come online.
+                or _moderation_sync.moderation_sync_mode() == "remove"
             )
             intents.voice_states = True
 
@@ -1237,6 +1317,47 @@ class DiscordAdapter(BasePlatformAdapter):
                         else f"moved {before.channel.name} -> {after.channel.name}",
                         guild_id,
                     )
+
+            # R7: moderation → authorization propagation. A guild ban (and,
+            # in "remove" mode, any member removal) revokes the user's Hermes
+            # authorization everywhere: pairing grant, DISCORD_ALLOWED_USERS
+            # (in-memory + persisted .env), GATEWAY_ALLOWED_USERS, plus the
+            # adapter-owned deny store that survives HSM console re-writes.
+            _mod_sync_mode = _moderation_sync.moderation_sync_mode()
+            if _mod_sync_mode != "off":
+
+                async def _moderation_sync_revoke(uid: str, gid: str, reason: str) -> None:
+                    if uid in _moderation_sync.exempt_user_ids():
+                        logger.info(
+                            "[%s] Moderation sync: uid=%s is exempt — not revoking (%s)",
+                            adapter_self.name, uid, reason,
+                        )
+                        return
+                    sync_guilds = _moderation_sync.sync_guild_ids()
+                    if sync_guilds and gid not in sync_guilds:
+                        return
+                    # Blocking file IO (deny store, .env persistence) off-loop.
+                    await asyncio.to_thread(
+                        _moderation_sync.revoke_user_authorization,
+                        adapter_self, uid, reason, gid,
+                    )
+
+                @self._client.event
+                async def on_member_ban(guild, user):
+                    # Non-privileged moderation intent — part of Intents.default().
+                    await _moderation_sync_revoke(str(user.id), str(guild.id), "ban")
+
+                if _mod_sync_mode == "remove":
+
+                    @self._client.event
+                    async def on_raw_member_remove(payload):
+                        # Fires for kick AND voluntary leave (indistinguishable
+                        # without audit-log permissions), and also after a ban
+                        # (double-fire with on_member_ban — revocation is
+                        # idempotent). Requires the privileged members intent.
+                        await _moderation_sync_revoke(
+                            str(payload.user.id), str(payload.guild_id), "remove"
+                        )
 
             # Register slash commands
             if self._slash_commands:
@@ -3274,6 +3395,14 @@ class DiscordAdapter(BasePlatformAdapter):
             channel_ids: Resolved text-channel ids for guild traffic when an
                 upstream gate has already scoped the message to a channel.
         """
+        # R7: the moderation deny store beats EVERY allow branch below —
+        # pairing, user/role allowlists, ALLOW_ALL flags, and the channel
+        # bypass. This is the backstop against the HSM console's stale
+        # whole-document save re-writing DISCORD_ALLOWED_USERS and silently
+        # re-granting a banned user.
+        if _moderation_sync.deny_store().is_denied(user_id):
+            return False
+
         # ``getattr`` fallbacks here guard against test fixtures that build
         # an adapter via ``object.__new__(DiscordAdapter)`` and skip __init__
         # (see AGENTS.md pitfall #17 — same pattern as gateway.run).
@@ -3282,6 +3411,32 @@ class DiscordAdapter(BasePlatformAdapter):
         has_users = bool(allowed_users)
         has_roles = bool(allowed_roles)
 
+        # Whether an allowlist was CONFIGURED, as distinct from whether it parsed to
+        # anything. A var that was set but resolved to zero entries (e.g.
+        # DISCORD_ALLOWED_ROLES=moderators — a role name where a numeric snowflake
+        # is required) must count as configured: otherwise control reaches the
+        # "no allowlist at all" branch below, which grants channel-scoped access to
+        # every sender and honors DISCORD_ALLOW_ALL_USERS / GATEWAY_ALLOW_ALL_USERS.
+        # A misconfiguration would then WIDEN access instead of denying — the
+        # fail-open this guards. Configured-but-unresolvable means "matches
+        # nobody", so the checks below simply never match and we deny.
+        #
+        # The flag is purely ADDITIVE to the parsed truthiness: a populated set
+        # already proves an allowlist is in effect, so the flag only contributes
+        # the extra "set but unparseable" case. Deriving `configured` from the flag
+        # alone would go stale for any caller that assigns `_allowed_user_ids`
+        # directly after __init__ (several tests and the slash-auth fixture do
+        # exactly this) — the flag would still read False, the widening branch
+        # would be taken, and a legitimately allowlisted user would be denied.
+        # This form also keeps fixtures that skip __init__ entirely working
+        # (AGENTS.md pitfall #17).
+        users_configured = has_users or bool(
+            getattr(self, "_user_allowlist_configured", False)
+        )
+        roles_configured = has_roles or bool(
+            getattr(self, "_role_allowlist_configured", False)
+        )
+
         # Pairing is a first-class auth grant in the gateway auth union and in
         # Discord component buttons. Honor it here too so normal guild/DM text
         # messages do not get dropped at the adapter before the pairing-aware
@@ -3289,7 +3444,36 @@ class DiscordAdapter(BasePlatformAdapter):
         if self._is_pairing_approved_user(user_id):
             return True
 
-        if not has_users and not has_roles:
+        # Channel-scoped access (opt-in, DISCORD_CHANNEL_SCOPED_ACCESS): a UNION
+        # grant, mirroring the gateway's block in authz_mixin — anyone posting in
+        # an explicitly allowlisted channel (or a thread under one; channel_ids
+        # carries both the thread id and its parent) is admitted, regardless of
+        # whether a user/role allowlist is also configured. Without this, a
+        # non-empty DISCORD_ALLOWED_USERS turns the adapter into a strict
+        # per-user gate and the flag silently does nothing — the allowlist keeps
+        # working (DMs, buttons) but no longer excludes channel members.
+        #
+        # ``*`` is deliberately NOT honored here, matching the gateway: for
+        # channels it states where the bot may speak, not who may command it —
+        # which is why this does not reuse ``_discord_channel_ids_allowed``
+        # (that helper treats ``*`` as match-all). Guild traffic only: DMs and
+        # callers with no validated channel context (voice loops) get no grant.
+        if (
+            not is_dm
+            and channel_ids is not None
+            and os.getenv("DISCORD_CHANNEL_SCOPED_ACCESS", "").strip().lower()
+            in {"true", "1", "yes"}
+        ):
+            _scoped_raw = os.getenv("DISCORD_ALLOWED_CHANNELS", "").strip()
+            _scoped = {
+                c.strip()
+                for c in _scoped_raw.split(",")
+                if c.strip() and c.strip() != "*"
+            }
+            if _scoped and (channel_ids & _scoped):
+                return True
+
+        if not users_configured and not roles_configured:
             if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
                 return True
             if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:
@@ -3364,6 +3548,13 @@ class DiscordAdapter(BasePlatformAdapter):
         allowed_users = getattr(self, "_allowed_user_ids", set()) or set()
         allowed_roles = getattr(self, "_allowed_role_ids", set()) or set()
         if allowed_users or allowed_roles:
+            return
+        # Set-but-unparseable is a different failure with its own error at parse
+        # time ("contains no numeric role IDs"). Telling the operator to "set
+        # DISCORD_ALLOWED_ROLES" when they already did would send them in circles.
+        if getattr(self, "_user_allowlist_configured", False) or getattr(
+            self, "_role_allowlist_configured", False
+        ):
             return
         if os.getenv("DISCORD_ALLOWED_CHANNELS", "").strip():
             return
@@ -3988,9 +4179,18 @@ class DiscordAdapter(BasePlatformAdapter):
         if to_resolve:
             print(f"[{self.name}] Could not resolve usernames: {', '.join(to_resolve)}")
 
-        # Update internal set and env var so gateway auth checks use IDs
-        self._allowed_user_ids = numeric_ids
-        os.environ["DISCORD_ALLOWED_USERS"] = ",".join(sorted(numeric_ids))
+        # Update internal set and env var so gateway auth checks use IDs.
+        #
+        # Only when something usable remains: if NOTHING resolved (every entry
+        # was an unresolvable username), rewriting the env var to "" would make
+        # the next reconnect's parse read "no allowlist configured" — clearing
+        # ``_user_allowlist_configured`` and silently WIDENING access to the
+        # channel-scoped/allow-all branch of ``_is_allowed_user``. Keep the
+        # unresolvable entries instead: they match nobody (fail closed), and
+        # the operator sees the "Could not resolve" line above.
+        if numeric_ids:
+            self._allowed_user_ids = numeric_ids
+            os.environ["DISCORD_ALLOWED_USERS"] = ",".join(sorted(numeric_ids))
         if resolved_count:
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {resolved_count} resolved ID(s)")
 
@@ -4635,6 +4835,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # For forum threads, inherit the parent forum's topic.
         chat_topic = self._get_effective_topic(interaction.channel, is_thread=is_thread)
 
+        # Thread parent — stamped on the source so gateway authorization
+        # (channel-scoped access) can match a slash command in a thread against
+        # its parent channel, same as the on_message path.
+        parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
+
         source = self.build_source(
             chat_id=str(interaction.channel_id),
             chat_name=chat_name,
@@ -4643,11 +4848,11 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            parent_chat_id=parent_id or None,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
         channel_id = str(interaction.channel_id)
-        parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
         return MessageEvent(
             text=text,
             message_type=msg_type,
@@ -4729,6 +4934,9 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan = getattr(interaction, "channel", None)
         chat_topic = self._get_effective_topic(_chan, is_thread=True) if _chan else None
 
+        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
+        _parent_id = str(getattr(_parent_channel, "id", "") or "")
+
         source = self.build_source(
             chat_id=thread_id,
             chat_name=chat_name,
@@ -4737,10 +4945,10 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            # Gateway channel-scoped access matches a thread by its parent
+            # channel id, same as the on_message path.
+            parent_chat_id=_parent_id or None,
         )
-
-        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
-        _parent_id = str(getattr(_parent_channel, "id", "") or "")
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(thread_id, _parent_id or None)
         event = MessageEvent(
@@ -4778,6 +4986,24 @@ class DiscordAdapter(BasePlatformAdapter):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
+
+    def _discord_observe_unmentioned(self) -> bool:
+        """Return whether unmentioned channel messages are ingested as context.
+
+        When true, a message failing the mention gate is recorded into the
+        session transcript (observe_only) for situational awareness rather than
+        dropped — but the agent still does not respond, and no auto-thread is
+        created. Orthogonal to require_mention. Defaults False (opt-in) so
+        existing deployments are unchanged, matching Telegram; operators (e.g.
+        HSM harness settings) opt in per surface via DISCORD_OBSERVE_UNMENTIONED
+        / config extra.observe_unmentioned.
+        """
+        configured = self.config.extra.get("observe_unmentioned")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("DISCORD_OBSERVE_UNMENTIONED", "false").lower() in {"true", "1", "yes", "on"}
 
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
@@ -4868,18 +5094,48 @@ class DiscordAdapter(BasePlatformAdapter):
         content = getattr(message, "content", "") or ""
         return {match.group(1) for match in re.finditer(r"<@!?(\d+)>", content)}
 
+    def _self_managed_role_id(self, message: Any) -> Optional[str]:
+        """Return this bot's managed integration role id in the message's guild.
+
+        Discord's mention picker often resolves a bot's name to its managed
+        integration role (``<@&ROLE_ID>``) instead of the bot user. That role
+        is created by the integration, carries ``tags.bot_id`` equal to our
+        user id, and can only ever refer to this one bot — so mentioning it is
+        an unambiguous, explicit address of this bot. discord.py exposes it as
+        ``guild.self_role``. Returns None in DMs or when the role is absent.
+        """
+        guild = getattr(message, "guild", None)
+        if guild is None:
+            return None
+        self_role = getattr(guild, "self_role", None)
+        if self_role is None:
+            return None
+        return str(self_role.id)
+
     def _self_is_explicitly_mentioned(self, message: Any) -> bool:
         """Return True when this bot is explicitly @mentioned in the message.
 
-        Treats the bot as mentioned if it is either present in the resolved
-        ``message.mentions`` list OR referenced by its raw ``<@ID>`` / ``<@!ID>``
-        form in the message content.
+        Treats the bot as mentioned if it is present in the resolved
+        ``message.mentions`` list, referenced by its raw ``<@ID>`` / ``<@!ID>``
+        form in the message content, or addressed via its managed integration
+        role (``guild.self_role``) — either in ``message.role_mentions`` or as
+        a raw ``<@&ID>`` token. Mentions of other roles the bot merely holds
+        (e.g. a shared "bots" role) do NOT count: only the managed self-role
+        uniquely identifies this bot.
         """
         if not self._client or not self._client.user:
             return False
         if self._client.user in getattr(message, "mentions", []):
             return True
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+        if str(self._client.user.id) in self._raw_mentioned_user_ids(message):
+            return True
+        role_id = self._self_managed_role_id(message)
+        if role_id is None:
+            return False
+        for role in getattr(message, "role_mentions", None) or []:
+            if str(getattr(role, "id", "")) == role_id:
+                return True
+        return f"<@&{role_id}>" in (getattr(message, "content", "") or "")
 
     def _self_is_raw_mentioned(self, message: Any) -> bool:
         """Return True only when this bot has an inline mention token.
@@ -4888,10 +5144,17 @@ class DiscordAdapter(BasePlatformAdapter):
         without a literal ``<@bot>`` token in ``message.content``. This helper
         intentionally ignores the resolved mentions list so the bot admission
         gate can distinguish an explicit cross-bot address from a reply chip.
+        A raw ``<@&self_role>`` token counts: it is an inline, deliberate
+        address of this bot (reply chips never produce role-mention tokens).
         """
         if not self._client or not self._client.user:
             return False
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+        if str(self._client.user.id) in self._raw_mentioned_user_ids(message):
+            return True
+        role_id = self._self_managed_role_id(message)
+        return role_id is not None and f"<@&{role_id}>" in (
+            getattr(message, "content", "") or ""
+        )
 
     def _discord_bots_require_inline_mention(self) -> bool:
         """Whether another bot must type an inline @mention to trigger us.
@@ -6235,7 +6498,15 @@ class DiscordAdapter(BasePlatformAdapter):
             if self._client.user:
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
+            _self_role_id = self._self_managed_role_id(message)
+            if _self_role_id:
+                normalized_content = normalized_content.replace(f"<@&{_self_role_id}>", "").strip()
             message.content = normalized_content
+        # Observe-unmentioned: when enabled, a message that fails the mention
+        # gate is ingested into session context (observe_only) instead of
+        # dropped, while the agent still does not respond. Orthogonal to the
+        # mention gate; observe-only messages never spawn an auto-thread.
+        observe_only = False
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -6284,13 +6555,16 @@ class DiscordAdapter(BasePlatformAdapter):
 
             if require_mention and not is_free_channel and not in_bot_thread:
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
-                    return
+                    if self._discord_observe_unmentioned():
+                        observe_only = True  # ingest as context; still no response
+                    else:
+                        return
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
-        if not is_thread and not isinstance(message.channel, discord.DMChannel):
+        if not is_thread and not observe_only and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
@@ -6660,6 +6934,7 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            observe_only=observe_only,
         )
 
         # Track thread participation so the bot won't require @mention for
@@ -6794,6 +7069,16 @@ def _component_check_auth(
     """
     user = getattr(interaction, "user", None)
     if user is None or getattr(user, "id", None) is None:
+        return False
+
+    # R7: the moderation deny store beats every allow branch below —
+    # including the ALLOW_ALL flags and the GATEWAY_ALLOWED_USERS union.
+    # A banned user must not be able to click approval buttons.
+    try:
+        _denied_uid = str(user.id)
+    except AttributeError:
+        _denied_uid = ""
+    if _denied_uid and _moderation_sync.deny_store().is_denied(_denied_uid):
         return False
 
     if os.getenv("DISCORD_ALLOW_ALL_USERS", "").strip().lower() in {"true", "1", "yes"}:

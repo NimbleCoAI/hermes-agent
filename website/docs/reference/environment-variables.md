@@ -278,6 +278,7 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `DISCORD_ALLOW_ALL_USERS` | Allow any Discord user to trigger the bot (dev only). |
 | `DISCORD_ALLOWED_ROLES` | Comma-separated Discord role IDs allowed to use the bot (OR with `DISCORD_ALLOWED_USERS`). Auto-enables the Members intent. Useful when moderation teams churn — role grants propagate automatically. |
 | `DISCORD_ALLOWED_CHANNELS` | Comma-separated Discord channel IDs. When set, the bot only responds in these channels (plus DMs if allowed). Overrides `config.yaml` `discord.allowed_channels`. |
+| `DISCORD_CHANNEL_SCOPED_ACCESS` | Opt-in. When `true`, anyone posting in a channel explicitly listed in `DISCORD_ALLOWED_CHANNELS` (or a thread under one) is authorized to talk to the bot, in addition to `DISCORD_ALLOWED_USERS` / `DISCORD_ALLOWED_ROLES` / pairing grants. `*` is not honored as a grant — an explicit channel list is required. DMs are unaffected. Prefer this over `DISCORD_ALLOWED_USERS=*` for "public in approved channels" bots. |
 | `DISCORD_PROXY` | Proxy URL for Discord connections — overrides `HTTPS_PROXY`. Supports `http://`, `https://`, `socks5://` |
 | `DISCORD_HOME_CHANNEL` | Default Discord channel for cron delivery |
 | `DISCORD_HOME_CHANNEL_NAME` | Display name for the Discord home channel |
@@ -483,6 +484,10 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `API_SERVER_MODEL_NAME` | Model name advertised on `/v1/models`. Defaults to the profile name (or `hermes-agent` for the default profile). Useful for multi-user setups where frontends like Open WebUI need distinct model names per connection. |
 | `GATEWAY_PROXY_URL` | URL of a remote Hermes API server to forward messages to ([proxy mode](/user-guide/messaging/matrix#proxy-mode-e2ee-on-macos)). When set, the gateway handles platform I/O only — all agent work is delegated to the remote server. Also configurable via `gateway.proxy_url` in `config.yaml`. |
 | `GATEWAY_PROXY_KEY` | Bearer token for authenticating with the remote API server in proxy mode. Must match `API_SERVER_KEY` on the remote host. |
+| `LETTA_BRAIN_URL` | Base URL of a Letta server (e.g. `http://localhost:8283`). Set together with `LETTA_BRAIN_AGENT_ID` to enable [Letta-backed agent mode](/user-guide/features/letta-brain-mode) — the gateway keeps platform I/O, authorization, and audit, but delegates each turn to a bound Letta agent instead of the native loop. Checked **before** `GATEWAY_PROXY_URL`. Also `gateway.letta_brain.base_url` in `config.yaml`. |
+| `LETTA_BRAIN_AGENT_ID` | ID of the Letta agent this gateway is bound to. Required alongside `LETTA_BRAIN_URL` — if either is missing, Letta mode does **not** activate and turns fall through to the native loop silently (no warning). Also `gateway.letta_brain.agent_id`. |
+| `LETTA_BRAIN_API_KEY` | Optional bearer token for Letta Cloud or a secured self-hosted Letta server. Omit for an unsecured local server. Also `gateway.letta_brain.api_key`. |
+| `LETTA_BRAIN_STREAMING` | Set to `off`/`0`/`false`/`no` to force the non-streaming (blocking) Letta path. Streaming is **on** for any other value, including unset. **Caveat:** streamed Letta turns report `0` prompt/completion tokens, so per-turn usage accounting is only accurate with streaming off — see [Letta brain mode](/user-guide/features/letta-brain-mode#budget-and-usage-accounting-the-important-caveat). |
 | `MESSAGING_CWD` | Deprecated compatibility fallback for gateway working directory. Prefer `terminal.cwd` in `config.yaml`. |
 | `GATEWAY_ALLOWED_USERS` | Comma-separated user IDs allowed across all platforms |
 | `GATEWAY_ALLOW_ALL_USERS` | Allow all users without allowlists (`true`/`false`, default: `false`) |

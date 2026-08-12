@@ -597,6 +597,19 @@ _SUMMARY_HEADROOM_FRACTION = 0.5
 # Floor so a single summary always gets a usable slice even when the parent is
 # already nearly full — below this we'd be truncating to noise.
 _MIN_SUMMARY_CHARS = 2000
+# How many trailing assistant turns to keep when salvaging a partial summary
+# from a timed-out subagent (see _salvage_partial_summary). The child never
+# wrote a wrap-up, so its last turns stand in for one; the normal per-summary
+# budget still trims the result afterwards.
+_PARTIAL_SUMMARY_TURNS = 3
+# Ceiling on the salvaged body. Applied inside the salvage, before the progress
+# relay copies the string to the gateway websocket — _apply_summary_budget only
+# protects the parent's model context, and it runs later.
+_PARTIAL_SUMMARY_MAX_CHARS = 12000
+# The literal the child emits when it gives up after repeated empty-LLM-response
+# retries (see run_agent/conversation_loop empty-response recovery). The success
+# path treats it as failure; the salvage must not mistake it for reasoning.
+_EMPTY_RESPONSE_SENTINEL = "(empty)"
 # No default wall-clock cap on child agents: legitimate heavy subagent work
 # (deep reviews, research fan-outs, slow reasoning models) was being killed
 # mid-task. Errors should come from what the child actually does; stuck-child
@@ -782,6 +795,27 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
         or all(t in DELEGATE_BLOCKED_TOOLS for t in defn.get("tools", []))
     }
     return [t for t in toolsets if t not in blocked_toolset_names]
+
+
+def _blocked_toolsets_for_role(role: str) -> List[str]:
+    """Return one-tool deny toolsets for a delegated child role.
+
+    ``_strip_blocked_tools`` can remove fully blocked toolsets, but it must keep
+    mixed platform bundles such as ``hermes-cli`` because those also contain
+    useful tools. Passing these exact deny toolsets to AIAgent lets
+    ``model_tools`` subtract blocked names *after* composite expansion, and the
+    restriction survives later registry/MCP refreshes through the agent's
+    stored ``disabled_toolsets``.
+    """
+    blocked_names = set(DELEGATE_BLOCKED_TOOLS)
+    if role == "orchestrator":
+        blocked_names.discard("delegate_task")
+    return sorted(
+        name
+        for name, defn in TOOLSETS.items()
+        if defn.get("tools")
+        and set(defn.get("tools", ())).issubset(blocked_names)
+    )
 
 
 def _emit_parent_console(parent_agent, line: str) -> None:
@@ -1137,6 +1171,28 @@ def _build_child_agent(
     else:
         child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
+    # Blocked tools also live inside mixed platform bundles (hermes-cli,
+    # hermes-telegram, etc.) that _strip_blocked_tools must keep because they
+    # carry useful tools too. Pass exact one-tool deny toolsets through to the
+    # child so model_tools subtracts the blocked names AFTER composite
+    # expansion, and the restriction survives later registry/MCP refreshes.
+    raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
+    if isinstance(raw_parent_disabled, (list, tuple, set)):
+        inherited_disabled = [str(name) for name in raw_parent_disabled]
+    else:
+        inherited_disabled = []
+    if effective_role == "orchestrator":
+        # Role grants delegate_task explicitly, matching the unconditional
+        # delegation toolset re-add below.
+        inherited_disabled = [
+            name for name in inherited_disabled if name != "delegation"
+        ]
+    child_disabled_toolsets = list(
+        dict.fromkeys(
+            inherited_disabled + _blocked_toolsets_for_role(effective_role)
+        )
+    )
+
     # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
     # removed.  The re-add is unconditional on parent-toolset membership because
     # orchestrator capability is granted by role, not inherited — see the
@@ -1332,6 +1388,7 @@ def _build_child_agent(
         prefill_messages=getattr(parent_agent, "prefill_messages", None),
         fallback_model=parent_fallback,
         enabled_toolsets=child_toolsets,
+        disabled_toolsets=child_disabled_toolsets,
         quiet_mode=True,
         ephemeral_system_prompt=child_prompt,
         log_prefix=f"[subagent-{task_index}]",
@@ -1567,6 +1624,117 @@ def _dump_subagent_timeout_diagnostic(
     except Exception as exc:
         logger.warning("Subagent timeout diagnostic dump failed: %s", exc)
         return None
+
+
+def _salvage_partial_summary(child: Any, task_index: int) -> tuple[str, list[Dict[str, Any]]]:
+    """Reconstruct what a timed-out subagent managed to produce.
+
+    On timeout the parent abandons the child's future, so ``run_conversation``
+    never returns and its ``final_response``/``messages`` are lost. The child
+    has usually done substantial work by then — a 600s research task can
+    complete dozens of tool calls — and discarding all of it means the parent
+    gets nothing at all rather than a partial answer.
+
+    ``run_conversation`` publishes its live transcript as
+    ``agent._session_messages``, so read that and rebuild (a) the child's most
+    recent assistant prose and (b) a tool trace, mirroring the shape the normal
+    success path returns.
+
+    Returns ``(summary_text, tool_trace)``; ``("", [])`` if nothing is
+    recoverable. Never raises — a salvage failure must not mask the timeout.
+    """
+    try:
+        messages = getattr(child, "_session_messages", None)
+        if not isinstance(messages, list) or not messages:
+            return "", []
+
+        assistant_texts: List[str] = []
+        tool_trace: List[Dict[str, Any]] = []
+        trace_by_id: Dict[str, Dict[str, Any]] = {}
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role == "assistant":
+                content = msg.get("content")
+                # Skip the empty-response recovery scaffolding. Those turns
+                # carry the literal "(empty)" sentinel, which the success path
+                # treats as failure (see _empty_sentinel below). A child stuck
+                # in the empty-response retry loop is a prime timeout
+                # candidate, so without this the salvage would return
+                # "(empty)" as "the child's last reasoning" and push the real
+                # findings out of the tail window.
+                if (
+                    isinstance(content, str)
+                    and content.strip()
+                    and content.strip() != _EMPTY_RESPONSE_SENTINEL
+                    and not msg.get("_empty_recovery_synthetic")
+                    and not msg.get("_empty_terminal_sentinel")
+                ):
+                    assistant_texts.append(content.strip())
+                for tc in msg.get("tool_calls") or []:
+                    # Per-call guard: one malformed entry must not abort the
+                    # whole salvage via the function-level except and throw
+                    # away every recovered turn.
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function")
+                    fn = fn if isinstance(fn, dict) else {}
+                    args = fn.get("arguments")
+                    entry_t = {
+                        "tool": fn.get("name") or "unknown",
+                        "args_bytes": len(args) if isinstance(args, str) else 0,
+                    }
+                    tool_trace.append(entry_t)
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        trace_by_id[tc_id] = entry_t
+            elif role == "tool":
+                content = _stringify_tool_content(msg.get("content", ""))
+                result_meta = {
+                    "result_bytes": len(content),
+                    "status": "error" if _looks_like_error_output(content) else "ok",
+                }
+                tc_id = msg.get("tool_call_id")
+                target = trace_by_id.get(tc_id) if tc_id else None
+                if target is not None:
+                    target.update(result_meta)
+                elif tool_trace:
+                    tool_trace[-1].update(result_meta)
+
+        if not assistant_texts:
+            return "", tool_trace
+
+        # The child never got to write a wrap-up, so its last few prose turns
+        # are the best available stand-in. Keep the tail: later reasoning
+        # supersedes earlier, and the parent's context budget is finite.
+        body = "\n\n".join(assistant_texts[-_PARTIAL_SUMMARY_TURNS:])
+        # Hard cap before anything else sees this. _apply_summary_budget trims
+        # for the MODEL's context later, but the progress relay copies the
+        # string onto the websocket first (tui_gateway re-emits it as
+        # message.complete), so three half-megabyte turns would put ~1.5 MB on
+        # the wire. The success path never has this problem because a model
+        # writes its own summary.
+        if len(body) > _PARTIAL_SUMMARY_MAX_CHARS:
+            kept = len(body) - _PARTIAL_SUMMARY_MAX_CHARS
+            body = (
+                body[:_PARTIAL_SUMMARY_MAX_CHARS]
+                + f"\n\n[... {kept:,} further chars of salvaged text omitted]"
+            )
+        ok = sum(1 for t in tool_trace if t.get("status") == "ok")
+        errored = sum(1 for t in tool_trace if t.get("status") == "error")
+        header = (
+            "[PARTIAL — subagent timed out before writing a final summary. "
+            f"{len(tool_trace)} tool call(s): {ok} ok, {errored} errored. "
+            "The text below is the child's last reasoning, not a considered "
+            "wrap-up; treat conclusions as provisional and verify anything "
+            "load-bearing.]"
+        )
+        return f"{header}\n\n{body}", tool_trace
+    except Exception as exc:
+        logger.debug("Partial summary salvage failed for subagent %d: %s", task_index, exc)
+        return "", []
 
 
 def _spill_summary_to_file(task_index: int, summary: str) -> Optional[str]:
@@ -2014,6 +2182,21 @@ def _run_single_child(
                         diagnostic_path,
                     )
 
+            # Recover whatever the child produced before it was cut off. Without
+            # this the parent gets summary=None and the run's entire output —
+            # potentially many minutes of completed tool work — is discarded.
+            partial_summary, partial_trace = _salvage_partial_summary(child, task_index)
+            partial_path: Optional[str] = None
+            if partial_summary:
+                partial_path = _spill_summary_to_file(task_index, partial_summary)
+                logger.warning(
+                    "Subagent %d: salvaged %d-char partial summary from %d tool call(s)%s",
+                    task_index,
+                    len(partial_summary),
+                    len(partial_trace),
+                    f" (full text: {partial_path})" if partial_path else "",
+                )
+
             if child_progress_cb:
                 try:
                     child_progress_cb(
@@ -2025,7 +2208,10 @@ def _run_single_child(
                         ),
                         status="timeout" if is_timeout else "error",
                         duration_seconds=duration,
-                        summary="",
+                        # [:500] matches the success path's relay payload
+                        # (see complete_kwargs below) — the full text is in
+                        # the spill file, not on the websocket.
+                        summary=partial_summary[:500],
                     )
                 except Exception:
                     pass
@@ -2049,10 +2235,20 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
+            if partial_summary:
+                _err += (
+                    " A partial summary was salvaged from the child's transcript"
+                    " and is included below."
+                )
+                if partial_path:
+                    _err += f" Full text: {partial_path}"
+
             return {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
-                "summary": None,
+                "summary": partial_summary or None,
+                "partial": bool(partial_summary),
+                "tool_trace": partial_trace,
                 "error": _err,
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
@@ -2832,10 +3028,11 @@ def delegate_task(
             _sync_result = _execute_and_aggregate()
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
-                    "background=true is not available on this endpoint (stateless "
-                    "HTTP API — no channel to deliver a detached subagent result "
-                    "after the turn ends), so the subagent(s) ran SYNCHRONOUSLY and "
-                    "the result is included above."
+                    "background=true is not available in this session — it cannot "
+                    "receive a detached subagent result after the turn ends (a "
+                    "one-shot runner such as `hermes -z` or a cron job, or a "
+                    "stateless HTTP endpoint). The subagent(s) ran SYNCHRONOUSLY "
+                    "and the result is included above."
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
 
