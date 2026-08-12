@@ -2283,6 +2283,26 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Per-context memory scoping (gateway only). When True, memory in a
+        # messaging chat is partitioned to contexts/{platform:chat_type:chat_id}/
+        # so a fact learned in one DM or group is not readable in another.
+        # Default False = today's behavior (single shared memory). No effect on
+        # the interactive CLI, which is always unscoped.
+        # mt DIVERGES FROM UPSTREAM (which defaults this False): scoping is
+        # already unconditional on this fork, so defaulting to False would
+        # silently collapse every agent back to one shared memory. Keep it on.
+        "context_scoping_enabled": True,
+        # When scoping is on, whether a scoped context ALSO reads the shared
+        # global MEMORY.md/USER.md as a read-only layer. Default False keeps
+        # scoped contexts fully isolated; True lets them see (but never edit)
+        # global facts.
+        #
+        # mt DIVERGES FROM UPSTREAM (False) and sets this True: mt's global
+        # layer is what holds the agent's name, personality and skills, and
+        # those must stay visible inside a group. That is only safe now that
+        # DMs are scoped too — under the old code global also collected DM
+        # content, which is precisely what made the merged read a leak.
+        "include_global_in_scoped": True,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
