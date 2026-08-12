@@ -389,6 +389,16 @@ preview = true  # required for PLW1514 (unspecified-encoding) — preview rule
 # which silently corrupts any non-ASCII file content.  We had three
 # separate Windows sandbox regressions in one debug session before
 # adding the explicit encoding.  This rule keeps new code honest.
+# NOTE (2026-08-12): F811 (redefinition-of-unused-name) is worth enabling and is
+# NOT enabled here on purpose. This merge silently produced two byte-identical
+# duplicate definitions from "keep both sides" conflict resolution — a function in
+# plugins/platforms/discord/adapter.py and a 183-line test class in
+# tests/hermes_cli/test_web_server.py — and nothing caught them: identical
+# duplicates still pass their tests, and `ruff check .` is only ever asked about
+# PLW1514. Every future upstream merge has that same failure mode.
+# Turning F811 on today surfaces 18 pre-existing hits (mostly function-local
+# import shadowing), so it needs its own cleanup PR rather than riding along with
+# an ancestry merge. Do it.
 select = ["PLW1514"]
 
 [tool.ruff.lint.per-file-ignores]
