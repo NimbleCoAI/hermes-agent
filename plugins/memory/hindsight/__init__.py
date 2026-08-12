@@ -757,7 +757,6 @@ class HindsightMemoryProvider(MemoryProvider):
         """Custom setup wizard — installs only the deps needed for the selected mode."""
         import subprocess
         import shutil
-        import sys
         from pathlib import Path
 
         from hermes_cli.config import save_config
