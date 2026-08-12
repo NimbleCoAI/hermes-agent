@@ -1,62 +1,68 @@
 #!/usr/bin/env python3
-"""Migrate memory context directories onto the platform-qualified id format.
+"""Migrate memory context directories onto the current context-id scheme.
 
-Background
-----------
-Before the partitioned MemoryStore landed, the gateway scoped memory by the
-raw ``chat_id`` (e.g. ``group:<signal-id>``) and, on every ordinary scoped
-write, persisted the MERGED global+scoped view into the scoped file. Two
-consequences survive the code fix and need a data pass:
+Why this exists
+---------------
+The memory context id has changed shape twice:
 
-1. The context id format changed to ``{platform}:{chat_type}:{chat_id}``.
-   Directories under the old name are never loaded again, so their genuinely
-   scoped entries drop out of the agent's read view.
-2. Those directories still contain copies of global entries. The store's
-   self-heal only runs for a context it actually loads, so an orphaned
-   directory keeps its copied global content on disk indefinitely.
+  gen0  ``<chat_id>``                      (raw id; DMs/threads went to global)
+  gen1  ``{platform}:{chat_type}:{chat_id}``
+  gen2  ``{platform}:{dm|chat}:{chat_id}`` (threads pool into parent channel)
 
-This script renames each old-format directory to its new id and strips any
-entry that is also present in the global file for that target.
+A directory left under an older name is never loaded again, so its scoped
+entries silently drop out of the agent's read view. Older directories may also
+still contain copies of global entries, from the era when a scoped write
+persisted the merged global+scoped view; the store self-heals that only for a
+context it actually loads, so an orphaned directory keeps them indefinitely.
+
+How the target is chosen
+------------------------
+Not by guessing from the directory name. Each agent's ``state.db`` records the
+``platform``, ``chat_type`` and ``parent_chat_id`` actually observed for every
+``chat_id``, so the target is computed by handing those to the SAME
+``derive_context_id`` the runtime uses. A chat_id the database has never seen
+is reported and skipped rather than renamed on a hunch.
+
+Because gen2 pools a thread into its parent channel, several source
+directories can collapse into one target. Their entries are merged and
+deduplicated, most-recently-written last.
 
 Safety
 ------
-Dry-run by default: prints the plan and changes nothing. Pass ``--apply`` to
-write. ``--apply`` takes a timestamped backup of each memories directory it
-touches before modifying it.
-
-Platform cannot be recovered from the directory name alone, so it must be
-supplied per run with ``--platform``. Ids that do not look like they belong to
-that platform are reported and skipped rather than guessed at.
+Dry-run by default: prints the plan and changes nothing. ``--apply`` takes a
+timestamped backup of each memories directory before touching it.
 
 Usage
 -----
-    # inspect every agent on this host
-    python3 scripts/migrate_memory_contexts.py ~/.hermes-*/memories --platform signal
-
-    # commit the change
-    python3 scripts/migrate_memory_contexts.py ~/.hermes-*/memories --platform signal --apply
+    python3 scripts/migrate_memory_contexts.py ~/.hermes-cyborg
+    python3 scripts/migrate_memory_contexts.py ~/.hermes-* --apply
 """
 from __future__ import annotations
 
 import argparse
-import re
+import json
+import os
 import shutil
+import sqlite3
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-ENTRY_DELIMITER = "\n§\n"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tools.memory_tool import ENTRY_DELIMITER, derive_context_id  # noqa: E402
+
 TARGETS = (("memory", "MEMORY.md"), ("user", "USER.md"))
 
-# A directory name already in {platform}:{chat_type}:{chat_id} form. The chat
-# id itself may contain ':' (Signal's "group:<id>"), so only the first two
-# segments are structural.
-_NEW_FORMAT = re.compile(r"^[a-z0-9_]+:[a-z0-9_]+:.+$", re.IGNORECASE)
-
-# Chat types the old gateway could produce a scoped directory for. It only
-# ever scoped group/forum/channel; everything else went to global.
-_OLD_SCOPED_CHAT_TYPES = ("group", "forum", "channel")
+#: Platform tokens that may appear as the first segment of a gen1/gen2 id.
+#: Used only to strip a known prefix back off to recover the raw chat_id.
+_KNOWN_PLATFORMS = (
+    "signal", "telegram", "discord", "slack", "api_server", "msgraph_webhook",
+    "feishu", "whatsapp", "matrix", "local", "cli", "irc", "unknown",
+)
+_KNOWN_SCOPES = ("dm", "chat", "group", "channel", "forum", "thread")
 
 
 def read_entries(path: Path) -> List[str]:
@@ -76,154 +82,195 @@ def write_entries(path: Path, entries: List[str]) -> None:
     path.write_text(ENTRY_DELIMITER.join(entries), encoding="utf-8")
 
 
-def infer_chat_type(old_id: str, platform: str) -> Optional[str]:
-    """Infer the chat_type the old id was scoped under, or None if unclear.
+def raw_chat_id(dir_name: str) -> str:
+    """Recover the underlying chat_id from a directory name of any generation."""
+    parts = dir_name.split(":", 2)
+    if (len(parts) == 3
+            and parts[0].lower() in _KNOWN_PLATFORMS
+            and parts[1].lower() in _KNOWN_SCOPES):
+        return parts[2]
+    return dir_name
 
-    The old gateway only created scoped directories for group/forum/channel,
-    so a directory that exists at all was one of those. Signal encodes it in
-    the id itself; for other platforms we cannot distinguish group from
-    channel and say so rather than guessing.
+
+def load_chat_facts(agent_dir: Path) -> Dict[str, Tuple[str, str, Optional[str]]]:
+    """chat_id -> (platform, chat_type, parent_chat_id) from the agent's sessions.
+
+    The most recently started session for a chat_id wins.
     """
-    if old_id.startswith("group:"):
-        return "group"
-    if platform == "signal":
-        # Signal DMs were never scoped, so a non-"group:" Signal directory is
-        # not something this script knows how to name.
-        return None
-    return None
+    db = agent_dir / "state.db"
+    facts: Dict[str, Tuple[str, str, Optional[str]]] = {}
+    if not db.exists():
+        return facts
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return facts
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+        if not {"chat_id", "chat_type"} <= cols:
+            return facts
+        has_origin = "origin_json" in cols
+        order = "started_at" if "started_at" in cols else "id"
+        sel = "chat_id, chat_type" + (", origin_json" if has_origin else "")
+        q = (f"SELECT {sel} FROM sessions "
+             f"WHERE chat_id IS NOT NULL AND chat_id != '' ORDER BY {order} ASC")
+        for row in con.execute(q):
+            chat_id, chat_type = row[0], row[1]
+            platform, parent = None, None
+            if has_origin and row[2]:
+                try:
+                    o = json.loads(row[2])
+                    platform = o.get("platform")
+                    parent = o.get("parent_chat_id")
+                except (ValueError, TypeError):
+                    pass
+            prev = facts.get(str(chat_id))
+            # Keep a previously-known platform/parent if this row lacks them.
+            if prev:
+                platform = platform or prev[0]
+                parent = parent or prev[2]
+                chat_type = chat_type or prev[1]
+            facts[str(chat_id)] = (platform, chat_type, parent)
+    except sqlite3.Error:
+        pass
+    finally:
+        con.close()
+    return facts
 
 
-def plan_for_memories_dir(
-    mem_dir: Path, platform: str
-) -> Tuple[List[Dict], List[Dict]]:
-    """Return (actions, skipped) for one memories/ directory."""
-    actions: List[Dict] = []
+def plan_for_agent(agent_dir: Path) -> Tuple[List[Dict], List[Dict]]:
+    """Return (moves, skipped) for one agent directory."""
+    moves: List[Dict] = []
     skipped: List[Dict] = []
+    mem_dir = agent_dir / "memories"
     contexts = mem_dir / "contexts"
     if not contexts.is_dir():
-        return actions, skipped
+        return moves, skipped
 
+    facts = load_chat_facts(agent_dir)
     globals_by_target = {
         target: set(read_entries(mem_dir / fname)) for target, fname in TARGETS
     }
 
+    # target_dir_name -> list of (source_dir, mtime)
+    grouped: Dict[str, List[Tuple[Path, float]]] = defaultdict(list)
+
     for entry in sorted(contexts.iterdir()):
         if not entry.is_dir():
             continue
-        old_id = entry.name
-
-        if _NEW_FORMAT.match(old_id) and not old_id.startswith("group:"):
-            skipped.append({"dir": old_id, "reason": "already new format"})
+        cid = raw_chat_id(entry.name)
+        fact = facts.get(cid)
+        if not fact:
+            skipped.append({"dir": entry.name,
+                            "reason": f"chat_id {cid!r} not present in state.db "
+                                      f"— cannot determine platform/parent"})
             continue
-
-        chat_type = infer_chat_type(old_id, platform)
-        if chat_type is None:
-            skipped.append({
-                "dir": old_id,
-                "reason": f"cannot infer chat_type for platform '{platform}' "
-                          f"— rename by hand or rerun with the right --platform",
-            })
+        platform, chat_type, parent = fact
+        target = derive_context_id(platform, chat_type, cid, parent)
+        if not target:
+            skipped.append({"dir": entry.name, "reason": "derives to unscoped (None)"})
             continue
+        safe = str(target).replace("/", "_").replace("\\", "_").replace("..", "_")
+        mtimes = [p.stat().st_mtime for p in entry.glob("*.md")] or [0.0]
+        grouped[safe].append((entry, max(mtimes)))
 
-        new_id = f"{platform}:{chat_type}:{old_id}"
-        safe_new_id = new_id.replace("/", "_").replace("\\", "_").replace("..", "_")
+    for target_name, sources in sorted(grouped.items()):
+        target_dir = contexts / target_name
+        # Oldest first so the most recent writes land last in the merged list.
+        sources.sort(key=lambda t: t[1])
+        if [s for s, _ in sources] == [target_dir]:
+            continue  # already correct, nothing to do
 
-        strip: Dict[str, int] = {}
-        keep: Dict[str, List[str]] = {}
-        for target, fname in TARGETS:
-            entries = read_entries(entry / fname)
-            if not entries:
-                continue
-            gset = globals_by_target[target]
-            kept = [e for e in entries if e not in gset]
-            strip[fname] = len(entries) - len(kept)
-            keep[fname] = kept
+        merged: Dict[str, List[str]] = {}
+        stripped: Dict[str, int] = {}
+        for _, fname in TARGETS:
+            acc: List[str] = []
+            dropped = 0
+            for src, _mt in sources:
+                for e in read_entries(src / fname):
+                    if e in globals_by_target["user" if fname == "USER.md" else "memory"]:
+                        dropped += 1
+                        continue
+                    acc.append(e)
+            merged[fname] = list(dict.fromkeys(acc))
+            stripped[fname] = dropped
 
-        actions.append({
-            "mem_dir": mem_dir,
-            "old_dir": entry,
-            "old_id": old_id,
-            "new_id": safe_new_id,
-            "new_dir": contexts / safe_new_id,
-            "strip": strip,
-            "keep": keep,
+        moves.append({
+            "target_name": target_name,
+            "target_dir": target_dir,
+            "sources": [s for s, _ in sources],
+            "merged": merged,
+            "stripped": stripped,
         })
 
-    return actions, skipped
+    return moves, skipped
 
 
-def apply_action(action: Dict) -> None:
-    new_dir: Path = action["new_dir"]
-    old_dir: Path = action["old_dir"]
-
-    # Rewrite the files with global-copied entries removed, then move the dir.
-    for fname, kept in action["keep"].items():
-        write_entries(old_dir / fname, kept)
-
-    if new_dir.exists():
-        # Merge into an existing new-format dir rather than clobbering it.
-        for fname, kept in action["keep"].items():
-            existing = read_entries(new_dir / fname)
-            merged = list(dict.fromkeys(existing + kept))
-            write_entries(new_dir / fname, merged)
-        shutil.rmtree(old_dir)
-    else:
-        old_dir.rename(new_dir)
-
-
-def backup(mem_dir: Path, stamp: str) -> Path:
-    dest = mem_dir.parent / f"{mem_dir.name}.pre-migration-{stamp}"
-    shutil.copytree(mem_dir, dest)
-    return dest
+def apply_move(move: Dict) -> None:
+    target_dir: Path = move["target_dir"]
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for _, fname in TARGETS:
+        entries = move["merged"].get(fname, [])
+        if entries:
+            write_entries(target_dir / fname, entries)
+        elif (target_dir / fname).exists():
+            (target_dir / fname).unlink()
+    for src in move["sources"]:
+        if src.resolve() != target_dir.resolve():
+            shutil.rmtree(src)
 
 
 def main(argv: List[str]) -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("memories_dirs", nargs="+", type=Path,
-                    help="one or more agent memories/ directories")
-    ap.add_argument("--platform", required=True,
-                    help="platform these agents run on (e.g. signal, telegram)")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("agent_dirs", nargs="+", type=Path,
+                    help="agent home directories (e.g. ~/.hermes-cyborg)")
     ap.add_argument("--apply", action="store_true",
                     help="write the changes (default is a dry run)")
     args = ap.parse_args(argv)
 
     stamp = time.strftime("%Y%m%dT%H%M%S")
-    total_actions = 0
-    total_stripped = 0
+    total_moves = total_stripped = total_merged = 0
 
-    for mem_dir in args.memories_dirs:
-        if not mem_dir.is_dir():
-            print(f"!! {mem_dir}: not a directory, skipping")
+    for agent_dir in args.agent_dirs:
+        if not (agent_dir / "memories" / "contexts").is_dir():
+            continue
+        moves, skipped = plan_for_agent(agent_dir)
+        if not moves and not skipped:
             continue
 
-        actions, skipped = plan_for_memories_dir(mem_dir, args.platform)
-        if not actions and not skipped:
-            continue
-
-        print(f"\n=== {mem_dir}")
+        print(f"\n=== {agent_dir.name}")
         for s in skipped:
             print(f"  -- skip {s['dir']}\n       {s['reason']}")
-        for a in actions:
-            stripped = sum(a["strip"].values())
-            total_stripped += stripped
-            print(f"  -> {a['old_id']}")
-            print(f"     rename to {a['new_id']}")
-            for fname, n in sorted(a["strip"].items()):
-                kept = len(a["keep"].get(fname, []))
-                print(f"     {fname}: drop {n} global-copied, keep {kept} scoped")
-        total_actions += len(actions)
+        for m in moves:
+            names = [p.name for p in m["sources"]]
+            if len(names) > 1:
+                total_merged += 1
+                print(f"  -> {m['target_name']}   (merging {len(names)} dirs)")
+                for n in names:
+                    print(f"       + {n}")
+            else:
+                print(f"  -> {m['target_name']}\n       from {names[0]}")
+            for _, fname in TARGETS:
+                kept = len(m["merged"].get(fname, []))
+                drop = m["stripped"].get(fname, 0)
+                if kept or drop:
+                    print(f"       {fname}: keep {kept}, drop {drop} global-copied")
+            total_stripped += sum(m["stripped"].values())
+        total_moves += len(moves)
 
-        if args.apply and actions:
-            dest = backup(mem_dir, stamp)
-            print(f"  backup: {dest}")
-            for a in actions:
-                apply_action(a)
-            print(f"  applied {len(actions)} migration(s)")
+        if args.apply and moves:
+            dest = agent_dir / "memories"
+            bak = dest.parent / f"memories.pre-migration-{stamp}"
+            shutil.copytree(dest, bak)
+            print(f"  backup: {bak}")
+            for m in moves:
+                apply_move(m)
+            print(f"  applied {len(moves)} move(s)")
 
     verb = "applied" if args.apply else "planned (dry run — pass --apply to write)"
-    print(f"\n{total_actions} directory migration(s) {verb}; "
-          f"{total_stripped} global-copied entries removed.")
+    print(f"\n{total_moves} move(s) {verb}; {total_merged} merged into a shared "
+          f"parent; {total_stripped} global-copied entries removed.")
     return 0
 
 

@@ -2589,6 +2589,7 @@ def _context_id_for_source(source) -> Optional[str]:
         platform_str,
         getattr(source, "chat_type", None),
         getattr(source, "chat_id", None),
+        getattr(source, "parent_chat_id", None),
     )
 
 

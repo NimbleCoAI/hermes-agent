@@ -1437,18 +1437,26 @@ def init_agent(
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore, derive_context_id
-                # Per-context scoping (gateway/messaging only). Off by default;
-                # when enabled we partition memory by platform:chat_type:chat_id
-                # so a fact learned in one DM/group is isolated from others. The
-                # interactive CLI has no chat_id, so derive_context_id → None
-                # and the store stays unscoped regardless of the flag.
+                # Per-context scoping (gateway/messaging only). When enabled we
+                # partition memory by platform:scope:chat_id so a fact learned
+                # in one DM/channel is isolated from others. The interactive
+                # CLI has no chat_id, so there is nothing to derive and the
+                # store stays unscoped regardless of the flag.
+                #
+                # Prefer the caller's context_id. The gateway computes it from
+                # the full SessionSource — including parent_chat_id, which is
+                # what pools a thread's memory into its parent channel. Only
+                # `platform`, `_chat_type` and `_chat_id` survive onto `agent`,
+                # so re-deriving here would drop the parent and give every
+                # thread its own island.
                 _context_id = None
                 _include_global = False
                 if mem_config.get("context_scoping_enabled", False):
-                    _context_id = derive_context_id(
+                    _context_id = getattr(agent, "_context_id", None) or derive_context_id(
                         getattr(agent, "platform", None),
                         getattr(agent, "_chat_type", None),
                         getattr(agent, "_chat_id", None),
+                        getattr(agent, "_parent_chat_id", None),
                     )
                     _include_global = bool(mem_config.get("include_global_in_scoped", False))
                 agent._memory_store = MemoryStore(
