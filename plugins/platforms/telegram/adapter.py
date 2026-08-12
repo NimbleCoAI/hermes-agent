@@ -215,11 +215,19 @@ try:
         Application,
         CommandHandler,
         CallbackQueryHandler,
-        ChatMemberHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
         filters,
     )
+    # Optional: only powers the bot-membership (group auto-approval) gate.
+    # Older/patched python-telegram-bot builds — and test doubles that stub
+    # telegram.ext — may not expose it. Import it on its own so a missing
+    # symbol disables that one feature instead of collapsing into the
+    # TELEGRAM_AVAILABLE=False fallback and disabling the whole adapter.
+    try:
+        from telegram.ext import ChatMemberHandler
+    except ImportError:
+        ChatMemberHandler = None
     from telegram.constants import ParseMode, ChatType
     from telegram.request import HTTPXRequest
     TELEGRAM_AVAILABLE = True
@@ -234,7 +242,9 @@ except ImportError:
     Application = Any
     CommandHandler = Any
     CallbackQueryHandler = Any
-    ChatMemberHandler = Any
+    # None (not Any) so the single "is it available?" test at the registration
+    # site works the same whether the SDK is absent or merely lacks the symbol.
+    ChatMemberHandler = None
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -395,10 +405,14 @@ def check_telegram_requirements() -> bool:
         from telegram.ext import (
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
-            ChatMemberHandler as _CMH,
             MessageHandler as _MH,
             ContextTypes as _CT, filters as _filters,
         )
+        # Optional — see the module-level import block.
+        try:
+            from telegram.ext import ChatMemberHandler as _CMH
+        except ImportError:
+            _CMH = None
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
         from telegram.request import HTTPXRequest as _HR
     except ImportError:
@@ -3596,10 +3610,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
             # Bot's own membership changes (added to / removed from chats) —
             # drives the HSM group auto-approval gate (TELEGRAM_GROUP_AUTOAPPROVE).
-            self._app.add_handler(ChatMemberHandler(
-                self._handle_my_chat_member,
-                ChatMemberHandler.MY_CHAT_MEMBER,
-            ))
+            self._register_my_chat_member_handler()
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -8141,6 +8152,43 @@ class TelegramAdapter(BasePlatformAdapter):
     def _telegram_group_autoapprove_enabled(self) -> bool:
         """Return whether bot-added-to-group events are gated through HSM."""
         return os.getenv("TELEGRAM_GROUP_AUTOAPPROVE", "false").lower() in {"true", "1", "yes", "on"}
+
+    def _register_my_chat_member_handler(self) -> bool:
+        """Register the bot's own-membership handler; return whether it was.
+
+        ``telegram.ext.ChatMemberHandler`` is treated as OPTIONAL. It only
+        powers the group auto-approval gate, so a build of
+        python-telegram-bot that doesn't export it must cost us that one
+        feature — not the entire Telegram adapter. (Importing it as part of
+        the mandatory ``from telegram.ext import (...)`` tuple would send an
+        older SDK down the ``TELEGRAM_AVAILABLE = False`` path, silently
+        nulling ParseMode/ChatType and disabling Telegram altogether.)
+        """
+        if ChatMemberHandler is None:
+            if self._telegram_group_autoapprove_enabled():
+                logger.warning(
+                    "[%s] TELEGRAM_GROUP_AUTOAPPROVE is enabled but this "
+                    "python-telegram-bot build does not provide "
+                    "telegram.ext.ChatMemberHandler — bot-added-to-group events "
+                    "will NOT be gated through HSM. Upgrade python-telegram-bot "
+                    "to restore the gate.",
+                    self.name,
+                )
+            else:
+                logger.debug(
+                    "[%s] telegram.ext.ChatMemberHandler unavailable — skipping "
+                    "bot-membership handler (group auto-approval is off anyway)",
+                    self.name,
+                )
+            return False
+        app = self._app
+        if app is None:
+            return False
+        app.add_handler(ChatMemberHandler(
+            self._handle_my_chat_member,
+            ChatMemberHandler.MY_CHAT_MEMBER,
+        ))
+        return True
 
     async def _handle_my_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle changes to the bot's OWN chat membership (my_chat_member).
