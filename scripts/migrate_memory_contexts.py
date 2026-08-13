@@ -84,12 +84,25 @@ def write_entries(path: Path, entries: List[str]) -> None:
 
 def raw_chat_id(dir_name: str) -> str:
     """Recover the underlying chat_id from a directory name of any generation."""
+    parsed = parse_qualified_name(dir_name)
+    return parsed[2] if parsed else dir_name
+
+
+def parse_qualified_name(dir_name: str) -> Optional[Tuple[str, str, str]]:
+    """Split a gen1/gen2 directory name into (platform, chat_type, chat_id).
+
+    Returns None for a gen0 (raw chat_id) name. A qualified name already
+    states its own platform and chat_type, so it can be re-derived without
+    consulting state.db — which matters because a chat_id whose sessions have
+    been pruned is absent from the database but its memory directory is still
+    on disk and still wanted.
+    """
     parts = dir_name.split(":", 2)
     if (len(parts) == 3
             and parts[0].lower() in _KNOWN_PLATFORMS
             and parts[1].lower() in _KNOWN_SCOPES):
-        return parts[2]
-    return dir_name
+        return parts[0], parts[1], parts[2]
+    return None
 
 
 def load_chat_facts(agent_dir: Path) -> Dict[str, Tuple[str, str, Optional[str]]]:
@@ -158,14 +171,24 @@ def plan_for_agent(agent_dir: Path) -> Tuple[List[Dict], List[Dict]]:
     for entry in sorted(contexts.iterdir()):
         if not entry.is_dir():
             continue
-        cid = raw_chat_id(entry.name)
+        qualified = parse_qualified_name(entry.name)
+        cid = qualified[2] if qualified else entry.name
         fact = facts.get(cid)
-        if not fact:
+
+        if qualified:
+            # The name already states platform and chat_type. Trust it, and
+            # take only the parent from state.db (a thread needs one; if its
+            # sessions were pruned it falls back to its own id).
+            platform, chat_type = qualified[0], qualified[1]
+            parent = fact[2] if fact else None
+        elif fact:
+            platform, chat_type, parent = fact
+        else:
             skipped.append({"dir": entry.name,
-                            "reason": f"chat_id {cid!r} not present in state.db "
-                                      f"— cannot determine platform/parent"})
+                            "reason": f"unqualified name and chat_id {cid!r} is not "
+                                      f"in state.db — cannot determine platform"})
             continue
-        platform, chat_type, parent = fact
+
         target = derive_context_id(platform, chat_type, cid, parent)
         if not target:
             skipped.append({"dir": entry.name, "reason": "derives to unscoped (None)"})
