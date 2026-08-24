@@ -1230,10 +1230,15 @@ class DiscordAdapter(BasePlatformAdapter):
                     _is_dm = isinstance(message.channel, discord.DMChannel) or _msg_guild is None
                     _msg_channel_ids = None
                     if not _is_dm:
-                        _msg_channel_ids = {str(message.channel.id)}
+                        # Use the full gate-key set (id, names, thread parent,
+                        # category) so channel-scoped authorization sees the
+                        # same keys as the allow/ignore gates and the slash
+                        # path — a category id in DISCORD_ALLOWED_CHANNELS
+                        # must admit plain messages, not only slash commands.
                         _parent_id = adapter_self._get_parent_channel_id(message.channel)
-                        if _parent_id:
-                            _msg_channel_ids.add(_parent_id)
+                        _msg_channel_ids = adapter_self._discord_channel_keys(
+                            message, _parent_id
+                        )
                     if not self._is_allowed_user(
                         str(message.author.id),
                         message.author,
@@ -5233,9 +5238,23 @@ class DiscordAdapter(BasePlatformAdapter):
         # without a config re-render. Deliberately ID-only: category names
         # routinely collide with channel names (a "studio" category next to a
         # #studio channel), so name-form category matching is not offered.
-        category_id = getattr(channel, "category_id", None)
-        if category_id is None and parent_channel is not None:
-            category_id = getattr(parent_channel, "category_id", None)
+        # Prefer the parent channel's category (safe attribute on text/forum
+        # channels) and guard the direct access: discord.py's
+        # ``Thread.category_id`` is a *property* that raises ClientException
+        # when the parent channel is not in cache (reconnect/resume races) —
+        # getattr's default only swallows AttributeError, so an unguarded read
+        # here would crash the hot message path.
+        category_id = None
+        if parent_channel is not None:
+            try:
+                category_id = getattr(parent_channel, "category_id", None)
+            except Exception:
+                category_id = None
+        if category_id is None:
+            try:
+                category_id = getattr(channel, "category_id", None)
+            except Exception:
+                category_id = None
         if category_id:
             keys.add(str(category_id))
 

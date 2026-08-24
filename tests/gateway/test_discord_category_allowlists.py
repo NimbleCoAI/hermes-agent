@@ -131,6 +131,53 @@ def test_uncategorized_channel_adds_no_category_key(adapter):
     assert keys == {"123", "lobby", "#lobby"}
 
 
+class _RaisingCategoryThread:
+    """Mimics discord.py Thread when the parent channel is not cached:
+    ``.parent`` is None and ``category_id`` is a PROPERTY that raises
+    ClientException (not AttributeError, so getattr defaults don't help)."""
+
+    id = "6663333"
+    name = "orphan thread"
+    parent = None
+    parent_id = "5551111"
+
+    @property
+    def category_id(self):
+        raise RuntimeError("Parent channel not found")  # stands in for ClientException
+
+
+def test_uncached_thread_parent_does_not_crash(adapter):
+    """discord.py Thread.category_id raises when the parent is uncached
+    (reconnect/resume race). Key derivation must swallow it — a message-path
+    crash would silence the bot — and simply omit the category key."""
+    keys = adapter._discord_channel_keys_from_channel(
+        _RaisingCategoryThread(), "5551111"
+    )
+    assert "6663333" in keys
+    assert "5551111" in keys
+    assert CATEGORY_ID not in keys
+
+
+def test_parent_category_preferred_over_raising_property(adapter):
+    """When the parent IS cached, the category comes from the parent and the
+    raising property is never consulted."""
+    thread = _RaisingCategoryThread()
+    thread.parent = SimpleNamespace(id="5551111", name="studio", category_id=CATEGORY_ID)
+    keys = adapter._discord_channel_keys_from_channel(thread, "5551111")
+    assert CATEGORY_ID in keys
+
+
+def test_channel_scoped_auth_sees_category(adapter, monkeypatch):
+    """Fix for the on_message/slash asymmetry: the key set handed to
+    channel-scoped authorization (_is_allowed_user via on_message) is the
+    same full gate-key set, so a category id in DISCORD_ALLOWED_CHANNELS
+    admits plain messages too, not only slash commands."""
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", CATEGORY_ID)
+    message = SimpleNamespace(channel=_guild_channel())
+    keys = adapter._discord_channel_keys(message, None)
+    assert adapter._discord_channel_ids_allowed(keys) is True
+
+
 def test_category_matching_is_id_only(adapter):
     """A category NAME must not become a key — category and channel names
     collide too easily for name-form ring matching to be safe."""
