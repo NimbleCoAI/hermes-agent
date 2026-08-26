@@ -29,6 +29,7 @@ different axis; reactive escalation still applies underneath the chosen tier.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any, Optional
@@ -39,7 +40,11 @@ from .classifier import (
     classify_turn,
     decide_tier,
 )
-from .config import cheap_tier_target, is_intelligent_routing_enabled
+from .config import (
+    cheap_extra_body,
+    cheap_tier_target,
+    is_intelligent_routing_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -210,14 +215,63 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[dict]:
         # runtime's routing-override extension (agent/routing_override.py)
         # actuates. Premium / fail-open turns emit no override and stay on the
         # configured primary.
+        routed_model, routed_provider = kwargs.get("model"), kwargs.get("provider")
         if tier == TIER_CHEAP:
             cheap_model, cheap_provider = cheap_tier_target()
             if cheap_model:
-                result["route"] = {"model": cheap_model, "provider": cheap_provider}
+                route = {"model": cheap_model, "provider": cheap_provider}
+                # Provider-specific body params for the cheap tier (e.g.
+                # {"think": false} on a local ollama model). Omitted entirely
+                # when unset, so nothing changes for existing cloud tiers.
+                extra_body = cheap_extra_body()
+                if extra_body:
+                    route["extra_body"] = extra_body
+                result["route"] = route
+                routed_model, routed_provider = cheap_model, cheap_provider
+
+        log_routing_decision(
+            tier=tier,
+            model=routed_model,
+            provider=routed_provider,
+            reason=reason,
+            primary_model=kwargs.get("model"),
+        )
         return result
     except Exception as exc:  # noqa: BLE001 — must never break the turn
         logger.warning("intelligent_routing: pre_llm_call failed (inert): %s", exc)
         return None
+
+
+def log_routing_decision(*, tier, model, provider, reason, primary_model) -> None:
+    """Emit ONE machine-parseable decision record per classified turn.
+
+    Format: ``routing_decision {json}`` at INFO on this module's logger, so a
+    window of fleet data can be harvested with a grep + ``json.loads`` on the
+    suffix. This is the instrumentation the upstream-PR spec
+    (2026-07-23, "numbers needed for the Nous upstream PR") names as its first
+    prerequisite: *"Routing decisions must be countable: parseable per-turn log
+    line of tier, model, reason."* Absent it, coverage/cost/fail-open rates
+    cannot be computed, which is why Stage 2 never had numbers to attach.
+
+    Never raises — metrics must not be able to break a turn.
+    """
+    try:
+        logger.info(
+            "routing_decision %s",
+            json.dumps(
+                {
+                    "tier": tier,
+                    "model": model,
+                    "provider": provider,
+                    "reason": reason,
+                    "primary_model": primary_model,
+                },
+                default=str,
+                ensure_ascii=False,
+            ),
+        )
+    except Exception:  # noqa: BLE001 — instrumentation must never break the turn
+        logger.debug("intelligent_routing: metric emit failed", exc_info=True)
 
 
 def register(ctx) -> None:

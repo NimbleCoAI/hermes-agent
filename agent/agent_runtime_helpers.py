@@ -1243,9 +1243,26 @@ def restore_primary_runtime(agent) -> bool:
         _saved = getattr(agent, "_routing_override_saved_primary", None)
         if isinstance(_saved, dict):
             agent._primary_runtime = _saved
+        # Revert any turn-scoped request-body params (e.g. {"think": false}
+        # applied for a local cheap tier). _NOT_SET means the key did not exist
+        # before the routed turn, so we remove it rather than leaving {} behind.
+        try:
+            from agent.routing_override import _NOT_SET
+
+            _saved_eb = getattr(agent, "_routing_override_saved_extra_body", _NOT_SET)
+            _overrides = getattr(agent, "request_overrides", None)
+            if isinstance(_overrides, dict):
+                if _saved_eb is _NOT_SET:
+                    _overrides.pop("extra_body", None)
+                else:
+                    _overrides["extra_body"] = _saved_eb
+        except Exception:  # noqa: BLE001 — restore is best-effort, never fatal
+            pass
+
         # Clear the scoping state so this runs exactly once.
         agent._routing_override_active = False
         agent._routing_override_saved_primary = None
+        agent._routing_override_saved_extra_body = None
         # Do NOT return here — proceed to rebuild the runtime from the restored
         # (premium) _primary_runtime via the shared body below.
 

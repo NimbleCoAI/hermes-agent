@@ -14,7 +14,13 @@ A ``pre_llm_call`` hook result may be a dict carrying a ``route`` key::
      "route": {"model": "deepseek/deepseek-v3.2", "provider": "openrouter"}}
 
 ``model`` is required; ``provider`` (and optional ``base_url`` / ``api_key`` /
-``api_mode``) are passed through to ``switch_model``. ``turn_context`` extracts
+``api_mode``) are passed through to ``switch_model``. An optional ``extra_body``
+dict is NOT passed to ``switch_model`` (its signature has no such parameter) —
+it is merged into ``agent.request_overrides["extra_body"]`` for the turn and
+reverted with the rest of the override. That is what lets a routed turn carry a
+provider-specific body param such as ``{"think": false}`` for a local ollama
+cheap tier; without it a thinking model returns an empty completion under a
+modest ``max_tokens``. ``turn_context`` extracts
 the first well-formed override and applies it right after the hook fires, before
 the turn's first API call assembles.
 
@@ -66,6 +72,10 @@ logger = logging.getLogger(__name__)
 # Fields we forward from an override into switch_model (model/provider plus the
 # optional endpoint/credential fields switch_model already accepts).
 _PASSTHROUGH_FIELDS = ("base_url", "api_key", "api_mode")
+
+# Distinguishes "there was no extra_body before" from "it was explicitly {}",
+# so restore removes the key entirely rather than leaving an empty dict behind.
+_NOT_SET = object()
 
 
 def extract_routing_override(results: Iterable[Any]) -> Optional[dict]:
@@ -162,8 +172,32 @@ def apply_routing_override(agent: Any, override: Optional[dict]) -> bool:
     # Mark the override turn-scoped with a DEDICATED flag. Do NOT restore the
     # premium snapshot into _primary_runtime (keep it == cheap) and do NOT arm
     # _fallback_activated (that would corrupt reactive cooldown accounting).
+    # Turn-scoped request-body params (e.g. {"think": false} for a local tier).
+    # Merged over any existing extra_body so custom-provider params survive; the
+    # prior value is stashed for restore_primary_runtime to revert next turn.
+    # Best-effort: a malformed extra_body must not undo an applied swap.
+    saved_extra_body = _NOT_SET
+    try:
+        routed_extra_body = override.get("extra_body")
+        if isinstance(routed_extra_body, dict) and routed_extra_body:
+            overrides = getattr(agent, "request_overrides", None)
+            if isinstance(overrides, dict):
+                saved_extra_body = overrides.get("extra_body", _NOT_SET)
+                base = saved_extra_body if isinstance(saved_extra_body, dict) else {}
+                merged = dict(base)
+                merged.update(routed_extra_body)
+                overrides["extra_body"] = merged
+        elif routed_extra_body not in (None, {}):
+            logger.debug(
+                "intelligent_routing: ignoring non-dict extra_body (%s)",
+                type(routed_extra_body).__name__,
+            )
+    except Exception:  # noqa: BLE001 — never break the turn over extra_body
+        logger.debug("intelligent_routing: could not apply extra_body", exc_info=True)
+
     try:
         agent._routing_override_saved_primary = primary_snapshot
+        agent._routing_override_saved_extra_body = saved_extra_body
         agent._routing_override_active = True
     except Exception:  # noqa: BLE001 — best-effort scoping; swap already applied
         logger.debug("intelligent_routing: could not scope override to turn",

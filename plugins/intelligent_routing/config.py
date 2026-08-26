@@ -34,6 +34,14 @@ _DEFAULT_MODE = "heuristic"
 _DEFAULT_CHEAP_MODEL = "deepseek/deepseek-v3.2"
 _DEFAULT_CHEAP_PROVIDER = "openrouter"
 
+# Provider-specific request-body params to send WITH a cheap-routed turn, e.g.
+# ``{"think": false}`` for a local ollama tier. Without this a thinking model on
+# an OpenAI-compatible endpoint burns its whole token budget on reasoning and
+# returns an EMPTY completion under any modest max_tokens — measured on
+# qwen3.5:9b: 8 tokens with think=false vs 1807 with it on, same answer, and
+# empty output at max_tokens=200. Empty by default: changes nothing unless set.
+_DEFAULT_CHEAP_EXTRA_BODY: Dict[str, Any] = {}
+
 
 def _load_config() -> Dict[str, Any]:
     """Load the full config dict (``{}`` on any failure). Patched in tests."""
@@ -79,3 +87,19 @@ def cheap_tier_target() -> tuple[str, str]:
     model = str(section.get("cheap_model") or _DEFAULT_CHEAP_MODEL).strip() or _DEFAULT_CHEAP_MODEL
     provider = str(section.get("cheap_provider") or _DEFAULT_CHEAP_PROVIDER).strip() or _DEFAULT_CHEAP_PROVIDER
     return model, provider
+
+
+def cheap_extra_body() -> Dict[str, Any]:
+    """Return ``routing.cheap_extra_body`` as a dict (``{}`` when unset/malformed).
+
+    Returns a shallow copy so callers cannot mutate the loaded config.
+    """
+    value = _routing_section().get("cheap_extra_body", _DEFAULT_CHEAP_EXTRA_BODY)
+    if not isinstance(value, dict):
+        if value not in (None, "", {}):
+            logger.debug(
+                "intelligent_routing: routing.cheap_extra_body is %s, expected a "
+                "mapping — ignoring", type(value).__name__,
+            )
+        return {}
+    return dict(value)
