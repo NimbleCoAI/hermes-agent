@@ -77,6 +77,15 @@ _PASSTHROUGH_FIELDS = ("base_url", "api_key", "api_mode")
 # so restore removes the key entirely rather than leaving an empty dict behind.
 _NOT_SET = object()
 
+# THIRD state, and the one a single sentinel got wrong: "this routed turn never
+# wrote extra_body at all". routing.cheap_extra_body is empty by default, so
+# that is the COMMON case — and conflating it with _NOT_SET made the revert pop
+# an extra_body the override never set. request_overrides["extra_body"] is built
+# once at agent construction for custom providers and for fast/priority mode, so
+# that pop silently destroyed the primary provider's own body params for the
+# rest of the session. Revert must be a no-op on this value.
+_UNTOUCHED = object()
+
 
 def extract_routing_override(results: Iterable[Any]) -> Optional[dict]:
     """Return the first well-formed ``route`` override from hook results, or None.
@@ -176,7 +185,8 @@ def apply_routing_override(agent: Any, override: Optional[dict]) -> bool:
     # Merged over any existing extra_body so custom-provider params survive; the
     # prior value is stashed for restore_primary_runtime to revert next turn.
     # Best-effort: a malformed extra_body must not undo an applied swap.
-    saved_extra_body = _NOT_SET
+    saved_extra_body = _UNTOUCHED
+    overrides_ref = None
     try:
         routed_extra_body = override.get("extra_body")
         if isinstance(routed_extra_body, dict) and routed_extra_body:
@@ -184,9 +194,20 @@ def apply_routing_override(agent: Any, override: Optional[dict]) -> bool:
             if isinstance(overrides, dict):
                 saved_extra_body = overrides.get("extra_body", _NOT_SET)
                 base = saved_extra_body if isinstance(saved_extra_body, dict) else {}
+                # Shallow copy: saved and live are always DISTINCT dicts (so the
+                # merge can't corrupt the snapshot at the top level), but they
+                # share nested values. Never mutate a nested value in place here
+                # or in flight — that would reach through into the snapshot and
+                # into the loaded config that cheap_extra_body() copied from.
                 merged = dict(base)
                 merged.update(routed_extra_body)
                 overrides["extra_body"] = merged
+                # Remember WHICH dict we dirtied. The gateway assigns a freshly
+                # built per-turn request_overrides onto the cached agent before
+                # the next turn's revert runs, so re-reading the attribute there
+                # would clean the wrong object: leaving cheap params on the dict
+                # we actually mutated and stomping the new turn's own extra_body.
+                overrides_ref = overrides
         elif routed_extra_body not in (None, {}):
             logger.debug(
                 "intelligent_routing: ignoring non-dict extra_body (%s)",
@@ -196,8 +217,26 @@ def apply_routing_override(agent: Any, override: Optional[dict]) -> bool:
         logger.debug("intelligent_routing: could not apply extra_body", exc_info=True)
 
     try:
-        agent._routing_override_saved_primary = primary_snapshot
-        agent._routing_override_saved_extra_body = saved_extra_body
+        # Only the FIRST apply of a turn snapshots. A second apply without an
+        # intervening restore would otherwise stash the first route's own
+        # runtime and merged extra_body as the "pristine" pre-turn state, so the
+        # cheap params would survive the revert. The single in-tree call site
+        # applies once per turn, but the snapshot is the whole safety property.
+        # `is not True` deliberately, not falsiness: the flag is set to exactly
+        # True here and cleared to False by the revert, so anything else means
+        # "no snapshot has been taken" rather than "a routed turn is live".
+        if getattr(agent, "_routing_override_active", False) is not True:
+            agent._routing_override_saved_primary = primary_snapshot
+            agent._routing_override_saved_extra_body = saved_extra_body
+            agent._routing_override_overrides_ref = overrides_ref
+        elif overrides_ref is not None and getattr(
+            agent, "_routing_override_saved_extra_body", _UNTOUCHED
+        ) is _UNTOUCHED:
+            # First apply wrote no extra_body, this one did: the snapshot is
+            # still pristine, but the revert now needs the dirtied dict + the
+            # value that was there before this apply touched it.
+            agent._routing_override_saved_extra_body = saved_extra_body
+            agent._routing_override_overrides_ref = overrides_ref
         agent._routing_override_active = True
     except Exception:  # noqa: BLE001 — best-effort scoping; swap already applied
         logger.debug("intelligent_routing: could not scope override to turn",

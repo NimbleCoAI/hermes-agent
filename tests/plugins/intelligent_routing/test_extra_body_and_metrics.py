@@ -183,34 +183,81 @@ def test_hook_omits_extra_body_when_unset():
     assert "extra_body" not in out["route"]
 
 
-def test_restore_removes_extra_body_that_did_not_exist_before():
-    from agent import routing_override as ro
-    a = _FakeAgent()
-    ro.apply_routing_override(a, {"model": "qwen3.5:9b", "provider": "ollama",
-                                  "extra_body": {"think": False}})
-    assert a.request_overrides["extra_body"] == {"think": False}
-    _simulate_restore(a)
-    assert "extra_body" not in a.request_overrides
+# Restore coverage lives in test_extra_body_revert_real_path.py, which drives the
+# REAL restore_primary_runtime. This file used to mirror its revert block in a
+# local _simulate_restore() helper; the mirror reproduced the implementation's
+# own assumptions, so it could not fail on either revert bug the audit found —
+# and it had already drifted (no _routing_override_active gate).
 
 
-def test_restore_reinstates_prior_extra_body():
-    from agent import routing_override as ro
-    a = _FakeAgent()
-    a.request_overrides["extra_body"] = {"tags": ["x"]}
-    ro.apply_routing_override(a, {"model": "qwen3.5:9b", "provider": "ollama",
-                                  "extra_body": {"think": False}})
-    _simulate_restore(a)
-    assert a.request_overrides["extra_body"] == {"tags": ["x"]}
+# ── 5. metrics: the dimensions a harvest actually has to slice by ────────────
+
+def _decision_rows(caplog):
+    return [json.loads(r.getMessage().split("routing_decision ", 1)[1])
+            for r in caplog.records if "routing_decision " in r.getMessage()]
 
 
-def _simulate_restore(agent):
-    """Mirror of the revert block in agent_runtime_helpers.restore_primary_runtime."""
-    from agent.routing_override import _NOT_SET
-    saved = getattr(agent, "_routing_override_saved_extra_body", _NOT_SET)
-    if isinstance(agent.request_overrides, dict):
-        if saved is _NOT_SET:
-            agent.request_overrides.pop("extra_body", None)
-        else:
-            agent.request_overrides["extra_body"] = saved
-    agent._routing_override_active = False
-    agent._routing_override_saved_extra_body = None
+def _routing_on(reg, tier=None):
+    """Force the plugin on with a deterministic classification."""
+    tier = tier or reg.TIER_CHEAP
+    return (patch.object(reg, "is_intelligent_routing_enabled", return_value=True),
+            patch.object(reg, "decide_tier", return_value=tier),
+            patch.object(reg, "classify_turn", return_value="mechanical"),
+            patch.object(reg, "cheap_tier_target", return_value=("deepseek/x", "openrouter")),
+            patch.object(reg, "cheap_extra_body", return_value={}))
+
+
+def test_decision_row_carries_join_keys_and_group_flag(caplog):
+    """A row with no session_id/turn_id cannot be joined to post-call usage, and
+    without a group flag the group-chat regression _SENDER_PREFIX_RE exists to
+    catch stays invisible in the harvest."""
+    from plugins.intelligent_routing import registration as reg
+    ctxs = _routing_on(reg)
+    with ctxs[0], ctxs[1], ctxs[2], ctxs[3], ctxs[4], \
+            caplog.at_level(logging.INFO, logger=reg.logger.name):
+        reg.on_pre_llm_call(user_message="[alice] list the files",
+                            model="z-ai/glm-5.3", platform="discord",
+                            session_id="S1", turn_id="T7")
+    row = _decision_rows(caplog)[0]
+    assert row["session_id"] == "S1"
+    assert row["turn_id"] == "T7"
+    assert row["platform"] == "discord"
+    assert row["is_group"] is True
+
+
+def test_dm_turn_is_not_flagged_as_group(caplog):
+    from plugins.intelligent_routing import registration as reg
+    ctxs = _routing_on(reg)
+    with ctxs[0], ctxs[1], ctxs[2], ctxs[3], ctxs[4], \
+            caplog.at_level(logging.INFO, logger=reg.logger.name):
+        reg.on_pre_llm_call(user_message="list the files", model="z-ai/glm-5.3",
+                            platform="discord", session_id="S1", turn_id="T7")
+    assert _decision_rows(caplog)[0]["is_group"] is False
+
+
+def test_user_directive_to_primary_emits_a_row(caplog):
+    """"use claude" is the pushback signal — it must not be a silent turn."""
+    from plugins.intelligent_routing import registration as reg
+    ctxs = _routing_on(reg)
+    with ctxs[0], ctxs[1], ctxs[2], ctxs[3], ctxs[4], \
+            caplog.at_level(logging.INFO, logger=reg.logger.name):
+        out = reg.on_pre_llm_call(user_message="use claude please",
+                                  model="z-ai/glm-5.3", session_id="S1", turn_id="T8")
+    assert "route" not in out
+    rows = _decision_rows(caplog)
+    assert len(rows) == 1
+    assert rows[0]["tier"] == "directive"
+    assert rows[0]["turn_id"] == "T8"
+
+
+def test_user_directive_to_another_model_emits_a_row(caplog):
+    from plugins.intelligent_routing import registration as reg
+    ctxs = _routing_on(reg)
+    with ctxs[0], ctxs[1], ctxs[2], ctxs[3], ctxs[4], \
+            caplog.at_level(logging.INFO, logger=reg.logger.name):
+        out = reg.on_pre_llm_call(user_message="use fable for this",
+                                  model="z-ai/glm-5.3", session_id="S1", turn_id="T9")
+    rows = _decision_rows(caplog)
+    assert len(rows) == 1
+    assert rows[0]["tier"] == "directive"
+    assert rows[0]["model"] == out["route"]["model"]
