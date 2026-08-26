@@ -14,7 +14,13 @@ A ``pre_llm_call`` hook result may be a dict carrying a ``route`` key::
      "route": {"model": "deepseek/deepseek-v3.2", "provider": "openrouter"}}
 
 ``model`` is required; ``provider`` (and optional ``base_url`` / ``api_key`` /
-``api_mode``) are passed through to ``switch_model``. ``turn_context`` extracts
+``api_mode``) are passed through to ``switch_model``. An optional ``extra_body``
+dict is NOT passed to ``switch_model`` (its signature has no such parameter) —
+it is merged into ``agent.request_overrides["extra_body"]`` for the turn and
+reverted with the rest of the override. That is what lets a routed turn carry a
+provider-specific body param such as ``{"think": false}`` for a local ollama
+cheap tier; without it a thinking model returns an empty completion under a
+modest ``max_tokens``. ``turn_context`` extracts
 the first well-formed override and applies it right after the hook fires, before
 the turn's first API call assembles.
 
@@ -66,6 +72,19 @@ logger = logging.getLogger(__name__)
 # Fields we forward from an override into switch_model (model/provider plus the
 # optional endpoint/credential fields switch_model already accepts).
 _PASSTHROUGH_FIELDS = ("base_url", "api_key", "api_mode")
+
+# Distinguishes "there was no extra_body before" from "it was explicitly {}",
+# so restore removes the key entirely rather than leaving an empty dict behind.
+_NOT_SET = object()
+
+# THIRD state, and the one a single sentinel got wrong: "this routed turn never
+# wrote extra_body at all". routing.cheap_extra_body is empty by default, so
+# that is the COMMON case — and conflating it with _NOT_SET made the revert pop
+# an extra_body the override never set. request_overrides["extra_body"] is built
+# once at agent construction for custom providers and for fast/priority mode, so
+# that pop silently destroyed the primary provider's own body params for the
+# rest of the session. Revert must be a no-op on this value.
+_UNTOUCHED = object()
 
 
 def extract_routing_override(results: Iterable[Any]) -> Optional[dict]:
@@ -162,8 +181,62 @@ def apply_routing_override(agent: Any, override: Optional[dict]) -> bool:
     # Mark the override turn-scoped with a DEDICATED flag. Do NOT restore the
     # premium snapshot into _primary_runtime (keep it == cheap) and do NOT arm
     # _fallback_activated (that would corrupt reactive cooldown accounting).
+    # Turn-scoped request-body params (e.g. {"think": false} for a local tier).
+    # Merged over any existing extra_body so custom-provider params survive; the
+    # prior value is stashed for restore_primary_runtime to revert next turn.
+    # Best-effort: a malformed extra_body must not undo an applied swap.
+    saved_extra_body = _UNTOUCHED
+    overrides_ref = None
     try:
-        agent._routing_override_saved_primary = primary_snapshot
+        routed_extra_body = override.get("extra_body")
+        if isinstance(routed_extra_body, dict) and routed_extra_body:
+            overrides = getattr(agent, "request_overrides", None)
+            if isinstance(overrides, dict):
+                saved_extra_body = overrides.get("extra_body", _NOT_SET)
+                base = saved_extra_body if isinstance(saved_extra_body, dict) else {}
+                # Shallow copy: saved and live are always DISTINCT dicts (so the
+                # merge can't corrupt the snapshot at the top level), but they
+                # share nested values. Never mutate a nested value in place here
+                # or in flight — that would reach through into the snapshot and
+                # into the loaded config that cheap_extra_body() copied from.
+                merged = dict(base)
+                merged.update(routed_extra_body)
+                overrides["extra_body"] = merged
+                # Remember WHICH dict we dirtied. The gateway assigns a freshly
+                # built per-turn request_overrides onto the cached agent before
+                # the next turn's revert runs, so re-reading the attribute there
+                # would clean the wrong object: leaving cheap params on the dict
+                # we actually mutated and stomping the new turn's own extra_body.
+                overrides_ref = overrides
+        elif routed_extra_body not in (None, {}):
+            logger.debug(
+                "intelligent_routing: ignoring non-dict extra_body (%s)",
+                type(routed_extra_body).__name__,
+            )
+    except Exception:  # noqa: BLE001 — never break the turn over extra_body
+        logger.debug("intelligent_routing: could not apply extra_body", exc_info=True)
+
+    try:
+        # Only the FIRST apply of a turn snapshots. A second apply without an
+        # intervening restore would otherwise stash the first route's own
+        # runtime and merged extra_body as the "pristine" pre-turn state, so the
+        # cheap params would survive the revert. The single in-tree call site
+        # applies once per turn, but the snapshot is the whole safety property.
+        # `is not True` deliberately, not falsiness: the flag is set to exactly
+        # True here and cleared to False by the revert, so anything else means
+        # "no snapshot has been taken" rather than "a routed turn is live".
+        if getattr(agent, "_routing_override_active", False) is not True:
+            agent._routing_override_saved_primary = primary_snapshot
+            agent._routing_override_saved_extra_body = saved_extra_body
+            agent._routing_override_overrides_ref = overrides_ref
+        elif overrides_ref is not None and getattr(
+            agent, "_routing_override_saved_extra_body", _UNTOUCHED
+        ) is _UNTOUCHED:
+            # First apply wrote no extra_body, this one did: the snapshot is
+            # still pristine, but the revert now needs the dirtied dict + the
+            # value that was there before this apply touched it.
+            agent._routing_override_saved_extra_body = saved_extra_body
+            agent._routing_override_overrides_ref = overrides_ref
         agent._routing_override_active = True
     except Exception:  # noqa: BLE001 — best-effort scoping; swap already applied
         logger.debug("intelligent_routing: could not scope override to turn",

@@ -29,6 +29,7 @@ different axis; reactive escalation still applies underneath the chosen tier.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any, Optional
@@ -39,7 +40,11 @@ from .classifier import (
     classify_turn,
     decide_tier,
 )
-from .config import cheap_tier_target, is_intelligent_routing_enabled
+from .config import (
+    cheap_extra_body,
+    cheap_tier_target,
+    is_intelligent_routing_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +98,12 @@ def _parse_model_directive(message: str) -> object:
 # still runs the full conservative classifier (fails open to premium on anything
 # non-mechanical), so an over-peel can never wrongly cheap-route real work.
 _SENDER_PREFIX_RE = re.compile(r"^\[[^\]\n]{1,64}\]\s+")
+
+# Metrics-only tier label. NOT a classifier tier (the classifier never sees a
+# directive turn — the intercept runs before it), so it does not belong beside
+# TIER_CHEAP/TIER_PREMIUM in classifier.py. It keeps user-directed turns
+# countable and separable from classified ones in the same log stream.
+TIER_DIRECTIVE = "directive"
 
 
 def _strip_sender_prefix(message: str) -> str:
@@ -173,6 +184,18 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[dict]:
         if not isinstance(raw_message, str):
             raw_message = str(raw_message)
         stripped = _strip_sender_prefix(raw_message)
+        # Whether a "[sender] " attribution was peeled IS the group signal — a
+        # Discord DM and a Discord group turn share platform="discord", so
+        # platform cannot separate them. The group/DM split is the dimension the
+        # harvest needs most: a past bug made group chat inert (what
+        # _SENDER_PREFIX_RE fixes), and without this flag a recurrence is
+        # invisible in the log.
+        metric_dims = {
+            "session_id": kwargs.get("session_id"),
+            "turn_id": kwargs.get("turn_id"),
+            "platform": kwargs.get("platform") or "",
+            "is_group": stripped != raw_message,
+        }
 
         # ── User model directive ("use fable for this") ───────────────────────
         # Check BEFORE the classifier. "use" is in _IMPERATIVE_VERBS so without
@@ -183,10 +206,24 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[dict]:
                 # "use claude" — stay on configured primary; inject a context note.
                 reason = "user-requested → primary"
                 line = _reason_line(kwargs.get("model"), kwargs.get("provider"), reason)
+                # A directive is the pushback signal — "the user rejected the
+                # cheap answer" is exactly what the upstream numbers need, and
+                # it is also a real turn. Returning here without a row both lost
+                # that signal and left the log with no total-turn denominator,
+                # so any cheap-share read off it described classified turns only.
+                log_routing_decision(
+                    tier=TIER_DIRECTIVE, model=kwargs.get("model"),
+                    provider=kwargs.get("provider"), reason=reason,
+                    primary_model=kwargs.get("model"), **metric_dims,
+                )
                 return {"context": line}
             model, provider = directive
             reason = f"user-requested → {model.split('/')[0] if '/' in model else model}"
             line = _reason_line(kwargs.get("model"), kwargs.get("provider"), reason)
+            log_routing_decision(
+                tier=TIER_DIRECTIVE, model=model, provider=provider, reason=reason,
+                primary_model=kwargs.get("model"), **metric_dims,
+            )
             return {"route": {"model": model, "provider": provider}, "context": line}
 
         # ── Heuristic classifier (no explicit directive) ───────────────────────
@@ -210,14 +247,77 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[dict]:
         # runtime's routing-override extension (agent/routing_override.py)
         # actuates. Premium / fail-open turns emit no override and stay on the
         # configured primary.
+        routed_model, routed_provider = kwargs.get("model"), kwargs.get("provider")
         if tier == TIER_CHEAP:
             cheap_model, cheap_provider = cheap_tier_target()
             if cheap_model:
-                result["route"] = {"model": cheap_model, "provider": cheap_provider}
+                route = {"model": cheap_model, "provider": cheap_provider}
+                # Provider-specific body params for the cheap tier (e.g.
+                # {"think": false} on a local ollama model). Omitted entirely
+                # when unset, so nothing changes for existing cloud tiers.
+                extra_body = cheap_extra_body()
+                if extra_body:
+                    route["extra_body"] = extra_body
+                result["route"] = route
+                routed_model, routed_provider = cheap_model, cheap_provider
+
+        log_routing_decision(
+            tier=tier,
+            model=routed_model,
+            provider=routed_provider,
+            reason=reason,
+            primary_model=kwargs.get("model"),
+            **metric_dims,
+        )
         return result
     except Exception as exc:  # noqa: BLE001 — must never break the turn
         logger.warning("intelligent_routing: pre_llm_call failed (inert): %s", exc)
         return None
+
+
+def log_routing_decision(
+    *, tier, model, provider, reason, primary_model,
+    session_id=None, turn_id=None, platform=None, is_group=None,
+) -> None:
+    """Emit ONE machine-parseable decision record per classified turn.
+
+    Format: ``routing_decision {json}`` at INFO on this module's logger, so a
+    window of fleet data can be harvested with a grep + ``json.loads`` on the
+    suffix. This is the instrumentation the upstream-PR spec
+    (2026-07-23, "numbers needed for the Nous upstream PR") names as its first
+    prerequisite: *"Routing decisions must be countable: parseable per-turn log
+    line of tier, model, reason."* Absent it, coverage/cost/fail-open rates
+    cannot be computed, which is why Stage 2 never had numbers to attach.
+
+    Never raises — metrics must not be able to break a turn.
+    """
+    try:
+        logger.info(
+            "routing_decision %s",
+            json.dumps(
+                {
+                    "tier": tier,
+                    "model": model,
+                    "provider": provider,
+                    "reason": reason,
+                    "primary_model": primary_model,
+                    # Join keys. Cost / latency / 429-rate live on the POST-call
+                    # side (usage, api_duration, finish_reason), which this
+                    # pre-call hook structurally cannot see; carrying turn_id +
+                    # session_id lets those rows be joined against an already
+                    # deployed observability plugin instead of blocking on a
+                    # post_llm_call hook here.
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "platform": platform,
+                    "is_group": is_group,
+                },
+                default=str,
+                ensure_ascii=False,
+            ),
+        )
+    except Exception:  # noqa: BLE001 — instrumentation must never break the turn
+        logger.debug("intelligent_routing: metric emit failed", exc_info=True)
 
 
 def register(ctx) -> None:
