@@ -157,18 +157,41 @@ def test_reasoning_overrides_is_the_supported_route_to_the_same_wire_shape(trans
     assert seen["parsed"]["reasoning_effort"] == "none"
 
 
+# Verbatim from plugins/intelligent_routing/README.md, "Pointing the cheap
+# tier at a LOCAL model". Parsed here by the loader the runtime actually uses,
+# so the recipe is proved end to end rather than asserted in prose.
+README_RECIPE = """
+model:
+  default: "z-ai/glm-5.3"
+
+routing:
+  intelligent: true
+  cheap_model: "qwen3.5:9b"
+  cheap_provider: custom
+
+agent:
+  reasoning_overrides:
+    "qwen3.5:9b": none
+"""
+
+
 def test_documented_reasoning_overrides_recipe_resolves_for_the_routed_model():
     """The README recipe must actually parse — `"qwen3.5:9b": none` → disabled.
 
-    YAML gives a bare ``none`` as the STRING "none" (null is ``null``/``~``), and
-    parse_reasoning_effort maps none/false/disabled → {"enabled": False}.
+    The YAML hop is load-bearing, not incidental. A bare ``none`` parses as the
+    STRING "none" (YAML null is ``null``/``~``/empty), and parse_reasoning_effort
+    maps none/false/disabled → {"enabled": False}. Had it parsed as a Python
+    ``None``, resolve_reasoning_config would return None — NO override at all —
+    and the documented recipe would silently no-op, leaving the cheap model
+    burning its whole max_tokens budget on reasoning. So parse it for real.
     """
     from hermes_constants import resolve_reasoning_config
+    from utils import fast_safe_load
 
-    cfg = {
-        "model": {"default": "z-ai/glm-5.3"},
-        "agent": {"reasoning_overrides": {"qwen3.5:9b": "none"}},
-    }
+    cfg = fast_safe_load(README_RECIPE)
+    assert cfg["agent"]["reasoning_overrides"]["qwen3.5:9b"] == "none", (
+        "bare `none` must parse as the STRING 'none', not YAML null"
+    )
     # Resolved against the ROUTED model, which is what switch_model passes
     # (agent/agent_runtime_helpers.py: agent.reasoning_config =
     #  resolve_reasoning_config(_reasoning_cfg, agent.model)).

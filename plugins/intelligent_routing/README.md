@@ -73,6 +73,11 @@ on a routed turn — ollama `{"options": {"num_ctx": 8192}}`, an aggregator's
 `extra_body` into the request body *last*, so anything set there **overrides** a
 same-named typed parameter the transport already emitted.
 
+The transport merges your keys into the `extra_body` it assembled, but the
+merge is **shallow** (one level): a nested dict you set replaces the assembled
+one wholesale rather than merging into it. `{"reasoning": {"effort": "none"}}`
+therefore drops the assembled `enabled` key — write nested values out in full.
+
 ## How a turn flows
 
 ```
