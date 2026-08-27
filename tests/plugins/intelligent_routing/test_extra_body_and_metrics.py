@@ -4,10 +4,16 @@ Two gaps this closes:
 
 1. **extra_body** — `routing_override` forwarded only base_url/api_key/api_mode,
    so there was no way to send a provider-specific body param with a routed
-   turn. That blocks a LOCAL cheap tier: ollama's OpenAI-compatible endpoint
-   leaves thinking ON by default, so a mechanical turn on qwen3.5:9b burns
-   ~1800 reasoning tokens for an 8-token answer, and returns an EMPTY string
-   under any modest max_tokens. Measured on the Mini 2026-08-26.
+   turn (ollama `options.num_ctx`, an aggregator's `provider` preferences).
+
+   ⚠️ CORRECTION: this file originally justified the passthrough as the way to
+   send `{"think": false}` to a local ollama tier. That was never measured and
+   is wrong — ollama's OpenAI-compat /v1 endpoint ignores `think` entirely
+   (ollama#14820). Thinking is disabled per-model via `agent.reasoning_overrides`,
+   which `switch_model` re-resolves for the ROUTED model. See
+   `test_cheap_extra_body_wire_semantics.py` for the measured behaviour.
+   The `{"think": ...}` literals below are just opaque body dicts exercising the
+   plumbing; they are NOT a working recipe for disabling thinking.
 
 2. **metrics** — the plugin emitted no per-turn decision record, which is the
    stated blocker on the upstream PR (spec 2026-07-23: "Routing decisions must

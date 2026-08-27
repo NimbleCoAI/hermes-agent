@@ -501,10 +501,23 @@ class ChatCompletionsTransport(ProviderTransport):
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
-        # Request overrides last (service_tier etc.)
+        # Request overrides last (service_tier etc.). extra_body is MERGED, not
+        # replaced — same semantics as the provider-profile path below. A plain
+        # update() here dropped everything assembled above (provider prefs,
+        # reasoning config) the moment a caller passed its own extra_body, e.g.
+        # a routed turn carrying routing.cheap_extra_body onto an unregistered
+        # provider. A non-dict value keeps the old last-write-wins behaviour.
         overrides = params.get("request_overrides")
         if overrides:
-            api_kwargs.update(overrides)
+            for k, v in overrides.items():
+                if k == "extra_body" and isinstance(v, dict):
+                    merged = api_kwargs.get("extra_body")
+                    if isinstance(merged, dict):
+                        merged.update(v)
+                    else:
+                        api_kwargs["extra_body"] = dict(v)
+                else:
+                    api_kwargs[k] = v
 
         return api_kwargs
 

@@ -253,8 +253,10 @@ def on_pre_llm_call(**kwargs: Any) -> Optional[dict]:
             if cheap_model:
                 route = {"model": cheap_model, "provider": cheap_provider}
                 # Provider-specific body params for the cheap tier (e.g.
-                # {"think": false} on a local ollama model). Omitted entirely
-                # when unset, so nothing changes for existing cloud tiers.
+                # {"options": {"num_ctx": N}} on a local ollama model). Omitted
+                # entirely when unset, so nothing changes for existing cloud
+                # tiers. Thinking control is NOT set here — see
+                # config.cheap_extra_body for why and what to use instead.
                 extra_body = cheap_extra_body()
                 if extra_body:
                     route["extra_body"] = extra_body

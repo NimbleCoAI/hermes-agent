@@ -39,6 +39,40 @@ routing:
 
 Enabled but `routing.intelligent` OFF ⇒ the hook is inert (`None`, zero change).
 
+### Pointing the cheap tier at a LOCAL model
+
+A local cheap tier needs one extra thing: thinking OFF. A thinking-capable
+model on a modest `max_tokens` spends the whole budget reasoning and returns an
+**empty string** (measured, qwen3.5:9b at `max_tokens: 200` → 200 completion
+tokens, empty content, `finish_reason: length`).
+
+Do it with the per-model reasoning config, **not** with `cheap_extra_body`:
+
+```yaml
+routing:
+  intelligent: true
+  cheap_model: "qwen3.5:9b"
+  cheap_provider: custom            # aliases: ollama, local, vllm, llamacpp
+
+agent:
+  reasoning_overrides:
+    "qwen3.5:9b": none              # → reasoning_effort: "none" on the wire
+```
+
+`switch_model` re-resolves `reasoning_config` against the **routed** model, so
+the override applies to the cheap turn even though the primary is a different
+model. With it: 2 completion tokens and the right answer.
+
+⚠️ On ollama's OpenAI-compatible `/v1/chat/completions`, `think: false`,
+`chat_template_kwargs` and an in-prompt `/no_think` all do **nothing**
+(ollama#14820). `reasoning_effort: "none"` is the only switch that works.
+
+`routing.cheap_extra_body` is for genuinely provider-specific **body** params
+on a routed turn — ollama `{"options": {"num_ctx": 8192}}`, an aggregator's
+`provider` preferences. It is empty by default. Note the OpenAI SDK merges
+`extra_body` into the request body *last*, so anything set there **overrides** a
+same-named typed parameter the transport already emitted.
+
 ## How a turn flows
 
 ```
