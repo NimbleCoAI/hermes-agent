@@ -17,12 +17,21 @@ A ``pre_llm_call`` hook result may be a dict carrying a ``route`` key::
 ``api_mode``) are passed through to ``switch_model``. An optional ``extra_body``
 dict is NOT passed to ``switch_model`` (its signature has no such parameter) —
 it is merged into ``agent.request_overrides["extra_body"]`` for the turn and
-reverted with the rest of the override. That is what lets a routed turn carry a
-provider-specific body param such as ``{"think": false}`` for a local ollama
-cheap tier; without it a thinking model returns an empty completion under a
-modest ``max_tokens``. ``turn_context`` extracts
-the first well-formed override and applies it right after the hook fires, before
-the turn's first API call assembles.
+reverted with the rest of the override. That is what lets a routed turn carry
+provider-specific BODY params for the cheap tier (e.g. ollama
+``{"options": {"num_ctx": N}}``, or an aggregator's ``provider`` preferences).
+
+⚠️ The OpenAI SDK merges ``extra_body`` into the JSON body LAST, so a key here
+silently OVERRIDES a same-named TYPED parameter the transport already emitted —
+measured, not assumed (see
+``tests/plugins/intelligent_routing/test_cheap_extra_body_wire_semantics.py``).
+Do NOT use it to disable thinking on a local tier: ``think: false`` is ignored
+by ollama's OpenAI-compat ``/v1`` endpoint (ollama#14820), and the switch that
+does work (``reasoning_effort``) is already resolved PER-MODEL by
+``switch_model`` from ``agent.reasoning_overrides``.
+
+``turn_context`` extracts the first well-formed override and applies it right
+after the hook fires, before the turn's first API call assembles.
 
 ── Turn-scoping (the load-bearing detail) ──
 Proactive routing is a PER-TURN decision, exactly like reactive fallback — it
@@ -181,7 +190,10 @@ def apply_routing_override(agent: Any, override: Optional[dict]) -> bool:
     # Mark the override turn-scoped with a DEDICATED flag. Do NOT restore the
     # premium snapshot into _primary_runtime (keep it == cheap) and do NOT arm
     # _fallback_activated (that would corrupt reactive cooldown accounting).
-    # Turn-scoped request-body params (e.g. {"think": false} for a local tier).
+    # Turn-scoped request-body params (e.g. {"options": {"num_ctx": N}} for a
+    # local tier). The SDK merges these into the JSON body LAST, so they
+    # override same-named typed params. Thinking control does NOT belong here —
+    # use agent.reasoning_overrides (see the module docstring).
     # Merged over any existing extra_body so custom-provider params survive; the
     # prior value is stashed for restore_primary_runtime to revert next turn.
     # Best-effort: a malformed extra_body must not undo an applied swap.

@@ -34,12 +34,28 @@ _DEFAULT_MODE = "heuristic"
 _DEFAULT_CHEAP_MODEL = "deepseek/deepseek-v3.2"
 _DEFAULT_CHEAP_PROVIDER = "openrouter"
 
-# Provider-specific request-body params to send WITH a cheap-routed turn, e.g.
-# ``{"think": false}`` for a local ollama tier. Without this a thinking model on
-# an OpenAI-compatible endpoint burns its whole token budget on reasoning and
-# returns an EMPTY completion under any modest max_tokens — measured on
-# qwen3.5:9b: 8 tokens with think=false vs 1807 with it on, same answer, and
-# empty output at max_tokens=200. Empty by default: changes nothing unless set.
+# Provider-specific request-BODY params to send WITH a cheap-routed turn — e.g.
+# ollama ``{"options": {"num_ctx": 8192}}``, or an aggregator's ``provider``
+# preferences. Empty by default: changes nothing unless set.
+#
+# NOT the place to disable thinking. Measured against ollama's OpenAI-compat
+# /v1 endpoint (2026-08-26): ``think: false``, ``chat_template_kwargs`` and an
+# in-prompt ``/no_think`` all do NOTHING (ollama#14820). The only switch that
+# works is the first-class ``reasoning_effort: "none"``, and the supported way
+# to set it for a routed model is per-model config:
+#
+#     agent:
+#       reasoning_overrides:
+#         "qwen3.5:9b": none
+#
+# ``switch_model`` re-resolves reasoning_config against the ROUTED model, and
+# the custom/ollama provider profile then emits ``reasoning_effort: "none"``.
+# Without it a thinking model burns its whole budget and returns an EMPTY
+# completion — measured on qwen3.5:9b at max_tokens=200: 200 completion tokens,
+# empty content, finish_reason=length; with it, 2 tokens and the right answer.
+#
+# NOTE: anything set here is merged into the JSON body LAST by the OpenAI SDK,
+# so it OVERRIDES a same-named typed parameter the transport emitted.
 _DEFAULT_CHEAP_EXTRA_BODY: Dict[str, Any] = {}
 
 

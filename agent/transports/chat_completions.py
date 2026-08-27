@@ -501,10 +501,34 @@ class ChatCompletionsTransport(ProviderTransport):
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
-        # Request overrides last (service_tier etc.)
+        # Request overrides last (service_tier etc.). extra_body is MERGED, not
+        # replaced — same semantics as the provider-profile path below. A plain
+        # update() here dropped everything assembled above (provider prefs,
+        # reasoning config) the moment a caller passed its own extra_body.
+        #
+        # Two callers reach this with request_overrides["extra_body"], and the
+        # second one is NOT routing-only:
+        #   1. a routed turn carrying routing.cheap_extra_body (agent/
+        #      routing_override.py) onto a provider with no registered profile;
+        #   2. agent_init._merge_custom_provider_extra_body, which writes
+        #      request_overrides["extra_body"] at AGENT INIT for any
+        #      `provider: custom:<key>` agent — so for those agents this merge
+        #      is on EVERY turn, routed or not.
+        #
+        # The merge is SHALLOW (one level): a colliding nested dict is replaced
+        # wholesale, not merged into. See TestNestedCollisionIsShallow.
+        # A non-dict value keeps the old last-write-wins behaviour.
         overrides = params.get("request_overrides")
         if overrides:
-            api_kwargs.update(overrides)
+            for k, v in overrides.items():
+                if k == "extra_body" and isinstance(v, dict):
+                    merged = api_kwargs.get("extra_body")
+                    if isinstance(merged, dict):
+                        merged.update(v)
+                    else:
+                        api_kwargs["extra_body"] = dict(v)
+                else:
+                    api_kwargs[k] = v
 
         return api_kwargs
 
@@ -615,7 +639,10 @@ class ChatCompletionsTransport(ProviderTransport):
         if additions:
             extra_body.update(additions)
 
-        # Request overrides (user config)
+        # Request overrides (user config). extra_body merges SHALLOW (one
+        # level), same as the legacy path above. A non-dict value lands
+        # top-level here and is then overwritten below whenever the profile
+        # assembled anything — the one place the two paths do NOT agree.
         overrides = params.get("request_overrides")
         if overrides:
             for k, v in overrides.items():
